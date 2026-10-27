@@ -41,7 +41,9 @@ Mamba Environments: Separate isolated environments for vamb, metabinner_env, com
 
 #~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Installation & ConfigurationClone or download the script to your working environment.   
+Installation & Configuration
+
+Clone or download the script to your working environment.   
 
 Make the script executable:   Bashchmod +x run_metagenomics_pipeline.sh
 
