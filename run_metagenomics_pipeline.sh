@@ -23,11 +23,10 @@
 #   2. bash run_metagenomics_pipeline.sh [--dry-run] [--force] [-h|--help]
 #
 # Execution model:
-#   Direct binaries : fastp, megahit, kraken2, bracken, bowtie2, bowtie2-build,
-#                     samtools, jgi_summarize_bam_contig_depths, coverm
-#                     → called directly via $BIN_DIR prepended to $PATH
-#   Isolated envs   : vamb, metabinner, comebin, metawrap, checkm2, gtdbtk
-#                     → ALWAYS via  mamba run -n <ENV_NAME>  (NEVER conda activate)
+#   Container steps: fastp, megahit, kraken2, bracken, bowtie2, samtools,
+#                     jgi_summarize_bam_contig_depths, vamb, metabinner,
+#                     comebin, metawrap, checkm2, gtdbtk, coverm, Rscript
+#   mamba mode     : all tools retain their original host/mamba execution paths
 ###############################################################################
 
 set -euo pipefail
@@ -38,8 +37,8 @@ trap 'echo -e "\n[FATAL] Pipeline aborted at line ${LINENO}. Check logs in ${OUT
 ###############################################################################
 
 # ── Input / Output ────────────────────────────────────────────────────────────
-READS_DIR="/path/to/reads"      # Dir containing paired-end reads
-OUTDIR="./metagenomics_out"     # All pipeline output goes here
+READS_DIR="${READS_DIR:-}"      # Dir containing paired-end reads
+OUTDIR="${OUTDIR:-./metagenomics_out}"     # All pipeline output goes here
 ASSEMBLY_IN=""                   # Pre-assembled FASTA. Empty = run MEGAHIT.
 
 # ── Read File Patterns ────────────────────────────────────────────────────────
@@ -47,14 +46,69 @@ READ_SUFFIX_R1="_R1.fastq.gz"
 READ_SUFFIX_R2="_R2.fastq.gz"
 
 # ── Compute Resources ─────────────────────────────────────────────────────────
-THREADS=32
-MEMORY=120      # GB — MEGAHIT memory cap (converted to bytes internally)
+# Use "auto" to detect from hardware, a positive integer to set manually, or
+# export THREADS / MEMORY as environment variables before running.
+THREADS="${THREADS:-auto}"   # logical CPU cores to use (or "auto")
+MEMORY="${MEMORY:-auto}"     # GB RAM cap for MEGAHIT / MetaWRAP (or "auto")
+
+# ── Resource Safety Margins ───────────────────────────────────────────────────
+CPU_RESERVE=2    # logical cores always kept free for the OS
+MEM_FRACTION=85  # maximum % of available RAM the pipeline may use
 
 # ── Tool Binaries Directory ───────────────────────────────────────────────────
 # Compiled binaries accessed directly. Leave empty ("") if already on $PATH.
 BIN_DIR=""
 
-# ── Mamba Environment Names ───────────────────────────────────────────────────
+# ── Container / Environment Execution Engine ──────────────────────────────────
+# EXEC_MODE: "apptainer" — run isolated steps via Apptainer/Singularity .sif
+#            "mamba"     — fall back to  mamba run -n <env>  (original behaviour)
+EXEC_MODE="${EXEC_MODE:-apptainer}"
+
+# ── Apptainer/Singularity Container Images (.sif) ────────────────────────────
+# SIF_DIR  : local directory where .sif files are stored / downloaded.
+# AUTO_PULL_SIF : if true, missing images are pulled from their URI automatically.
+SIF_DIR="${SIF_DIR:-./containers}"
+AUTO_PULL_SIF=true
+
+# Per-tool image paths and their BioContainers / Docker Hub source URIs.
+# Override any path to point to a locally-built or pre-cached .sif.
+SIF_FASTP="${SIF_DIR}/fastp.sif"
+SIF_FASTP_URI="docker://quay.io/biocontainers/fastp:0.23.4--h125f33a_5"
+
+SIF_MEGAHIT="${SIF_DIR}/megahit.sif"
+SIF_MEGAHIT_URI="docker://quay.io/biocontainers/megahit:1.2.9--h43eeafb_4"
+
+SIF_KRAKEN2="${SIF_DIR}/kraken2_bracken.sif"
+SIF_KRAKEN2_URI="docker://staphb/kraken2:2.1.3"
+
+SIF_MAPPING="${SIF_DIR}/mapping_depth.sif"
+SIF_MAPPING_URI="docker://staphb/bowtie2:2.5.4"
+
+SIF_VAMB="${SIF_DIR}/vamb.sif"
+SIF_VAMB_URI="docker://ghcr.io/RasmussenLab/vamb:latest"
+
+SIF_METABINNER="${SIF_DIR}/metabinner.sif"
+SIF_METABINNER_URI="docker://quay.io/biocontainers/metabinner:1.4.4--pyhdfd78af_0"
+
+SIF_COMEBIN="${SIF_DIR}/comebin.sif"
+SIF_COMEBIN_URI="docker://quay.io/biocontainers/comebin:1.0.4--pyhdfd78af_0"
+
+SIF_METAWRAP="${SIF_DIR}/metawrap.sif"
+SIF_METAWRAP_URI="docker://quay.io/biocontainers/metawrap-mg:1.3.2--hdfd78af_1"
+
+SIF_CHECKM2="${SIF_DIR}/checkm2.sif"
+SIF_CHECKM2_URI="docker://quay.io/biocontainers/checkm2:1.0.2--pyh7cba7a3_0"
+
+SIF_GTDBTK="${SIF_DIR}/gtdbtk.sif"
+SIF_GTDBTK_URI="docker://quay.io/biocontainers/gtdbtk:2.4.0--pyhdfd78af_0"
+
+SIF_COVERM="${SIF_DIR}/coverm.sif"
+SIF_COVERM_URI="docker://quay.io/biocontainers/coverm:0.6.1--h9f5acd7_1"
+
+SIF_R="${SIF_DIR}/r_base.sif"
+SIF_R_URI="docker://rocker/r-base:latest"
+
+# ── Mamba Environment Names (used when EXEC_MODE="mamba") ────────────────────
 ENV_VAMB="vamb"
 ENV_METABINNER="metabinner_env"
 ENV_COMEBIN="comebin_env"
@@ -62,16 +116,26 @@ ENV_METAWRAP="metawrap_env"
 ENV_CHECKM2="checkm2_env"
 ENV_GTDBTK="gtdbtk_env"
 
-# ── Database Paths (override by exporting env vars before running) ────────────
-KRAKEN2_DB="${KRAKEN2_DB:-/path/to/kraken2_db}"
-CHECKM2_DB="${CHECKM2_DB:-/path/to/uniref100.KO.1.dmnd}"
-GTDBTK_DATA_PATH="${GTDBTK_DATA_PATH:-/path/to/gtdbtk_data}"
+# ── Database Paths ────────────────────────────────────────────────────────────
+KRAKEN2_DB="${KRAKEN2_DB:-}"
+CHECKM2_DB="${CHECKM2_DB:-}"
+GTDBTK_DATA_PATH="${GTDBTK_DATA_PATH:-}"
 
 # ── MetaBinner Script Paths ───────────────────────────────────────────────────
-METABINNER_SCRIPTS_DIR="${METABINNER_SCRIPTS_DIR:-/path/to/metabinner/scripts}"
+# When EXEC_MODE="apptainer" the scripts live inside the container at
+# /opt/metabinner/scripts; they do NOT need to be present on the host.
+# When EXEC_MODE="mamba" set this to the actual host path.
+#
+# Smart default: if the variable has not been set (or still holds the
+# placeholder), the value is resolved later in main() after EXEC_MODE is known.
+# You can always override it by exporting before running:
+#   export METABINNER_SCRIPTS_DIR=/my/host/path
+_METABINNER_SCRIPTS_DIR_ENV="${METABINNER_SCRIPTS_DIR:-}"
+METABINNER_SCRIPTS_DIR=""
 METABINNER_RUNNER="${METABINNER_RUNNER:-run_metabinner.sh}"
 
 # ── COMEBin Script Path ───────────────────────────────────────────────────────
+# Same logic: run_comebin.sh lives inside the container when EXEC_MODE="apptainer".
 COMEBIN_SCRIPT="${COMEBIN_SCRIPT:-run_comebin.sh}"
 
 # ── Assembly Parameters ───────────────────────────────────────────────────────
@@ -95,15 +159,15 @@ COVERM_METHODS="relative_abundance"   # leave empty for CoverM built-in default
 COVERM_MIN_COVERED_FRACTION="0.0"
 
 # ── Pipeline Step Flags ───────────────────────────────────────────────────────
-RUN_FASTP=true        # Step 01
-RUN_MEGAHIT=true      # Step 02 — false requires ASSEMBLY_IN to be set
-RUN_KRAKEN2=true      # Step 03
-RUN_REASSEMBLY=false  # Step 07
-RUN_GTDBTK=true       # Step 10
+RUN_FASTP="${RUN_FASTP:-true}"                # Step 01
+RUN_MEGAHIT="${RUN_MEGAHIT:-true}"            # Step 02 — false requires ASSEMBLY_IN to be set
+RUN_KRAKEN2="${RUN_KRAKEN2:-true}"            # Step 03
+RUN_REASSEMBLY="${RUN_REASSEMBLY:-false}"     # Step 07
+RUN_GTDBTK="${RUN_GTDBTK:-true}"              # Step 10
 
 # ── Execution Flags ───────────────────────────────────────────────────────────
-DRY_RUN=false         # Print commands without running them
-FORCE_RERUN=false     # Ignore checkpoints and rerun every step
+DRY_RUN="${DRY_RUN:-false}"                   # Print commands without running them
+FORCE_RERUN="${FORCE_RERUN:-false}"           # Ignore checkpoints and rerun every step
 
 ###############################################################################
 #  END OF CONFIGURATION                                                       #
@@ -111,18 +175,128 @@ FORCE_RERUN=false     # Ignore checkpoints and rerun every step
 
 # ── CLI Parsing ───────────────────────────────────────────────────────────────
 _show_help() {
-    grep '^#' "$0" | head -40 | sed 's/^# \?//'
+    cat <<'HELP'
+run_metagenomics_pipeline.sh — Consolidated Shotgun Metagenomics Pipeline
+
+Usage:
+  bash run_metagenomics_pipeline.sh [OPTIONS]
+
+Options:
+  -r, --reads-dir <directory>  Directory containing paired-end reads
+      --kraken2-db <directory> Kraken2 database directory
+      --checkm2-db <file>      CheckM2 database file
+      --gtdbtk-data-path <dir> GTDB-Tk reference data directory
+  -o, --outdir <directory>     Output directory (default: ./metagenomics_out)
+      --metabinner-scripts-dir <directory>
+                               MetaBinner scripts path (host path for mamba;
+                               defaults to /opt/metabinner/scripts for Apptainer)
+  -t, --threads <int>          Override THREADS (overrides "auto" and env var)
+  -m, --memory  <int>          Override MEMORY in GB (overrides "auto" and env var)
+  -e, --engine  <apptainer|mamba>
+                               Select execution engine for pipeline tools.
+                               Default: apptainer (uses .sif images from SIF_DIR).
+                               Fallback: mamba (uses  mamba run -n <env>).
+  --fastp / --no-fastp         Enable/disable fastp (default: enabled)
+  --megahit / --no-megahit     Enable/disable MEGAHIT (default: enabled)
+  --kraken2 / --no-kraken2     Enable/disable Kraken2 + Bracken (default: enabled)
+  --reassembly / --no-reassembly
+                               Enable/disable MetaWrap reassembly (default: disabled)
+  --gtdbtk / --no-gtdbtk       Enable/disable GTDB-Tk (default: enabled)
+  --dry-run / --no-dry-run     Print commands without executing them (default: disabled)
+  --force / --no-force         Ignore checkpoints (default: disabled)
+  -h, --help                   Show this help message and exit
+
+Example:
+  bash run_metagenomics_pipeline.sh \\
+    --reads-dir /data/reads \\
+    --kraken2-db /databases/kraken2 \\
+    --checkm2-db /databases/checkm2/uniref100.KO.1.dmnd \\
+    --gtdbtk-data-path /databases/gtdbtk \\
+    --outdir ./metagenomics_out
+
+Resource auto-detection:
+  When THREADS or MEMORY are set to "auto" (the default), the pipeline
+  queries the host hardware and applies safety margins:
+    CPU_RESERVE  (default 2)  — cores reserved for the OS
+    MEM_FRACTION (default 85) — max % of available RAM to use
+  Override any of these in the CONFIGURATION block or via environment variables.
+
+Container engine (EXEC_MODE=apptainer):
+  .sif images are resolved from SIF_DIR (default: ./containers/).
+  If a .sif is missing and AUTO_PULL_SIF=true, it is pulled automatically
+  via  apptainer pull  (or  singularity pull  if apptainer is unavailable).
+  Set EXEC_MODE=mamba to bypass containers entirely and use conda environments.
+HELP
     exit 0
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --dry-run)  DRY_RUN=true;     shift ;;
-        --force)    FORCE_RERUN=true;  shift ;;
+        -r|--reads-dir)
+            [[ -z "${2:-}" || "${2}" == -* ]] && {
+                echo "[ERROR] $1 requires a directory value." >&2; exit 1; }
+            READS_DIR="$2"; shift 2 ;;
+        --kraken2-db)
+            [[ -z "${2:-}" || "${2}" == -* ]] && {
+                echo "[ERROR] --kraken2-db requires a directory value." >&2; exit 1; }
+            KRAKEN2_DB="$2"; shift 2 ;;
+        --checkm2-db)
+            [[ -z "${2:-}" || "${2}" == -* ]] && {
+                echo "[ERROR] --checkm2-db requires a file value." >&2; exit 1; }
+            CHECKM2_DB="$2"; shift 2 ;;
+        --gtdbtk-data-path)
+            [[ -z "${2:-}" || "${2}" == -* ]] && {
+                echo "[ERROR] --gtdbtk-data-path requires a directory value." >&2; exit 1; }
+            GTDBTK_DATA_PATH="$2"; shift 2 ;;
+        -o|--outdir)
+            [[ -z "${2:-}" || "${2}" == -* ]] && {
+                echo "[ERROR] $1 requires a directory value." >&2; exit 1; }
+            OUTDIR="$2"; shift 2 ;;
+        --metabinner-scripts-dir)
+            [[ -z "${2:-}" || "${2}" == -* ]] && {
+                echo "[ERROR] --metabinner-scripts-dir requires a directory value." >&2; exit 1; }
+            _METABINNER_SCRIPTS_DIR_CLI="$2"; shift 2 ;;
+        -t|--threads)
+            [[ -z "${2:-}" || ! "${2}" =~ ^[1-9][0-9]*$ ]] && {
+                echo "[ERROR] --threads requires a positive integer." >&2; exit 1; }
+            THREADS="$2"; shift 2 ;;
+        -m|--memory)
+            [[ -z "${2:-}" || ! "${2}" =~ ^[1-9][0-9]*$ ]] && {
+                echo "[ERROR] --memory requires a positive integer (GB)." >&2; exit 1; }
+            MEMORY="$2"; shift 2 ;;
+        -e|--engine)
+            [[ -z "${2:-}" ]] && { echo "[ERROR] --engine requires a value (apptainer|mamba)." >&2; exit 1; }
+            case "${2}" in
+                apptainer|mamba) EXEC_MODE="${2}"; shift 2 ;;
+                *) echo "[ERROR] --engine must be 'apptainer' or 'mamba'." >&2; exit 1 ;;
+            esac ;;
+        --fastp)       RUN_FASTP=true;       shift ;;
+        --no-fastp)    RUN_FASTP=false;      shift ;;
+        --megahit)     RUN_MEGAHIT=true;     shift ;;
+        --no-megahit)  RUN_MEGAHIT=false;    shift ;;
+        --kraken2)     RUN_KRAKEN2=true;     shift ;;
+        --no-kraken2)  RUN_KRAKEN2=false;    shift ;;
+        --reassembly)     RUN_REASSEMBLY=true;  shift ;;
+        --no-reassembly)  RUN_REASSEMBLY=false; shift ;;
+        --gtdbtk)     RUN_GTDBTK=true;    shift ;;
+        --no-gtdbtk)  RUN_GTDBTK=false;   shift ;;
+        --dry-run)     DRY_RUN=true;      shift ;;
+        --no-dry-run)  DRY_RUN=false;     shift ;;
+        --force)     FORCE_RERUN=true;   shift ;;
+        --no-force)  FORCE_RERUN=false;  shift ;;
         -h|--help)  _show_help ;;
         *)  echo "[ERROR] Unknown option: $1. Use -h for help." >&2; exit 1 ;;
     esac
 done
+
+# Resolve MetaBinner's path only after parsing, since --engine may override the environment.
+if [[ -n "${_METABINNER_SCRIPTS_DIR_CLI:-}" ]]; then
+    METABINNER_SCRIPTS_DIR="${_METABINNER_SCRIPTS_DIR_CLI}"
+elif [[ -n "${_METABINNER_SCRIPTS_DIR_ENV}" ]]; then
+    METABINNER_SCRIPTS_DIR="${_METABINNER_SCRIPTS_DIR_ENV}"
+elif [[ "${EXEC_MODE}" == "apptainer" ]]; then
+    METABINNER_SCRIPTS_DIR="/opt/metabinner/scripts"
+fi
 
 [[ -n "${BIN_DIR}" ]] && export PATH="${BIN_DIR}:${PATH}"
 
@@ -147,27 +321,257 @@ log_step()  {
 # ── Utility Functions ─────────────────────────────────────────────────────────
 run_cmd() {
     if [[ "${DRY_RUN}" == true ]]; then
-        echo -e "${YELLOW}[DRY-RUN]${NC} $*"
+        printf '[DRY-RUN] '
+        printf '%q ' "$@"
+        printf '\n'
     else
-        log_info "Running: $*"
+        printf -v cmd_display '%q ' "$@"
+        log_info "Running: ${cmd_display}"
+        "$@"
+    fi
+}
+# ── run_tool(step_label, sif_path, uri, command...) ───────────────────────────
+# Runs a direct binary in its SIF image in Apptainer mode, preserving the
+# original direct command path in mamba mode.
+run_tool() {
+    local step_label="$1"
+    local sif_path="$2"
+    local uri="$3"
+    shift 3
+
+    if [[ "${EXEC_MODE}" == "mamba" ]]; then
+        run_cmd "$@"
+        return
+    fi
+
+    ensure_sif_image "${sif_path}" "${uri}" || return 1
+    local runtime="apptainer"
+    command -v apptainer &>/dev/null || runtime="singularity"
+    local binds
+    binds=$(build_bind_mounts)
+
+    log_info "[Step ${step_label}] Engine: Apptainer | Image: ${sif_path}"
+    if [[ "${DRY_RUN}" == true ]]; then
+        echo -e "${YELLOW}[DRY-RUN]${NC} ${runtime} exec --cleanenv ${binds} ${sif_path} $*"
+        return 0
+    fi
+
+    # shellcheck disable=SC2086
+    "${runtime}" exec --cleanenv ${binds} "${sif_path}" "$@"
+}
+
+# ── run_tool_shell(step_label, sif_path, uri, command) ─────────────────────────
+# Runs compound commands (such as the mapping pipeline) inside one SIF image.
+run_tool_shell() {
+    local step_label="$1"
+    local sif_path="$2"
+    local uri="$3"
+    local command="$4"
+
+    if [[ "${EXEC_MODE}" == "mamba" ]]; then
+        run_cmd "${command}"
+        return
+    fi
+
+    ensure_sif_image "${sif_path}" "${uri}" || return 1
+    local runtime="apptainer"
+    command -v apptainer &>/dev/null || runtime="singularity"
+    local binds
+    binds=$(build_bind_mounts)
+
+    log_info "[Step ${step_label}] Engine: Apptainer | Image: ${sif_path}"
+    if [[ "${DRY_RUN}" == true ]]; then
+        echo -e "${YELLOW}[DRY-RUN]${NC} ${runtime} exec --cleanenv ${binds} ${sif_path} bash -o pipefail -c ${command}"
+        return 0
+    fi
+
+    # shellcheck disable=SC2086
+    "${runtime}" exec --cleanenv ${binds} "${sif_path}" bash -o pipefail -c "${command}"
+}
+
+# ── ensure_sif_image(sif_path, uri) ──────────────────────────────────────────
+# Verifies that a .sif image exists in SIF_DIR. If missing and AUTO_PULL_SIF
+# is true, pulls it automatically using apptainer pull or singularity pull.
+ensure_sif_image() {
+    local sif_path="$1"
+    local uri="$2"
+
+    if [[ -f "${sif_path}" ]]; then
+        log_info "[Container] Image found: ${sif_path}"
+        return 0
+    fi
+
+    if [[ "${AUTO_PULL_SIF}" != true ]]; then
+        log_error "[Container] Image not found: ${sif_path}"
+        log_error "[Container] Set AUTO_PULL_SIF=true or place the image manually."
+        return 1
+    fi
+
+    # Determine available container runtime
+    local runtime=""
+    if command -v apptainer &>/dev/null; then
+        runtime="apptainer"
+    elif command -v singularity &>/dev/null; then
+        runtime="singularity"
+    else
+        log_error "[Container] Neither 'apptainer' nor 'singularity' found in PATH."
+        return 1
+    fi
+
+    mkdir -p "$(dirname "${sif_path}")"
+    log_info "[Container] Pulling image: ${uri} → ${sif_path}"
+
+    if [[ "${DRY_RUN}" == true ]]; then
+        echo -e "${YELLOW}[DRY-RUN]${NC} ${runtime} pull ${sif_path} ${uri}"
+        return 0
+    fi
+
+    "${runtime}" pull "${sif_path}" "${uri}"
+}
+
+# ── build_bind_mounts() ───────────────────────────────────────────────────────
+# Returns a string of "-B /abs/path:/abs/path" arguments covering all
+# directories that the containerised steps need to read or write.
+# Uses the same absolute paths on host and inside the container so that
+# any generated scripts that reference ${OUTDIR} etc. work without translation.
+run_in_sif() {
+    local sif_file="$1"
+    shift
+    if [[ "${DRY_RUN}" == true ]]; then
+        echo -e "${YELLOW}[DRY-RUN]${NC} [$(basename "${sif_file}")] $*"
+        return 0
+    fi
+    if [[ "${EXEC_MODE}" == "apptainer" ]]; then
+        local apptainer_bin
+        apptainer_bin=$(command -v apptainer 2>/dev/null || command -v singularity 2>/dev/null)
+        local binds
+        binds=$(build_bind_mounts)
+        # Execute via bash -c so compound pipes (like bowtie2 | samtools) run entirely inside the container
+        "${apptainer_bin}" exec --cleanenv ${binds} "${sif_file}" bash -c "$*"
+    else
         eval "$@"
     fi
 }
 
+
+build_bind_mounts() {
+    local -a bind_dirs=()
+
+    _add_bind() {
+        local raw_path="$1"
+        [[ -z "${raw_path}" ]] && return
+        # realpath -m resolves even if the path does not yet exist
+        local abs
+        abs=$(realpath -m "${raw_path}" 2>/dev/null || echo "${raw_path}")
+        # Avoid duplicates
+        local d
+        for d in "${bind_dirs[@]+"${bind_dirs[@]}"}"; do
+            [[ "${d}" == "${abs}" ]] && return
+        done
+        bind_dirs+=("${abs}")
+    }
+
+    _add_bind "${READS_DIR}"
+    _add_bind "${OUTDIR}"
+    _add_bind "$(dirname "${CHECKM2_DB}")"
+    [[ "${RUN_KRAKEN2}" == true ]] && [[ -d "${KRAKEN2_DB}" ]] && _add_bind "${KRAKEN2_DB}"
+    [[ "${RUN_GTDBTK}" == true ]] && [[ -d "${GTDBTK_DATA_PATH}" ]] && _add_bind "${GTDBTK_DATA_PATH}"
+    [[ -d "${METABINNER_SCRIPTS_DIR}" ]] && _add_bind "${METABINNER_SCRIPTS_DIR}"
+    [[ -n "${ASSEMBLY_IN}" ]] && _add_bind "$(dirname "${ASSEMBLY_IN}")"
+
+    local bind_str=""
+    local d
+    for d in "${bind_dirs[@]+"${bind_dirs[@]}"}"; do
+        bind_str+=" -B ${d}:${d}"
+    done
+
+    printf '%s' "${bind_str}"
+}
+
+# ── _env_to_sif(env_name) → sif_path / uri ───────────────────────────────────
+# Maps a mamba environment name to its SIF_* variable pair.
+_env_to_sif() {
+    local env_name="$1"
+    case "${env_name}" in
+        "${ENV_VAMB}")       echo "${SIF_VAMB}"       "${SIF_VAMB_URI}" ;;
+        "${ENV_METABINNER}") echo "${SIF_METABINNER}"  "${SIF_METABINNER_URI}" ;;
+        "${ENV_COMEBIN}")    echo "${SIF_COMEBIN}"     "${SIF_COMEBIN_URI}" ;;
+        "${ENV_METAWRAP}")   echo "${SIF_METAWRAP}"    "${SIF_METAWRAP_URI}" ;;
+        "${ENV_CHECKM2}")    echo "${SIF_CHECKM2}"     "${SIF_CHECKM2_URI}" ;;
+        "${ENV_GTDBTK}")     echo "${SIF_GTDBTK}"      "${SIF_GTDBTK_URI}" ;;
+        *)
+            log_error "[Container] No SIF mapping for environment: ${env_name}"
+            return 1 ;;
+    esac
+}
+
+# ── _has_gpu() ────────────────────────────────────────────────────────────────
+# Returns 0 (true) if at least one NVIDIA GPU is visible on the host.
+_has_gpu() {
+    command -v nvidia-smi &>/dev/null && nvidia-smi --query-gpu=name \
+        --format=csv,noheader &>/dev/null
+}
+
+# ── run_mamba_file(step_label, env_name, script_file) ────────────────────────
+# Hybrid dispatcher: routes execution through Apptainer or mamba depending on
+# EXEC_MODE. Signature is unchanged so all step functions work without edits.
 run_mamba_file() {
     local step_label="$1"
     local env_name="$2"
     local script_file="$3"
-    log_info "[Step ${step_label}] Dispatching to Mamba env: ${BOLD}${env_name}${NC}"
-    log_info "[Step ${step_label}] Script: ${script_file}"
-    if [[ "${DRY_RUN}" == true ]]; then
-        echo -e "${YELLOW}[DRY-RUN]${NC} mamba run -n ${env_name} bash ${script_file}"
-        echo -e "${YELLOW}[DRY-RUN]${NC} --- script contents ---"
-        cat "${script_file}"
-        echo -e "${YELLOW}[DRY-RUN]${NC} --- end of script ---"
-        return 0
+
+    if [[ "${EXEC_MODE}" == "apptainer" ]]; then
+        # Resolve container image for this environment
+        local sif_path uri
+        read -r sif_path uri < <(_env_to_sif "${env_name}")
+
+        log_info "[Step ${step_label}] Engine: Apptainer | Image: ${sif_path}"
+        log_info "[Step ${step_label}] Script: ${script_file}"
+
+        # Pull image if absent
+        ensure_sif_image "${sif_path}" "${uri}" || return 1
+
+        # Resolve bind-mount string
+        local bind_args
+        bind_args=$(build_bind_mounts)
+
+        # Optional GPU flag (Vamb and COMEBin can use CUDA)
+        local gpu_flag=""
+        if { [[ "${env_name}" == "${ENV_VAMB}" ]] || \
+             [[ "${env_name}" == "${ENV_COMEBIN}" ]]; } && _has_gpu; then
+            gpu_flag="--nv"
+            log_info "[Step ${step_label}] GPU detected — adding --nv flag."
+        fi
+
+        # Determine available runtime
+        local runtime="apptainer"
+        command -v apptainer &>/dev/null || runtime="singularity"
+
+        if [[ "${DRY_RUN}" == true ]]; then
+            echo -e "${YELLOW}[DRY-RUN]${NC} ${runtime} exec --cleanenv ${gpu_flag}${bind_args} ${sif_path} bash ${script_file}"
+            echo -e "${YELLOW}[DRY-RUN]${NC} --- script contents ---"
+            cat "${script_file}"
+            echo -e "${YELLOW}[DRY-RUN]${NC} --- end of script ---"
+            return 0
+        fi
+
+        # shellcheck disable=SC2086
+        "${runtime}" exec --cleanenv ${gpu_flag} ${bind_args} \
+            "${sif_path}" bash "${script_file}"
+
+    else
+        # ── mamba fallback ────────────────────────────────────────────────────
+        log_info "[Step ${step_label}] Engine: mamba | Env: ${BOLD}${env_name}${NC}"
+        log_info "[Step ${step_label}] Script: ${script_file}"
+        if [[ "${DRY_RUN}" == true ]]; then
+            echo -e "${YELLOW}[DRY-RUN]${NC} mamba run -n ${env_name} bash ${script_file}"
+            echo -e "${YELLOW}[DRY-RUN]${NC} --- script contents ---"
+            cat "${script_file}"
+            echo -e "${YELLOW}[DRY-RUN]${NC} --- end of script ---"
+            return 0
+        fi
+        mamba run -n "${env_name}" bash "${script_file}"
     fi
-    mamba run -n "${env_name}" bash "${script_file}"
 }
 
 check_tool() {
@@ -187,6 +591,12 @@ is_done() {
 
 mark_done() {
     local step="$1"
+
+    if [[ "${DRY_RUN}" == true ]]; then
+        log_info "[Step ${step}] Dry-run: checkpoint not written."
+        return 0
+    fi
+
     touch "${CHECKPOINT_DIR}/${step}.done"
     log_info "[Step ${step}] Checkpoint written."
 }
@@ -223,6 +633,71 @@ BINS_FOR_REFINEMENT_C=""
 REFINED_BINS_DIR=""
 BINS_FOR_QC=""
 HQ_BINS_DIR=""
+# Resource detection state (populated by detect_resources)
+_PHYS_CORES=0
+_PHYS_MEM_GB=0
+
+# ── Resource Detection ────────────────────────────────────────────────────────
+detect_resources() {
+    log_info "Detecting hardware resources..."
+
+    # ── CPU detection ────────────────────────────────────────────────────────
+    local total_cores
+    if command -v nproc &>/dev/null; then
+        total_cores=$(nproc)
+    elif command -v getconf &>/dev/null; then
+        total_cores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+    elif [[ -r /proc/cpuinfo ]]; then
+        total_cores=$(grep -c '^processor' /proc/cpuinfo)
+    else
+        total_cores=1
+        log_warn "[Resources] Cannot detect CPU count; defaulting to 1 core."
+    fi
+    _PHYS_CORES="${total_cores}"
+
+    if [[ "${THREADS}" == "auto" ]]; then
+        if (( total_cores > 4 )); then
+            THREADS=$(( total_cores - CPU_RESERVE ))
+        else
+            THREADS=$(( total_cores > 0 ? total_cores : 1 ))
+        fi
+        log_info "[Resources] CPU auto-detected: ${THREADS} of ${total_cores} logical cores assigned (reserve=${CPU_RESERVE})."
+    else
+        # Manual value — validate against hardware
+        if (( THREADS > total_cores )); then
+            log_warn "[Resources] THREADS=${THREADS} exceeds detected cores (${total_cores}). Consider lowering to avoid contention."
+        fi
+        log_info "[Resources] CPU (manual): ${THREADS} of ${total_cores} logical cores."
+    fi
+
+    # ── RAM detection ────────────────────────────────────────────────────────
+    local mem_kb=0
+    if [[ -r /proc/meminfo ]]; then
+        # Prefer MemAvailable (free + reclaimable); fall back to MemTotal
+        mem_kb=$(awk '/^MemAvailable:/{print $2; found=1} END{if(!found) exit 1}' \
+                      /proc/meminfo 2>/dev/null) || \
+        mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    else
+        log_warn "[Resources] /proc/meminfo not readable; defaulting to 4 GB."
+        mem_kb=4194304  # 4 GB in kB
+    fi
+
+    local mem_total_gb=$(( mem_kb / 1048576 ))   # kB → GB (integer)
+    [[ "${mem_total_gb}" -lt 1 ]] && mem_total_gb=1
+    _PHYS_MEM_GB="${mem_total_gb}"
+
+    if [[ "${MEMORY}" == "auto" ]]; then
+        MEMORY=$(( mem_total_gb * MEM_FRACTION / 100 ))
+        [[ "${MEMORY}" -lt 4 ]] && MEMORY=4   # hard floor: 4 GB
+        log_info "[Resources] RAM auto-detected: ${MEMORY} GB assigned from ${mem_total_gb} GB available (${MEM_FRACTION}% cap)."
+    else
+        # Manual value — validate
+        if (( MEMORY > mem_total_gb )); then
+            log_warn "[Resources] MEMORY=${MEMORY} GB exceeds detected RAM (${mem_total_gb} GB). OOM risk!"
+        fi
+        log_info "[Resources] RAM (manual): ${MEMORY} GB of ${mem_total_gb} GB available."
+    fi
+}
 
 # ── Pre-Flight Validation ─────────────────────────────────────────────────────
 preflight_check() {
@@ -247,59 +722,112 @@ preflight_check() {
 
     # Kraken2 DB
     if [[ "${RUN_KRAKEN2}" == true ]]; then
-        if [[ "${KRAKEN2_DB}" == *"/path/to/"* ]] || [[ ! -d "${KRAKEN2_DB}" ]]; then
+        if [[ ! -d "${KRAKEN2_DB}" ]]; then
             log_error "KRAKEN2_DB not set or not found: ${KRAKEN2_DB}"
             (( errors++ )) || true
         fi
     fi
 
     # CheckM2 DB
-    if [[ "${CHECKM2_DB}" == *"/path/to/"* ]] || [[ ! -f "${CHECKM2_DB}" ]]; then
+    if [[ ! -f "${CHECKM2_DB}" ]]; then
         log_error "CHECKM2_DB not set or not found: ${CHECKM2_DB}"
         (( errors++ )) || true
     fi
 
     # GTDB-Tk data
     if [[ "${RUN_GTDBTK}" == true ]]; then
-        if [[ "${GTDBTK_DATA_PATH}" == *"/path/to/"* ]] || [[ ! -d "${GTDBTK_DATA_PATH}" ]]; then
+        if [[ ! -d "${GTDBTK_DATA_PATH}" ]]; then
             log_error "GTDBTK_DATA_PATH not set or not found: ${GTDBTK_DATA_PATH}"
             (( errors++ )) || true
         fi
     fi
 
-    # MetaBinner scripts directory
-    if [[ "${METABINNER_SCRIPTS_DIR}" == *"/path/to/"* ]] || [[ ! -d "${METABINNER_SCRIPTS_DIR}" ]]; then
-        log_error "METABINNER_SCRIPTS_DIR not set or not found: ${METABINNER_SCRIPTS_DIR}"
-        (( errors++ )) || true
-    fi
-
-    # Required direct binaries
-    local required_bins=(bowtie2 bowtie2-build samtools jgi_summarize_bam_contig_depths coverm)
-    [[ "${RUN_FASTP}" == true ]]   && required_bins+=(fastp)
-    [[ "${RUN_MEGAHIT}" == true ]] && required_bins+=(megahit)
-    [[ "${RUN_KRAKEN2}" == true ]] && required_bins+=(kraken2 bracken)
-    for tool in "${required_bins[@]}"; do
-        if ! command -v "${tool}" &>/dev/null; then
-            log_error "Required binary not found in PATH: ${tool}"
+    # MetaBinner scripts directory — validation differs by engine
+    if [[ "${EXEC_MODE}" == "mamba" ]]; then
+        # mamba: directory must exist on the host
+        if [[ -z "${METABINNER_SCRIPTS_DIR}" || ! -d "${METABINNER_SCRIPTS_DIR}" ]]; then
+            log_error "METABINNER_SCRIPTS_DIR not set or not found on host: ${METABINNER_SCRIPTS_DIR}"
             (( errors++ )) || true
         fi
-    done
-
-    # mamba
-    if ! command -v mamba &>/dev/null; then
-        log_error "'mamba' not found in PATH."
-        (( errors++ )) || true
+    else
+        # apptainer: directory lives inside the container
+        if [[ -z "${METABINNER_SCRIPTS_DIR}" ]]; then
+            log_error "METABINNER_SCRIPTS_DIR is empty."
+            log_error "For EXEC_MODE=apptainer use an in-container path (default: /opt/metabinner/scripts)."
+            (( errors++ )) || true
+        elif [[ -f "${SIF_METABINNER}" ]] && [[ "${DRY_RUN}" == false ]]; then
+            # .sif already cached → verify the path exists inside the container
+            local _rt="apptainer"
+            command -v apptainer &>/dev/null || _rt="singularity"
+            log_info "[Preflight] Verifying METABINNER_SCRIPTS_DIR inside container image..."
+            if ! "${_rt}" exec --cleanenv "${SIF_METABINNER}" \
+                    test -d "${METABINNER_SCRIPTS_DIR}" 2>/dev/null; then
+                log_error "METABINNER_SCRIPTS_DIR '${METABINNER_SCRIPTS_DIR}' not found inside ${SIF_METABINNER}."
+                log_error "Check the container's internal layout or adjust METABINNER_SCRIPTS_DIR."
+                (( errors++ )) || true
+            else
+                log_info "[Preflight] METABINNER_SCRIPTS_DIR OK inside container: ${METABINNER_SCRIPTS_DIR}"
+            fi
+        elif [[ ! -f "${SIF_METABINNER}" ]] && [[ "${AUTO_PULL_SIF}" == true ]]; then
+            log_info "[Preflight] ${SIF_METABINNER} not yet downloaded; METABINNER_SCRIPTS_DIR will be validated after pull."
+        fi
     fi
 
-    # Detect reads
-    shopt -s nullglob
-    local _probe=("${READS_DIR}"/*${READ_SUFFIX_R1})
-    shopt -u nullglob
-    if [[ ${#_probe[@]} -eq 0 ]]; then
-        log_error "No reads matching *${READ_SUFFIX_R1} found in ${READS_DIR}"
-        (( errors++ )) || true
+    # Required direct binaries are host dependencies only in mamba mode.
+    if [[ "${EXEC_MODE}" == "mamba" ]]; then
+        local required_bins=(bowtie2 bowtie2-build samtools jgi_summarize_bam_contig_depths coverm)
+        [[ "${RUN_FASTP}" == true ]]   && required_bins+=(fastp)
+        [[ "${RUN_MEGAHIT}" == true ]] && required_bins+=(megahit)
+        [[ "${RUN_KRAKEN2}" == true ]] && required_bins+=(kraken2 bracken)
+        for tool in "${required_bins[@]}"; do
+            if ! command -v "${tool}" &>/dev/null; then
+                log_error "Required binary not found in PATH: ${tool}"
+                (( errors++ )) || true
+            fi
+        done
+    fi
+
+    # Container / environment runtime
+    if [[ "${EXEC_MODE}" == "apptainer" ]]; then
+        if ! command -v apptainer &>/dev/null && ! command -v singularity &>/dev/null; then
+            log_error "EXEC_MODE=apptainer but neither 'apptainer' nor 'singularity' found in PATH."
+            (( errors++ )) || true
+        else
+            local _rt="apptainer"
+            command -v apptainer &>/dev/null || _rt="singularity"
+            log_info "Container runtime detected: ${_rt}"
+        fi
+        # Warn about SIF_DIR accessibility
+        if [[ ! -d "${SIF_DIR}" ]]; then
+            log_warn "SIF_DIR does not exist yet (${SIF_DIR}); it will be created on first pull."
+        fi
     else
-        log_info "Found ${#_probe[@]} read pair(s) in ${READS_DIR}"
+        # mamba mode
+        if ! command -v mamba &>/dev/null; then
+            log_error "'mamba' not found in PATH."
+            (( errors++ )) || true
+        fi
+    fi
+
+    # Detect reads and verify each R1 has its matching R2.
+    if [[ -d "${READS_DIR}" ]]; then
+        shopt -s nullglob
+        local _probe=("${READS_DIR}"/*${READ_SUFFIX_R1})
+        shopt -u nullglob
+        if [[ ${#_probe[@]} -eq 0 ]]; then
+            log_error "No reads matching *${READ_SUFFIX_R1} found in ${READS_DIR}"
+            (( errors++ )) || true
+        else
+            local _r1 _r2
+            for _r1 in "${_probe[@]}"; do
+                _r2="${_r1/${READ_SUFFIX_R1}/${READ_SUFFIX_R2}}"
+                if [[ ! -f "${_r2}" ]]; then
+                    log_error "R2 file not found for R1 read: ${_r1} (expected ${_r2})"
+                    (( errors++ )) || true
+                fi
+            done
+            log_info "Found ${#_probe[@]} R1 read file(s) in ${READS_DIR}"
+        fi
     fi
 
     if [[ "${errors}" -gt 0 ]]; then
@@ -368,7 +896,7 @@ step_01_fastp() {
         local step_log="${LOGS_DIR}/step_01_fastp_${base}.log"
 
         log_info "[Step 01] Processing sample: ${base}"
-        run_cmd fastp \
+        run_tool "01" "${SIF_FASTP}" "${SIF_FASTP_URI}" fastp \
             -i "${r1}" \
             -I "${r2}" \
             -o "${out_r1}" \
@@ -471,7 +999,7 @@ step_02_megahit() {
         run_cmd rm -rf "${megahit_outdir}"
     fi
 
-    run_cmd megahit \
+    run_tool "02" "${SIF_MEGAHIT}" "${SIF_MEGAHIT_URI}" megahit \
         -1 "${r1_list}" \
         -2 "${r2_list}" \
         -o "${megahit_outdir}" \
@@ -552,7 +1080,7 @@ step_03_kraken2_bracken() {
         local bracken_log="${LOGS_DIR}/step_03_bracken_${base}.log"
 
         log_info "[Step 03] Running Kraken2 for sample: ${base}"
-        run_cmd kraken2 \
+        run_tool "03" "${SIF_KRAKEN2}" "${SIF_KRAKEN2_URI}" kraken2 \
             --db "${KRAKEN2_DB}" \
             --threads "${THREADS}" \
             --paired "${r1}" "${r2}" \
@@ -561,7 +1089,7 @@ step_03_kraken2_bracken() {
             2>&1 | tee "${kraken_log}"
 
         log_info "[Step 03] Running Bracken for sample: ${base}"
-        run_cmd bracken \
+        run_tool "03" "${SIF_KRAKEN2}" "${SIF_KRAKEN2_URI}" bracken \
             -d "${KRAKEN2_DB}" \
             -i "${kraken_report}" \
             -o "${bracken_out}" \
@@ -599,7 +1127,7 @@ step_04_mapping_depth() {
     local build_log="${LOGS_DIR}/step_04_bowtie2_build.log"
 
     log_info "[Step 04] Building Bowtie2 index..."
-    run_cmd bowtie2-build \
+    run_tool "04" "${SIF_MAPPING}" "${SIF_MAPPING_URI}" bowtie2-build \
         --threads "${THREADS}" \
         "${CONTIGS}" \
         "${bt2_index}" \
@@ -638,7 +1166,7 @@ step_04_mapping_depth() {
         local bt2_log="${LOGS_DIR}/step_04_bowtie2_${base}.log"
 
         log_info "[Step 04] Mapping sample: ${base}"
-        run_cmd "bowtie2 --very-sensitive-local -p ${THREADS} --time --reorder \
+        run_tool_shell "04" "${SIF_MAPPING}" "${SIF_MAPPING_URI}" "bowtie2 --very-sensitive-local -p ${THREADS} --time --reorder \
             -x ${bt2_index} \
             -1 ${r1} \
             -2 ${r2} \
@@ -647,7 +1175,7 @@ step_04_mapping_depth() {
             | samtools sort -@ ${THREADS} -o ${bam_sorted} -"
 
         log_info "[Step 04] Indexing BAM: ${bam_sorted}"
-        run_cmd samtools index -@ "${THREADS}" "${bam_sorted}"
+        run_tool "04" "${SIF_MAPPING}" "${SIF_MAPPING_URI}" samtools index -@ "${THREADS}" "${bam_sorted}"
 
         SORTED_BAMS+=("${bam_sorted}")
     done
@@ -656,7 +1184,7 @@ step_04_mapping_depth() {
     local jgi_log="${LOGS_DIR}/step_04_jgi_depth.log"
 
     log_info "[Step 04] Running jgi_summarize_bam_contig_depths..."
-    run_cmd jgi_summarize_bam_contig_depths \
+    run_tool "04" "${SIF_MAPPING}" "${SIF_MAPPING_URI}" jgi_summarize_bam_contig_depths \
         --outputDepth "${DEPTH_FILE}" \
         "${SORTED_BAMS[@]}" \
         2>&1 | tee "${jgi_log}"
@@ -1088,7 +1616,7 @@ step_07_reassembly() {
     cat > "${reassembly_script}" <<REASSEMBLY_SCRIPT
 #!/usr/bin/env bash
 set -euo pipefail
-metaWRAP reassemble_bins \\
+metawrap reassemble_bins \\
     -o "${REASSEMBLY_DIR}" \\
     -b "${REFINED_BINS_DIR}" \\
     -1 "${REASSEMBLY_DIR}/all_reads_R1.fastq.gz" \\
@@ -1309,7 +1837,7 @@ step_11_coverm() {
         fi
 
         log_info "[Step 11] Running CoverM for sample: ${base}"
-        run_cmd coverm genome \
+        run_tool "11" "${SIF_COVERM}" "${SIF_COVERM_URI}" coverm genome \
             --read1 "${r1}" \
             --read2 "${r2}" \
             --genome-fasta-directory "${HQ_BINS_DIR}" \
@@ -1348,7 +1876,7 @@ step_12_summary_r() {
 
     log_info "[Step 12] Running R summary script..."
 
-    run_cmd Rscript - <<RSCRIPT
+    run_tool "12" "${SIF_R}" "${SIF_R_URI}" Rscript - <<RSCRIPT
 ###############################################################################
 # Final summary — base R only, no external packages
 ###############################################################################
@@ -1483,6 +2011,9 @@ main() {
         mkdir -p "${d}"
     done
 
+    # Auto-detect / validate compute resources before printing the banner
+    detect_resources
+
     # Print run configuration banner
     echo -e "\n${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}${BOLD}║         SHOTGUN METAGENOMICS PIPELINE — CONFIGURATION         ║${NC}"
@@ -1490,8 +2021,13 @@ main() {
     echo -e "${CYAN}${BOLD}║${NC}  READS_DIR              : ${READS_DIR}"
     echo -e "${CYAN}${BOLD}║${NC}  OUTDIR                 : ${OUTDIR}"
     echo -e "${CYAN}${BOLD}║${NC}  ASSEMBLY_IN            : ${ASSEMBLY_IN:-<run MEGAHIT>}"
-    echo -e "${CYAN}${BOLD}║${NC}  THREADS                : ${THREADS}"
-    echo -e "${CYAN}${BOLD}║${NC}  MEMORY (GB)            : ${MEMORY}"
+    echo -e "${CYAN}${BOLD}║${NC}  THREADS                : ${THREADS} (de ${_PHYS_CORES} disponibles)"
+    echo -e "${CYAN}${BOLD}║${NC}  MEMORY (GB)            : ${MEMORY} GB (de ${_PHYS_MEM_GB} GB disponibles)"
+    echo -e "${CYAN}${BOLD}║${NC}  CPU_RESERVE            : ${CPU_RESERVE} cores"
+    echo -e "${CYAN}${BOLD}║${NC}  MEM_FRACTION           : ${MEM_FRACTION}%"
+    echo -e "${CYAN}${BOLD}║${NC}  EXEC_MODE              : ${EXEC_MODE}"
+    echo -e "${CYAN}${BOLD}║${NC}  SIF_DIR                : ${SIF_DIR}"
+    echo -e "${CYAN}${BOLD}║${NC}  AUTO_PULL_SIF          : ${AUTO_PULL_SIF}"
     echo -e "${CYAN}${BOLD}║${NC}  MIN_CONTIG_LEN         : ${MIN_CONTIG_LEN} bp"
     echo -e "${CYAN}${BOLD}║${NC}  KRAKEN2_DB             : ${KRAKEN2_DB}"
     echo -e "${CYAN}${BOLD}║${NC}  CHECKM2_DB             : ${CHECKM2_DB}"

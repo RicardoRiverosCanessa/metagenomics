@@ -1,0 +1,32 @@
+Bootstrap: docker
+From: condaforge/miniforge3:latest
+
+%labels
+    Author Ricardo Riveros
+    Tool Kraken2 + Bracken
+    Step 03_kraken2_bracken
+
+%post
+    export LC_ALL=C
+    export CONDA_PKGS_DIRS=/tmp/conda-pkgs
+    mkdir -p /tmp/conda-pkgs
+
+    apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates procps wget && \
+        rm -rf /var/lib/apt/lists/*
+
+    mamba create -y -p /opt/env --copy \
+        -c conda-forge -c bioconda \
+        kraken2 \
+        bracken && \
+        mamba clean -afy
+
+    rm -rf /tmp/conda-pkgs
+
+%environment
+    export LC_ALL=C
+    export PATH="/opt/env/bin:/opt/conda/bin:${PATH}"
+
+%test
+    kraken2 --version
+    bracken -v || which bracken

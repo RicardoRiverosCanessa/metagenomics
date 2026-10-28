@@ -1,0 +1,39 @@
+Bootstrap: docker
+From: condaforge/miniforge3:latest
+
+%labels
+    Author Ricardo Riveros
+    Tool Vamb
+    Version 4.1.3
+
+%post
+    set -e
+    export LC_ALL=C
+    export CONDA_PKGS_DIRS=/tmp/conda-pkgs
+    mkdir -p /tmp/conda-pkgs
+
+    apt-get update && apt-get install -y --no-install-recommends \
+        gcc g++ ca-certificates procps && \
+        rm -rf /var/lib/apt/lists/*
+
+    # 1. Crear entorno ligero con Python 3.10 y pip
+    mamba create -y -p /opt/env --copy \
+        -c conda-forge \
+        python=3.10 \
+        pip && \
+        mamba clean -afy
+
+    rm -rf /tmp/conda-pkgs
+
+    # 2. Instalar PyTorch CPU-only y Vamb >= 4.1.3 sin librerías pesadas de NVIDIA CUDA
+    /opt/env/bin/pip install --no-cache-dir \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        torch \
+        "vamb>=4.1.3"
+
+%environment
+    export LC_ALL=C
+    export PATH="/opt/env/bin:/opt/conda/bin:${PATH}"
+
+%test
+    vamb --version

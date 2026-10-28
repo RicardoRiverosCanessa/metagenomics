@@ -1,0 +1,36 @@
+Bootstrap: docker
+From: condaforge/miniforge3:latest
+
+%labels
+    Author Ricardo Riveros
+    Tool Bowtie2 + SAMtools + MetaBAT2 (jgi_summarize_bam_contig_depths)
+    Step 04_mapping_depth
+
+%post
+    export LC_ALL=C
+    export CONDA_PKGS_DIRS=/tmp/conda-pkgs
+    mkdir -p /tmp/conda-pkgs
+
+    apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates procps && \
+        rm -rf /var/lib/apt/lists/*
+
+    # Crear un entorno limpio en /opt/env usando --copy para evitar errores de hardlinks en fakeroot
+    mamba create -y -p /opt/env --copy \
+        -c conda-forge -c bioconda \
+        bowtie2 \
+        samtools \
+        metabat2 && \
+        mamba clean -afy
+
+    rm -rf /tmp/conda-pkgs
+
+%environment
+    export LC_ALL=C
+    export PATH="/opt/env/bin:/opt/conda/bin:${PATH}"
+
+%test
+    bowtie2 --version
+    bowtie2-build --version
+    samtools --version
+    jgi_summarize_bam_contig_depths --help || true

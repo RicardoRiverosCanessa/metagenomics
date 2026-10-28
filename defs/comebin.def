@@ -1,0 +1,64 @@
+Bootstrap: docker
+From: condaforge/miniforge3:latest
+
+%labels
+    Author Ricardo Riveros
+    Tool COMEBin
+    Version 1.0.4
+
+%post
+    set -e
+    export LC_ALL=C
+    export CONDA_PKGS_DIRS=/tmp/conda-pkgs
+    mkdir -p /tmp/conda-pkgs
+
+    apt-get update && apt-get install -y --no-install-recommends \
+        git wget build-essential ca-certificates procps && \
+        rm -rf /var/lib/apt/lists/*
+
+    # 1. Crear entorno dedicado en /opt/env usando --copy
+    mamba create -y -p /opt/env --copy \
+        -c pytorch -c conda-forge -c bioconda \
+        python=3.9 \
+        pytorch \
+        cpuonly \
+        scikit-learn \
+        pandas \
+        biopython \
+        numpy \
+        scipy \
+        tqdm \
+        hmmer \
+        prodigal \
+        samtools \
+        bedtools \
+        fraggenescan && \
+        mamba clean -afy
+
+    # 2. Clonar COMEBin desde GitHub
+    git clone --depth 1 https://github.com/ziyewang/COMEBin.git /opt/COMEBin_repo
+
+    # 3. Localizar run_comebin.sh (viene dentro de /opt/COMEBin_repo/COMEBin/)
+    if [ -f "/opt/COMEBin_repo/COMEBin/run_comebin.sh" ]; then
+        COMEBIN_HOME="/opt/COMEBin_repo/COMEBin"
+    else
+        COMEBIN_HOME=$(dirname "$(find /opt/COMEBin_repo -name 'run_comebin.sh' | head -n 1)")
+    fi
+
+    chmod -R +x "${COMEBIN_HOME}"
+
+    # 4. Crear enlace estándar en /opt/COMEBin y en /opt/env/bin
+    ln -sf "${COMEBIN_HOME}" /opt/COMEBin
+    ln -sf "${COMEBIN_HOME}/run_comebin.sh" /opt/env/bin/run_comebin.sh
+
+    rm -rf /tmp/conda-pkgs
+
+%environment
+    export LC_ALL=C
+    export PATH="/opt/env/bin:/opt/COMEBin:/opt/conda/bin:${PATH}"
+    export COMEBIN_SCRIPT="/opt/COMEBin/run_comebin.sh"
+
+%test
+    /opt/env/bin/python -c "import torch; print('PyTorch OK:', torch.__version__)"
+    which run_comebin.sh
+    test -f /opt/COMEBin/run_comebin.sh
