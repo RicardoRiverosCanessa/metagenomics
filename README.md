@@ -16,19 +16,21 @@ The workflow supports two execution modes:
 | 01 | Read quality control | fastp | Yes |
 | 02 | Metagenome assembly | MEGAHIT | Yes |
 | 03 | Read-level taxonomic profiling | Kraken2 + Bracken | Yes |
-| 04 | Read mapping and contig depth | Bowtie2, SAMtools, JGI depth | No |
-| 05a | Binning | Vamb | No |
-| 05b | Binning | MetaBinner | No |
-| 05c | Binning | COMEBin | No |
-| 06 | Bin refinement | MetaWRAP | No |
+| 04 | Read mapping and contig depth | Bowtie2, SAMtools, JGI depth | Yes |
+| 05a | Binning | Vamb | Yes |
+| 05b | Binning | MetaBinner | Yes |
+| 05c | Binning | COMEBin | Yes |
+| 06 | Bin refinement | MetaWRAP | Yes |
 | 07 | Bin reassembly | MetaWRAP | Yes |
-| 08 | MAG quality assessment | CheckM2 | No |
-| 09 | MAG quality filtering | Bash/AWK | No |
+| 08 | MAG quality assessment | CheckM2 | Yes |
+| 09 | MAG quality filtering | Bash/AWK | Yes |
 | 10 | MAG taxonomic classification | GTDB-Tk | Yes |
-| 11 | MAG abundance estimation | CoverM | No |
-| 12 | Integrated summary table | Base R | No |
+| 11 | MAG abundance estimation | CoverM | Yes |
+| 12 | Integrated summary table | Base R | Yes |
 
-By default, the pipeline enables fastp, MEGAHIT, Kraken2/Bracken, and GTDB-Tk. Bin reassembly is disabled by default.
+All stages are enabled by default except MetaWRAP reassembly. Mapping, binning,
+refinement, CheckM2, MAG filtering, CoverM, and summary can be disabled
+independently when their dependencies are also disabled as described below.
 
 ## Repository structure
 
@@ -90,7 +92,7 @@ The pipeline accepts database paths as command-line arguments:
 | Argument | Expected path | Required when |
 |---|---|---|
 | `--kraken2-db` | Kraken2/Bracken database directory | Kraken2 is enabled |
-| `--checkm2-db` | CheckM2 DIAMOND database file, such as `uniref100.KO.1.dmnd` | Always |
+| `--checkm2-db` | CheckM2 DIAMOND database file, such as `uniref100.KO.1.dmnd` | CheckM2 is enabled and reached |
 | `--gtdbtk-data-path` | GTDB-Tk reference-data directory | GTDB-Tk is enabled |
 
 The Kraken2 database must contain the files needed by Kraken2 and the Bracken files matching the configured read length and taxonomic level.
@@ -171,10 +173,45 @@ When threads or memory remain set to `auto`, the pipeline detects available reso
 | `--kraken2` | `--no-kraken2` | Enabled |
 | `--reassembly` | `--no-reassembly` | Disabled |
 | `--gtdbtk` | `--no-gtdbtk` | Enabled |
+| `--mapping` | `--no-mapping` | Enabled |
+| `--binning` | `--no-binning` | Enabled |
+| `--refinement` | `--no-refinement` | Enabled |
+| `--checkm2` | `--no-checkm2` | Enabled |
+| `--mag-filtering` | `--no-mag-filtering` | Enabled |
+| `--coverm` | `--no-coverm` | Enabled |
+| `--summary` | `--no-summary` | Enabled |
 | `--dry-run` | `--no-dry-run` | Disabled |
 | `--force` | `--no-force` | Disabled |
 
 Command-line arguments override environment variables and script defaults.
+
+### Stage dependencies and stopping early
+
+The pipeline checks the requested configuration during preflight and does not
+silently enable or disable stages. The supported dependencies are:
+
+- Binning requires mapping.
+- Refinement requires binning.
+- Reassembly requires refinement.
+- CheckM2 requires refinement or reassembly.
+- MAG filtering requires CheckM2.
+- GTDB-Tk and CoverM each require MAG filtering.
+
+Use `--stop-after <stage>` to finish successfully after a stage has completed
+and its outputs have been validated. Accepted values are `mapping`, `binning`,
+`refinement`, `reassembly`, `checkm2`, `mag-filtering`, `gtdbtk`, `coverm`, and
+`summary`. The selected stage must be enabled and its dependencies must be
+satisfied. For example:
+
+```bash
+bash run_metagenomics_pipeline.sh --reads-dir /data/reads \
+  --kraken2-db /databases/kraken2 --stop-after binning
+```
+
+The final summary uses the available MAG FASTA list as its base and adds
+CheckM2, GTDB-Tk, and CoverM columns when their result files are available.
+Unavailable source fields remain `NA`; a summary is omitted with a warning
+when no non-empty MAGs are available.
 
 ## Examples
 
@@ -304,7 +341,7 @@ Important outputs include:
 - `09_mags/`: MAGs meeting the configured quality thresholds.
 - `10_gtdbtk/`: GTDB-Tk classifications.
 - `11_abundance/`: per-sample CoverM abundance tables.
-- `12_summary/final_summary.tsv`: integrated CheckM2, GTDB-Tk, and CoverM table.
+- `12_summary/final_summary.tsv`: MAG-based summary with available CheckM2, GTDB-Tk, and CoverM data.
 - `logs/`: step-specific execution logs and generated helper scripts.
 
 ## MAG filtering defaults
@@ -367,7 +404,7 @@ Confirm that the files are directly inside the supplied reads directory and foll
 ### Database path rejected
 
 - `--kraken2-db` expects a directory.
-- `--checkm2-db` expects the CheckM2 `.dmnd` file itself.
+- `--checkm2-db` expects the CheckM2 `.dmnd` file itself when CheckM2 is enabled and reached.
 - `--gtdbtk-data-path` expects the GTDB-Tk reference-data directory.
 
 ### MetaBinner scripts not found
@@ -406,8 +443,8 @@ make clean-tmp
 
 - The pipeline is designed for Linux and relies on Bash-specific features.
 - The current read suffixes are fixed to `_R1.fastq.gz` and `_R2.fastq.gz`.
-- CheckM2, mapping, binning, refinement, MAG filtering, and CoverM are mandatory stages in the present workflow.
-- The final summary always requires the CheckM2 quality report. GTDB-Tk information may be absent when that stage is disabled.
+- Mapping, binning, refinement, CheckM2, MAG filtering, CoverM, and summary are enabled by default but can be disabled subject to their dependencies.
+- The final summary uses a MAG list as its base and can include CheckM2, GTDB-Tk, and CoverM data independently.
 - Container tags and tool compatibility should be validated before long production runs.
 
 ## Citation

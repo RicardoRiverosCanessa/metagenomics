@@ -164,6 +164,14 @@ RUN_MEGAHIT="${RUN_MEGAHIT:-true}"            # Step 02 — false requires ASSEM
 RUN_KRAKEN2="${RUN_KRAKEN2:-true}"            # Step 03
 RUN_REASSEMBLY="${RUN_REASSEMBLY:-false}"     # Step 07
 RUN_GTDBTK="${RUN_GTDBTK:-true}"              # Step 10
+RUN_MAPPING="${RUN_MAPPING:-true}"
+RUN_BINNING="${RUN_BINNING:-true}"
+RUN_REFINEMENT="${RUN_REFINEMENT:-true}"
+RUN_CHECKM2="${RUN_CHECKM2:-true}"
+RUN_MAG_FILTERING="${RUN_MAG_FILTERING:-true}"
+RUN_COVERM="${RUN_COVERM:-true}"
+RUN_SUMMARY="${RUN_SUMMARY:-true}"
+STOP_AFTER="${STOP_AFTER:-}"
 
 # ── Execution Flags ───────────────────────────────────────────────────────────
 DRY_RUN="${DRY_RUN:-false}"                   # Print commands without running them
@@ -202,6 +210,18 @@ Options:
   --reassembly / --no-reassembly
                                Enable/disable MetaWrap reassembly (default: disabled)
   --gtdbtk / --no-gtdbtk       Enable/disable GTDB-Tk (default: enabled)
+  --mapping / --no-mapping     Enable/disable mapping (default: enabled)
+  --binning / --no-binning     Enable/disable binning (default: enabled)
+  --refinement / --no-refinement
+                               Enable/disable bin refinement (default: enabled)
+  --checkm2 / --no-checkm2     Enable/disable CheckM2 (default: enabled)
+  --mag-filtering / --no-mag-filtering
+                               Enable/disable MAG filtering (default: enabled)
+  --coverm / --no-coverm       Enable/disable CoverM (default: enabled)
+  --summary / --no-summary     Enable/disable final summary (default: enabled)
+  --stop-after <stage>         Stop after: mapping, binning, refinement,
+                               reassembly, checkm2, mag-filtering, gtdbtk,
+                               coverm, or summary
   --dry-run / --no-dry-run     Print commands without executing them (default: disabled)
   --force / --no-force         Ignore checkpoints (default: disabled)
   -h, --help                   Show this help message and exit
@@ -280,6 +300,24 @@ while [[ $# -gt 0 ]]; do
         --no-reassembly)  RUN_REASSEMBLY=false; shift ;;
         --gtdbtk)     RUN_GTDBTK=true;    shift ;;
         --no-gtdbtk)  RUN_GTDBTK=false;   shift ;;
+        --mapping) RUN_MAPPING=true; shift ;;
+        --no-mapping) RUN_MAPPING=false; shift ;;
+        --binning) RUN_BINNING=true; shift ;;
+        --no-binning) RUN_BINNING=false; shift ;;
+        --refinement) RUN_REFINEMENT=true; shift ;;
+        --no-refinement) RUN_REFINEMENT=false; shift ;;
+        --checkm2) RUN_CHECKM2=true; shift ;;
+        --no-checkm2) RUN_CHECKM2=false; shift ;;
+        --mag-filtering) RUN_MAG_FILTERING=true; shift ;;
+        --no-mag-filtering) RUN_MAG_FILTERING=false; shift ;;
+        --coverm) RUN_COVERM=true; shift ;;
+        --no-coverm) RUN_COVERM=false; shift ;;
+        --summary) RUN_SUMMARY=true; shift ;;
+        --no-summary) RUN_SUMMARY=false; shift ;;
+        --stop-after)
+            [[ -z "${2:-}" || "${2:-}" == -* ]] && {
+                echo "[ERROR] --stop-after requires a stage value." >&2; exit 1; }
+            STOP_AFTER="$2"; shift 2 ;;
         --dry-run)     DRY_RUN=true;      shift ;;
         --no-dry-run)  DRY_RUN=false;     shift ;;
         --force)     FORCE_RERUN=true;   shift ;;
@@ -347,17 +385,17 @@ run_tool() {
     ensure_sif_image "${sif_path}" "${uri}" || return 1
     local runtime="apptainer"
     command -v apptainer &>/dev/null || runtime="singularity"
-    local binds
-    binds=$(build_bind_mounts)
+    local -a bind_args=()
+    build_bind_mounts bind_args
 
     log_info "[Step ${step_label}] Engine: Apptainer | Image: ${sif_path}"
     if [[ "${DRY_RUN}" == true ]]; then
-        echo -e "${YELLOW}[DRY-RUN]${NC} ${runtime} exec --cleanenv ${binds} ${sif_path} $*"
+        printf '[DRY-RUN] %q ' "${runtime}" exec --cleanenv "${bind_args[@]}" "${sif_path}" "$@"
+        printf '\n'
         return 0
     fi
 
-    # shellcheck disable=SC2086
-    "${runtime}" exec --cleanenv ${binds} "${sif_path}" "$@"
+    "${runtime}" exec --cleanenv "${bind_args[@]}" "${sif_path}" "$@"
 }
 
 # ── run_tool_shell(step_label, sif_path, uri, command) ─────────────────────────
@@ -376,17 +414,17 @@ run_tool_shell() {
     ensure_sif_image "${sif_path}" "${uri}" || return 1
     local runtime="apptainer"
     command -v apptainer &>/dev/null || runtime="singularity"
-    local binds
-    binds=$(build_bind_mounts)
+    local -a bind_args=()
+    build_bind_mounts bind_args
 
     log_info "[Step ${step_label}] Engine: Apptainer | Image: ${sif_path}"
     if [[ "${DRY_RUN}" == true ]]; then
-        echo -e "${YELLOW}[DRY-RUN]${NC} ${runtime} exec --cleanenv ${binds} ${sif_path} bash -o pipefail -c ${command}"
+        printf '[DRY-RUN] %q ' "${runtime}" exec --cleanenv "${bind_args[@]}" "${sif_path}" bash -o pipefail -c "${command}"
+        printf '\n'
         return 0
     fi
 
-    # shellcheck disable=SC2086
-    "${runtime}" exec --cleanenv ${binds} "${sif_path}" bash -o pipefail -c "${command}"
+    "${runtime}" exec --cleanenv "${bind_args[@]}" "${sif_path}" bash -o pipefail -c "${command}"
 }
 
 # ── ensure_sif_image(sif_path, uri) ──────────────────────────────────────────
@@ -429,8 +467,8 @@ ensure_sif_image() {
     "${runtime}" pull "${sif_path}" "${uri}"
 }
 
-# ── build_bind_mounts() ───────────────────────────────────────────────────────
-# Returns a string of "-B /abs/path:/abs/path" arguments covering all
+# ── build_bind_mounts(array_name) ─────────────────────────────────────────────
+# Populates an array with "-B" and "/abs/path:/abs/path" argument pairs covering all
 # directories that the containerised steps need to read or write.
 # Uses the same absolute paths on host and inside the container so that
 # any generated scripts that reference ${OUTDIR} etc. work without translation.
@@ -444,17 +482,19 @@ run_in_sif() {
     if [[ "${EXEC_MODE}" == "apptainer" ]]; then
         local apptainer_bin
         apptainer_bin=$(command -v apptainer 2>/dev/null || command -v singularity 2>/dev/null)
-        local binds
-        binds=$(build_bind_mounts)
+        local -a bind_args=()
+        build_bind_mounts bind_args
         # Execute via bash -c so compound pipes (like bowtie2 | samtools) run entirely inside the container
-        "${apptainer_bin}" exec --cleanenv ${binds} "${sif_file}" bash -c "$*"
+        "${apptainer_bin}" exec --cleanenv "${bind_args[@]}" "${sif_file}" bash -c "$*"
     else
-        eval "$@"
+        run_cmd "$@"
     fi
 }
 
 
 build_bind_mounts() {
+    local output_name="$1"
+    local -n output_args="${output_name}"
     local -a bind_dirs=()
 
     _add_bind() {
@@ -479,13 +519,11 @@ build_bind_mounts() {
     [[ -d "${METABINNER_SCRIPTS_DIR}" ]] && _add_bind "${METABINNER_SCRIPTS_DIR}"
     [[ -n "${ASSEMBLY_IN}" ]] && _add_bind "$(dirname "${ASSEMBLY_IN}")"
 
-    local bind_str=""
     local d
     for d in "${bind_dirs[@]+"${bind_dirs[@]}"}"; do
-        bind_str+=" -B ${d}:${d}"
+        output_args+=("-B" "${d}:${d}")
     done
-
-    printf '%s' "${bind_str}"
+    return 0
 }
 
 # ── _env_to_sif(env_name) → sif_path / uri ───────────────────────────────────
@@ -493,12 +531,12 @@ build_bind_mounts() {
 _env_to_sif() {
     local env_name="$1"
     case "${env_name}" in
-        "${ENV_VAMB}")       echo "${SIF_VAMB}"       "${SIF_VAMB_URI}" ;;
-        "${ENV_METABINNER}") echo "${SIF_METABINNER}"  "${SIF_METABINNER_URI}" ;;
-        "${ENV_COMEBIN}")    echo "${SIF_COMEBIN}"     "${SIF_COMEBIN_URI}" ;;
-        "${ENV_METAWRAP}")   echo "${SIF_METAWRAP}"    "${SIF_METAWRAP_URI}" ;;
-        "${ENV_CHECKM2}")    echo "${SIF_CHECKM2}"     "${SIF_CHECKM2_URI}" ;;
-        "${ENV_GTDBTK}")     echo "${SIF_GTDBTK}"      "${SIF_GTDBTK_URI}" ;;
+        "${ENV_VAMB}") echo "${SIF_VAMB}" "${SIF_VAMB_URI}" ;;
+        "${ENV_METABINNER}") echo "${SIF_METABINNER}" "${SIF_METABINNER_URI}" ;;
+        "${ENV_COMEBIN}") echo "${SIF_COMEBIN}" "${SIF_COMEBIN_URI}" ;;
+        "${ENV_METAWRAP}") echo "${SIF_METAWRAP}" "${SIF_METAWRAP_URI}" ;;
+        "${ENV_CHECKM2}") echo "${SIF_CHECKM2}" "${SIF_CHECKM2_URI}" ;;
+        "${ENV_GTDBTK}") echo "${SIF_GTDBTK}" "${SIF_GTDBTK_URI}" ;;
         *)
             log_error "[Container] No SIF mapping for environment: ${env_name}"
             return 1 ;;
@@ -531,15 +569,15 @@ run_mamba_file() {
         # Pull image if absent
         ensure_sif_image "${sif_path}" "${uri}" || return 1
 
-        # Resolve bind-mount string
-        local bind_args
-        bind_args=$(build_bind_mounts)
+        # Resolve bind-mount arguments
+        local -a bind_args=()
+        build_bind_mounts bind_args
 
         # Optional GPU flag (Vamb and COMEBin can use CUDA)
-        local gpu_flag=""
+        local -a gpu_args=()
         if { [[ "${env_name}" == "${ENV_VAMB}" ]] || \
              [[ "${env_name}" == "${ENV_COMEBIN}" ]]; } && _has_gpu; then
-            gpu_flag="--nv"
+            gpu_args=(--nv)
             log_info "[Step ${step_label}] GPU detected — adding --nv flag."
         fi
 
@@ -548,15 +586,15 @@ run_mamba_file() {
         command -v apptainer &>/dev/null || runtime="singularity"
 
         if [[ "${DRY_RUN}" == true ]]; then
-            echo -e "${YELLOW}[DRY-RUN]${NC} ${runtime} exec --cleanenv ${gpu_flag}${bind_args} ${sif_path} bash ${script_file}"
+            printf '[DRY-RUN] %q ' "${runtime}" exec --cleanenv "${gpu_args[@]}" "${bind_args[@]}" "${sif_path}" bash "${script_file}"
+            printf '\n'
             echo -e "${YELLOW}[DRY-RUN]${NC} --- script contents ---"
             cat "${script_file}"
             echo -e "${YELLOW}[DRY-RUN]${NC} --- end of script ---"
             return 0
         fi
 
-        # shellcheck disable=SC2086
-        "${runtime}" exec --cleanenv ${gpu_flag} ${bind_args} \
+        "${runtime}" exec --cleanenv "${gpu_args[@]}" "${bind_args[@]}" \
             "${sif_path}" bash "${script_file}"
 
     else
@@ -583,20 +621,442 @@ check_tool() {
 
 # ── Checkpoint Helpers ────────────────────────────────────────────────────────
 CHECKPOINT_DIR=""  # initialized after OUTDIR is created
+declare -A INVALIDATED_CHECKPOINTS=()
+
+require_nonempty_file() {
+    local path="$1"
+    local description="$2"
+    if [[ ! -s "${path}" ]]; then
+        log_error "[Validation] ${description} is missing or empty: ${path}"
+        return 1
+    fi
+}
+
+require_directory() {
+    local path="$1"
+    local description="$2"
+    if [[ ! -d "${path}" ]]; then
+        log_error "[Validation] ${description} directory is missing: ${path}"
+        return 1
+    fi
+}
+
+collect_files_by_suffix() {
+    local directory="$1"
+    local suffix="$2"
+    local output_name="$3"
+    # shellcheck disable=SC2178,SC2034
+    local -n result_ref="${output_name}"
+    result_ref=()
+    [[ -d "${directory}" ]] || return 0
+    # shellcheck disable=SC2034
+    mapfile -d '' -t result_ref < <(
+        find "${directory}" -maxdepth 1 -type f -name "*${suffix}" -print0 | sort -z
+    )
+}
+
+collect_files_by_pattern() {
+    local directory="$1"
+    local pattern="$2"
+    local output_name="$3"
+    # shellcheck disable=SC2178,SC2034
+    local -n result_ref="${output_name}"
+    result_ref=()
+    [[ -d "${directory}" ]] || return 0
+    # shellcheck disable=SC2034
+    mapfile -d '' -t result_ref < <(
+        find "${directory}" -maxdepth 1 -type f -name "${pattern}" -print0 | sort -z
+    )
+}
+
+require_files_matching() {
+    local directory="$1"
+    local pattern="$2"
+    local description="$3"
+    local -a matches=()
+    local file
+
+    if [[ ! -d "${directory}" ]]; then
+        log_error "[Validation] ${description} directory is missing: ${directory}"
+        return 1
+    fi
+    collect_files_by_pattern "${directory}" "${pattern}" matches
+    for file in "${matches[@]}"; do
+        [[ -s "${file}" ]] && return 0
+    done
+    log_error "[Validation] No non-empty ${description} matching '${pattern}' in ${directory}"
+    return 1
+}
+
+sample_names() {
+    local -a files=()
+    local file
+    collect_files_by_suffix "${READS_DIR}" "${READ_SUFFIX_R1}" files
+    for file in "${files[@]}"; do
+        basename "${file}" "${READ_SUFFIX_R1}"
+    done
+}
+
+expected_sample_names() {
+    local -a files=()
+    local file
+    if [[ "${RUN_FASTP}" == true ]]; then
+        collect_files_by_suffix "${QC_DIR}/trimmed" "${READ_SUFFIX_R1}" files
+    else
+        collect_files_by_suffix "${READS_DIR}" "${READ_SUFFIX_R1}" files
+    fi
+    for file in "${files[@]}"; do
+        basename "${file}" "${READ_SUFFIX_R1}"
+    done
+}
+
+stage_rank() {
+    case "$1" in
+        mapping) echo 1 ;;
+        binning) echo 2 ;;
+        refinement) echo 3 ;;
+        reassembly) echo 4 ;;
+        checkm2) echo 5 ;;
+        mag-filtering) echo 6 ;;
+        gtdbtk) echo 7 ;;
+        coverm) echo 8 ;;
+        summary) echo 9 ;;
+        *) return 1 ;;
+    esac
+}
+
+stage_in_scope() {
+    local stage="$1"
+    [[ -z "${STOP_AFTER}" ]] && return 0
+    [[ "$(stage_rank "${stage}")" -le "$(stage_rank "${STOP_AFTER}")" ]]
+}
+
+stop_after_reached() {
+    [[ -n "${STOP_AFTER}" && "$1" == "${STOP_AFTER}" ]]
+}
+
+validate_stage_dependencies() {
+    local errors=0
+
+    if [[ -n "${STOP_AFTER}" ]]; then
+        if ! stage_rank "${STOP_AFTER}" >/dev/null; then
+            log_error "Invalid --stop-after stage: ${STOP_AFTER}"
+            (( errors += 1 ))
+        elif ! stage_in_scope "${STOP_AFTER}"; then
+            log_error "Invalid --stop-after stage: ${STOP_AFTER}"
+            (( errors += 1 ))
+        else
+            case "${STOP_AFTER}" in
+                mapping) [[ "${RUN_MAPPING}" == true ]] || { log_error "--stop-after mapping requires --mapping."; (( errors += 1 )); } ;;
+                binning) [[ "${RUN_BINNING}" == true ]] || { log_error "--stop-after binning requires --binning."; (( errors += 1 )); } ;;
+                refinement) [[ "${RUN_REFINEMENT}" == true ]] || { log_error "--stop-after refinement requires --refinement."; (( errors += 1 )); } ;;
+                reassembly) [[ "${RUN_REASSEMBLY}" == true ]] || { log_error "--stop-after reassembly requires --reassembly."; (( errors += 1 )); } ;;
+                checkm2) [[ "${RUN_CHECKM2}" == true ]] || { log_error "--stop-after checkm2 requires --checkm2."; (( errors += 1 )); } ;;
+                mag-filtering) [[ "${RUN_MAG_FILTERING}" == true ]] || { log_error "--stop-after mag-filtering requires --mag-filtering."; (( errors += 1 )); } ;;
+                gtdbtk) [[ "${RUN_GTDBTK}" == true ]] || { log_error "--stop-after gtdbtk requires --gtdbtk."; (( errors += 1 )); } ;;
+                coverm) [[ "${RUN_COVERM}" == true ]] || { log_error "--stop-after coverm requires --coverm."; (( errors += 1 )); } ;;
+                summary) [[ "${RUN_SUMMARY}" == true ]] || { log_error "--stop-after summary requires --summary."; (( errors += 1 )); } ;;
+            esac
+        fi
+    fi
+
+    if [[ "${RUN_BINNING}" == true && "${RUN_MAPPING}" != true ]]; then
+        log_error "Binning requires mapping; enable --mapping or disable --binning."
+        (( errors += 1 ))
+    fi
+    if [[ "${RUN_REFINEMENT}" == true && "${RUN_BINNING}" != true ]]; then
+        log_error "Refinement requires binning; enable --binning or disable --refinement."
+        (( errors += 1 ))
+    fi
+    if [[ "${RUN_REASSEMBLY}" == true && "${RUN_REFINEMENT}" != true ]]; then
+        log_error "Reassembly requires refinement; enable --refinement or disable --reassembly."
+        (( errors += 1 ))
+    fi
+    if [[ "${RUN_CHECKM2}" == true && "${RUN_REFINEMENT}" != true && "${RUN_REASSEMBLY}" != true ]]; then
+        log_error "CheckM2 requires refinement or reassembly; enable one or disable --checkm2."
+        (( errors += 1 ))
+    fi
+    if [[ "${RUN_MAG_FILTERING}" == true && "${RUN_CHECKM2}" != true ]]; then
+        log_error "MAG filtering requires CheckM2; enable --checkm2 or disable --mag-filtering."
+        (( errors += 1 ))
+    fi
+    if [[ "${RUN_GTDBTK}" == true && "${RUN_MAG_FILTERING}" != true ]]; then
+        log_error "GTDB-Tk requires MAG filtering; enable --mag-filtering or disable --gtdbtk."
+        (( errors += 1 ))
+    fi
+    if [[ "${RUN_COVERM}" == true && "${RUN_MAG_FILTERING}" != true ]]; then
+        log_error "CoverM requires MAG filtering; enable --mag-filtering or disable --coverm."
+        (( errors += 1 ))
+    fi
+
+    if [[ "${errors}" -gt 0 ]]; then
+        log_error "Stage configuration is incompatible (${errors} issue(s))."
+        return 1
+    fi
+}
+
+checkpoint_config_manifest() {
+    local step="$1"
+    local samples
+    samples=$(sample_names | sort)
+    {
+        printf 'step=%s\nreads_dir=%s\nr1_suffix=%s\nr2_suffix=%s\nsamples=%s\nrun_fastp=%s\nengine=%s\n' \
+            "${step}" "${READS_DIR}" "${READ_SUFFIX_R1}" "${READ_SUFFIX_R2}" \
+            "${samples}" "${RUN_FASTP}" "${EXEC_MODE}"
+        case "${step}" in
+            01_fastp)
+                printf 'enabled=%s\nthreads=%s\nparams=-5 20 -3 20 -r 20 -M 20 -e 20 -n 50\nimage=%s\n' \
+                    "${RUN_FASTP}" "${THREADS}" "${SIF_FASTP_URI}" ;;
+            02_megahit)
+                printf 'enabled=%s\nassembly_in=%s\nthreads=%s\nmemory=%s\nmin_contig_len=%s\nimage=%s\n' \
+                    "${RUN_MEGAHIT}" "${ASSEMBLY_IN}" "${THREADS}" "${MEMORY}" "${MIN_CONTIG_LEN}" "${SIF_MEGAHIT_URI}" ;;
+            03_kraken2)
+                printf 'enabled=%s\ndb=%s\nthreads=%s\nread_len=%s\ntax_level=%s\nthreshold=%s\nimage=%s\n' \
+                    "${RUN_KRAKEN2}" "${KRAKEN2_DB}" "${THREADS}" "${BRACKEN_READ_LEN}" \
+                    "${BRACKEN_TAX_LEVEL}" "${BRACKEN_THRESHOLD}" "${SIF_KRAKEN2_URI}" ;;
+            04_mapping)
+                printf 'enabled=%s\ncontigs=%s\nthreads=%s\nimage=%s\n' \
+                    "${RUN_MAPPING}" "${CONTIGS}" "${THREADS}" "${SIF_MAPPING_URI}" ;;
+            05a_vamb)
+                printf 'enabled=%s\ncontigs=%s\nmin_contig_len=%s\nimage=%s\n' \
+                    "${RUN_BINNING}" "${CONTIGS}" "${MIN_CONTIG_LEN}" "${SIF_VAMB_URI}" ;;
+            05b_metabinner)
+                printf 'enabled=%s\ncontigs=%s\nthreads=%s\nmin_contig_len=%s\nscripts=%s\nrunner=%s\nimage=%s\n' \
+                    "${RUN_BINNING}" "${CONTIGS}" "${THREADS}" "${MIN_CONTIG_LEN}" "${METABINNER_SCRIPTS_DIR}" \
+                    "${METABINNER_RUNNER}" "${SIF_METABINNER_URI}" ;;
+            05c_comebin)
+                printf 'enabled=%s\ncontigs=%s\nthreads=%s\nimage=%s\n' \
+                    "${RUN_BINNING}" "${CONTIGS}" "${THREADS}" "${SIF_COMEBIN_URI}" ;;
+            06_refinement)
+                printf 'enabled=%s\nthreads=%s\nvamb=%s\ncomebin=%s\nmetabinner=%s\ncompleteness=%s\ncontamination=%s\nimage=%s\n' \
+                    "${RUN_REFINEMENT}" "${THREADS}" \
+                    "${BINS_FOR_REFINEMENT_A}" "${BINS_FOR_REFINEMENT_B}" \
+                    "${BINS_FOR_REFINEMENT_C}" "${METAWRAP_COMPLETENESS}" \
+                    "${METAWRAP_CONTAMINATION}" "${SIF_METAWRAP_URI}" ;;
+            07_reassembly)
+                printf 'enabled=%s\nrefined=%s\nthreads=%s\nmemory=%s\nimage=%s\n' \
+                    "${RUN_REASSEMBLY}" "${REFINED_BINS_DIR}" "${THREADS}" "${MEMORY}" "${SIF_METAWRAP_URI}" ;;
+            08_checkm2)
+                printf 'enabled=%s\nbins=%s\ndb=%s\nthreads=%s\nimage=%s\n' \
+                    "${RUN_CHECKM2}" "${BINS_FOR_QC}" "${CHECKM2_DB}" "${THREADS}" "${SIF_CHECKM2_URI}" ;;
+            09_filter_mags)
+                printf 'enabled=%s\nbins=%s\ncheckm_report=%s\ncompleteness=%s\ncontamination=%s\nmeta_completeness=%s\nmeta_contamination=%s\n' \
+                    "${RUN_MAG_FILTERING}" \
+                    "${BINS_FOR_QC}" "${CHECKM2_DIR}/quality_report.tsv" "${COMPLETENESS}" "${CONTAMINATION}" \
+                    "${METAWRAP_COMPLETENESS}" "${METAWRAP_CONTAMINATION}" ;;
+            10_gtdbtk)
+                printf 'enabled=%s\nmags=%s\ndata=%s\nthreads=%s\nimage=%s\n' \
+                    "${RUN_GTDBTK}" "${HQ_BINS_DIR}" "${GTDBTK_DATA_PATH}" "${THREADS}" "${SIF_GTDBTK_URI}" ;;
+            11_coverm)
+                printf 'enabled=%s\nmags=%s\nmethods=%s\nmin_covered_fraction=%s\nthreads=%s\nimage=%s\n' \
+                    "${RUN_COVERM}" "${HQ_BINS_DIR}" "${COVERM_METHODS}" "${COVERM_MIN_COVERED_FRACTION}" "${THREADS}" "${SIF_COVERM_URI}" ;;
+            12_summary)
+                printf 'enabled=%s\nmags=%s\ncheckm2=%s\ngtdbtk_enabled=%s\ncoverm_enabled=%s\ncompleteness=%s\ncontamination=%s\ncoverm_methods=%s\nimage=%s\n' \
+                    "${RUN_SUMMARY}" "${HQ_BINS_DIR}" \
+                    "${CHECKM2_DIR}/quality_report.tsv" "${RUN_GTDBTK}" \
+                    "${RUN_COVERM}" "${COMPLETENESS}" "${CONTAMINATION}" "${COVERM_METHODS}" "${SIF_R_URI}" ;;
+        esac
+    }
+}
+
+validate_step_products() {
+    local step="$1"
+    local -a samples=()
+    local -a paths=()
+    local sample path mate bam
+    local found_data=0
+
+    case "${step}" in
+        01_fastp)
+            require_files_matching "${QC_DIR}/trimmed" "*${READ_SUFFIX_R1}" "clean R1 reads" || return 1
+            collect_files_by_suffix "${QC_DIR}/trimmed" "${READ_SUFFIX_R1}" paths
+            for path in "${paths[@]}"; do
+                require_nonempty_file "${path}" "clean R1 read" || return 1
+                mate="${path/${READ_SUFFIX_R1}/${READ_SUFFIX_R2}}"
+                require_nonempty_file "${mate}" "matching clean R2 read" || return 1
+            done ;;
+        02_megahit)
+            require_nonempty_file "${ASSEMBLY_DIR}/final.contigs.fa" "MEGAHIT assembly" ;;
+        03_kraken2)
+            mapfile -t samples < <(expected_sample_names)
+            [[ ${#samples[@]} -gt 0 ]] || {
+                log_error "[Validation] No samples available for Kraken2."
+                return 1
+            }
+            for sample in "${samples[@]}"; do
+                require_nonempty_file "${KRAKEN2_DIR}/kraken_output_${sample}.txt" "Kraken2 output for ${sample}" || return 1
+                require_nonempty_file "${KRAKEN2_DIR}/kraken_report_${sample}.txt" "Kraken2 report for ${sample}" || return 1
+                require_nonempty_file "${KRAKEN2_DIR}/bracken_${sample}.txt" "Bracken output for ${sample}" || return 1
+            done ;;
+        04_mapping)
+            collect_files_by_pattern "${MAPPING_DIR}" "*_sorted.bam" paths
+            mapfile -t samples < <(expected_sample_names)
+            [[ ${#samples[@]} -gt 0 && ${#paths[@]} -gt 0 ]] || {
+                log_error "[Validation] No sorted BAM files found in ${MAPPING_DIR}."
+                return 1
+            }
+            for sample in "${samples[@]}"; do
+                bam="${MAPPING_DIR}/${sample}_sorted.bam"
+                require_nonempty_file "${bam}" "sorted BAM" || return 1
+                require_nonempty_file "${bam}.bai" "BAM index" || return 1
+            done
+            require_nonempty_file "${BINNING_DIR}/depth_matrix.txt" "JGI depth matrix" ;;
+        05a_vamb)
+            require_files_matching "${VAMB_DIR}/vamb_out/bins" "*.fa" "Vamb bin FASTA" ;;
+        05b_metabinner)
+            require_nonempty_file "${METABINNER_DIR}/assembly_${MIN_CONTIG_LEN}.fa" "MetaBinner filtered assembly" || return 1
+            require_nonempty_file "${METABINNER_DIR}/assembly_${MIN_CONTIG_LEN}_kmer_4_f${MIN_CONTIG_LEN}.csv" "MetaBinner k-mer table" || return 1
+            require_files_matching "${METABINNER_DIR}/metabinner_out/result_bins" "*.fa" "MetaBinner bin FASTA" ;;
+        05c_comebin)
+            require_files_matching "${COMEBIN_DIR}/comebin_res/comebin_res_bins" "*.fa" "COMEBin bin FASTA" ;;
+        06_refinement)
+            require_files_matching "${REFINEMENT_DIR}/metawrap_${METAWRAP_COMPLETENESS}_${METAWRAP_CONTAMINATION}_bins" "*.fa" "refined bin FASTA" ;;
+        07_reassembly)
+            require_files_matching "${REASSEMBLY_DIR}/reassembled_bins" "*.fa" "reassembled bin FASTA" ;;
+        08_checkm2)
+            require_nonempty_file "${CHECKM2_DIR}/quality_report.tsv" "CheckM2 quality report" || return 1
+            if ! awk 'NR > 1 && NF { found=1 } END { exit !found }' "${CHECKM2_DIR}/quality_report.tsv"; then
+                log_error "[Validation] CheckM2 quality_report.tsv has no data rows."
+                return 1
+            fi ;;
+        09_filter_mags)
+            require_files_matching "${MAGS_DIR}" "*.fa" "retained MAG FASTA" ;;
+        10_gtdbtk)
+            for path in "${GTDBTK_DIR}/gtdbtk.bac120.summary.tsv" "${GTDBTK_DIR}/gtdbtk.ar53.summary.tsv"; do
+                if [[ -s "${path}" ]] && awk 'NR > 1 && NF { found=1 } END { exit !found }' "${path}"; then
+                    found_data=1
+                fi
+            done
+            if [[ "${found_data}" -ne 1 ]]; then
+                log_error "[Validation] GTDB-Tk produced no non-empty summary with data rows."
+                return 1
+            fi ;;
+        11_coverm)
+            mapfile -t samples < <(expected_sample_names)
+            [[ ${#samples[@]} -gt 0 ]] || {
+                log_error "[Validation] No samples available for CoverM."
+                return 1
+            }
+            for sample in "${samples[@]}"; do
+                require_nonempty_file "${ABUNDANCE_DIR}/abundance_${sample}.tsv" "CoverM abundance for ${sample}" || return 1
+            done ;;
+        12_summary)
+            require_nonempty_file "${SUMMARY_DIR}/final_summary.tsv" "final summary" || return 1
+            if ! awk 'NR > 1 && NF { found=1 } END { exit !found }' "${SUMMARY_DIR}/final_summary.tsv"; then
+                log_error "[Validation] final_summary.tsv has no data rows."
+                return 1
+            fi ;;
+        *)
+            log_error "[Validation] Unknown pipeline step: ${step}"
+            return 1 ;;
+    esac
+}
+
+describe_step_validations() {
+    case "$1" in
+        01_fastp) log_info "[Validation] Would require clean R1 files and matching non-empty clean R2 files." ;;
+        02_megahit) log_info "[Validation] Would require a non-empty final.contigs.fa." ;;
+        03_kraken2) log_info "[Validation] Would require non-empty Kraken2 output/report and Bracken output for every sample." ;;
+        04_mapping) log_info "[Validation] Would require non-empty sorted BAMs, their indexes, and the JGI depth matrix." ;;
+        05a_vamb) log_info "[Validation] Would require at least one non-empty *.fa bin in the Vamb bins directory." ;;
+        05b_metabinner) log_info "[Validation] Would require at least one non-empty *.fa bin in the MetaBinner result_bins directory." ;;
+        05c_comebin) log_info "[Validation] Would require at least one non-empty *.fa bin in the COMEBin bins directory." ;;
+        06_refinement) log_info "[Validation] Would require at least one non-empty refined *.fa bin." ;;
+        07_reassembly) log_info "[Validation] Would require at least one non-empty reassembled *.fa bin." ;;
+        08_checkm2) log_info "[Validation] Would require a non-empty quality_report.tsv with at least one data row." ;;
+        09_filter_mags) log_info "[Validation] Would require at least one non-empty retained MAG FASTA." ;;
+        10_gtdbtk) log_info "[Validation] Would require a non-empty GTDB-Tk summary containing a data row." ;;
+        11_coverm) log_info "[Validation] Would require a non-empty abundance TSV for every sample." ;;
+        12_summary) log_info "[Validation] Would require a non-empty final_summary.tsv with at least one data row." ;;
+        *) log_error "[Validation] Unknown pipeline step: $1"; return 1 ;;
+    esac
+}
+
+_checkpoint_dependents() {
+    case "$1" in
+        01_fastp)       printf '%s\n' 02_megahit 03_kraken2 04_mapping 05a_vamb 05b_metabinner 05c_comebin 06_refinement 07_reassembly 08_checkm2 09_filter_mags 10_gtdbtk 11_coverm 12_summary ;;
+        02_megahit)     printf '%s\n' 04_mapping 05a_vamb 05b_metabinner 05c_comebin 06_refinement 07_reassembly 08_checkm2 09_filter_mags 10_gtdbtk 11_coverm 12_summary ;;
+        03_kraken2)     ;;
+        04_mapping)     printf '%s\n' 05a_vamb 05b_metabinner 05c_comebin 06_refinement 07_reassembly 08_checkm2 09_filter_mags 10_gtdbtk 11_coverm 12_summary ;;
+        05a_vamb|05b_metabinner|05c_comebin) printf '%s\n' 06_refinement 07_reassembly 08_checkm2 09_filter_mags 10_gtdbtk 11_coverm 12_summary ;;
+        06_refinement)  printf '%s\n' 07_reassembly 08_checkm2 09_filter_mags 10_gtdbtk 11_coverm 12_summary ;;
+        07_reassembly)  printf '%s\n' 08_checkm2 09_filter_mags 10_gtdbtk 11_coverm 12_summary ;;
+        08_checkm2)     printf '%s\n' 09_filter_mags 10_gtdbtk 11_coverm 12_summary ;;
+        09_filter_mags) printf '%s\n' 10_gtdbtk 11_coverm 12_summary ;;
+        10_gtdbtk|11_coverm) printf '%s\n' 12_summary ;;
+    esac
+}
+
+invalidate_checkpoint() {
+    local step="$1"
+    local reason="$2"
+    local item
+    local -a queue=("${step}")
+    local -a dependents=()
+    local index=0
+
+    while [[ "${index}" -lt "${#queue[@]}" ]]; do
+        item="${queue[$index]}"
+        if [[ -n "${INVALIDATED_CHECKPOINTS[$item]:-}" ]]; then
+            index=$((index + 1))
+            continue
+        fi
+        INVALIDATED_CHECKPOINTS["${item}"]=1
+        if [[ "${DRY_RUN}" == true ]]; then
+            log_warn "[Checkpoint] Dry-run: would invalidate ${item} because: ${reason}"
+        else
+            rm -f -- "${CHECKPOINT_DIR}/${item}.done" "${CHECKPOINT_DIR}/${item}.config"
+            log_warn "[Checkpoint] Invalidated ${item}: ${reason}"
+        fi
+        mapfile -t dependents < <(_checkpoint_dependents "${item}")
+        if [[ ${#dependents[@]} -gt 0 ]]; then
+            queue+=("${dependents[@]}")
+        fi
+        index=$((index + 1))
+    done
+}
 
 is_done() {
     local step="$1"
-    [[ "${FORCE_RERUN}" == false ]] && [[ -f "${CHECKPOINT_DIR}/${step}.done" ]]
+    local current_config recorded_config
+    [[ "${FORCE_RERUN}" == false ]] || return 1
+    [[ -z "${INVALIDATED_CHECKPOINTS[$step]:-}" ]] || return 1
+    [[ -f "${CHECKPOINT_DIR}/${step}.done" ]] || return 1
+
+    current_config=$(checkpoint_config_manifest "${step}")
+    recorded_config=""
+    if [[ -f "${CHECKPOINT_DIR}/${step}.config" ]]; then
+        recorded_config=$(cat "${CHECKPOINT_DIR}/${step}.config")
+    fi
+    if [[ -z "${recorded_config}" || "${recorded_config}" != "${current_config}" ]]; then
+        if [[ -z "${recorded_config}" ]]; then
+            invalidate_checkpoint "${step}" "configuration metadata is missing"
+        else
+            log_warn "[Checkpoint] Configuration differences for ${step}:"
+            diff -u <(printf '%s\n' "${recorded_config}") <(printf '%s\n' "${current_config}") || true
+            invalidate_checkpoint "${step}" "configuration parameters changed (see differences above)"
+        fi
+        return 1
+    fi
+    if ! validate_step_products "${step}"; then
+        invalidate_checkpoint "${step}" "checkpoint products are missing, empty, or inconsistent"
+        return 1
+    fi
+    log_info "[Checkpoint] Step ${step} configuration and products validated."
+    return 0
 }
 
 mark_done() {
     local step="$1"
 
     if [[ "${DRY_RUN}" == true ]]; then
+        describe_step_validations "${step}"
         log_info "[Step ${step}] Dry-run: checkpoint not written."
         return 0
     fi
 
+    validate_step_products "${step}" || return 1
+    checkpoint_config_manifest "${step}" > "${CHECKPOINT_DIR}/${step}.config"
     touch "${CHECKPOINT_DIR}/${step}.done"
     log_info "[Step ${step}] Checkpoint written."
 }
@@ -703,95 +1163,135 @@ detect_resources() {
 preflight_check() {
     log_info "Running pre-flight validation..."
     local errors=0
+    local need_tools=false
+    local reads_required=false
+    validate_stage_dependencies || return 1
 
-    # Reads directory must exist
-    if [[ ! -d "${READS_DIR}" ]]; then
+    if [[ "${RUN_FASTP}" == true || "${RUN_KRAKEN2}" == true ]]; then
+        reads_required=true
+    fi
+    if [[ "${RUN_MEGAHIT}" == true && -z "${ASSEMBLY_IN}" ]]; then
+        reads_required=true
+    fi
+    if { [[ "${RUN_MAPPING}" == true ]] && stage_in_scope mapping; } || \
+       { [[ "${RUN_REASSEMBLY}" == true ]] && stage_in_scope reassembly; } || \
+       { [[ "${RUN_COVERM}" == true ]] && stage_in_scope coverm; }; then
+        reads_required=true
+    fi
+
+    # Validate read inputs only when an enabled stage will consume them.
+    if [[ "${reads_required}" == true ]] && [[ ! -d "${READS_DIR}" ]]; then
         log_error "READS_DIR does not exist: ${READS_DIR}"
-        (( errors++ )) || true
+        (( errors += 1 ))
     fi
 
     # Assembly logic
     if [[ "${RUN_MEGAHIT}" == false ]] && [[ -z "${ASSEMBLY_IN}" ]]; then
         log_error "RUN_MEGAHIT=false but ASSEMBLY_IN is not set."
-        (( errors++ )) || true
+        (( errors += 1 ))
     fi
     if [[ -n "${ASSEMBLY_IN}" ]] && [[ ! -f "${ASSEMBLY_IN}" ]]; then
         log_error "ASSEMBLY_IN file not found: ${ASSEMBLY_IN}"
-        (( errors++ )) || true
+        (( errors += 1 ))
     fi
 
     # Kraken2 DB
     if [[ "${RUN_KRAKEN2}" == true ]]; then
         if [[ ! -d "${KRAKEN2_DB}" ]]; then
             log_error "KRAKEN2_DB not set or not found: ${KRAKEN2_DB}"
-            (( errors++ )) || true
+            (( errors += 1 ))
         fi
     fi
 
     # CheckM2 DB
-    if [[ ! -f "${CHECKM2_DB}" ]]; then
+    if [[ "${RUN_CHECKM2}" == true ]] && stage_in_scope checkm2 && [[ ! -f "${CHECKM2_DB}" ]]; then
         log_error "CHECKM2_DB not set or not found: ${CHECKM2_DB}"
-        (( errors++ )) || true
+        (( errors += 1 ))
     fi
 
     # GTDB-Tk data
-    if [[ "${RUN_GTDBTK}" == true ]]; then
+    if [[ "${RUN_GTDBTK}" == true ]] && stage_in_scope gtdbtk; then
         if [[ ! -d "${GTDBTK_DATA_PATH}" ]]; then
             log_error "GTDBTK_DATA_PATH not set or not found: ${GTDBTK_DATA_PATH}"
-            (( errors++ )) || true
+            (( errors += 1 ))
         fi
     fi
 
     # MetaBinner scripts directory — validation differs by engine
-    if [[ "${EXEC_MODE}" == "mamba" ]]; then
-        # mamba: directory must exist on the host
-        if [[ -z "${METABINNER_SCRIPTS_DIR}" || ! -d "${METABINNER_SCRIPTS_DIR}" ]]; then
-            log_error "METABINNER_SCRIPTS_DIR not set or not found on host: ${METABINNER_SCRIPTS_DIR}"
-            (( errors++ )) || true
-        fi
-    else
-        # apptainer: directory lives inside the container
-        if [[ -z "${METABINNER_SCRIPTS_DIR}" ]]; then
-            log_error "METABINNER_SCRIPTS_DIR is empty."
-            log_error "For EXEC_MODE=apptainer use an in-container path (default: /opt/metabinner/scripts)."
-            (( errors++ )) || true
-        elif [[ -f "${SIF_METABINNER}" ]] && [[ "${DRY_RUN}" == false ]]; then
-            # .sif already cached → verify the path exists inside the container
-            local _rt="apptainer"
-            command -v apptainer &>/dev/null || _rt="singularity"
-            log_info "[Preflight] Verifying METABINNER_SCRIPTS_DIR inside container image..."
-            if ! "${_rt}" exec --cleanenv "${SIF_METABINNER}" \
-                    test -d "${METABINNER_SCRIPTS_DIR}" 2>/dev/null; then
-                log_error "METABINNER_SCRIPTS_DIR '${METABINNER_SCRIPTS_DIR}' not found inside ${SIF_METABINNER}."
-                log_error "Check the container's internal layout or adjust METABINNER_SCRIPTS_DIR."
-                (( errors++ )) || true
-            else
-                log_info "[Preflight] METABINNER_SCRIPTS_DIR OK inside container: ${METABINNER_SCRIPTS_DIR}"
+    if [[ "${RUN_BINNING}" == true ]] && stage_in_scope binning; then
+        if [[ "${EXEC_MODE}" == "mamba" ]]; then
+            if [[ -z "${METABINNER_SCRIPTS_DIR}" || ! -d "${METABINNER_SCRIPTS_DIR}" ]]; then
+                log_error "METABINNER_SCRIPTS_DIR not set or not found on host: ${METABINNER_SCRIPTS_DIR}"
+                (( errors += 1 ))
             fi
-        elif [[ ! -f "${SIF_METABINNER}" ]] && [[ "${AUTO_PULL_SIF}" == true ]]; then
-            log_info "[Preflight] ${SIF_METABINNER} not yet downloaded; METABINNER_SCRIPTS_DIR will be validated after pull."
+        else
+            if [[ -z "${METABINNER_SCRIPTS_DIR}" ]]; then
+                log_error "METABINNER_SCRIPTS_DIR is empty."
+                log_error "For EXEC_MODE=apptainer use an in-container path (default: /opt/metabinner/scripts)."
+                (( errors += 1 ))
+            elif [[ -f "${SIF_METABINNER}" ]] && [[ "${DRY_RUN}" == false ]]; then
+                local _rt="apptainer"
+                command -v apptainer &>/dev/null || _rt="singularity"
+                log_info "[Preflight] Verifying METABINNER_SCRIPTS_DIR inside container image..."
+                if ! "${_rt}" exec --cleanenv "${SIF_METABINNER}" \
+                        test -d "${METABINNER_SCRIPTS_DIR}" 2>/dev/null; then
+                    log_error "METABINNER_SCRIPTS_DIR '${METABINNER_SCRIPTS_DIR}' not found inside ${SIF_METABINNER}."
+                    log_error "Check the container's internal layout or adjust METABINNER_SCRIPTS_DIR."
+                    (( errors += 1 ))
+                else
+                    log_info "[Preflight] METABINNER_SCRIPTS_DIR OK inside container: ${METABINNER_SCRIPTS_DIR}"
+                fi
+            elif [[ ! -f "${SIF_METABINNER}" ]] && [[ "${AUTO_PULL_SIF}" == true ]]; then
+                log_info "[Preflight] ${SIF_METABINNER} not yet downloaded; METABINNER_SCRIPTS_DIR will be validated after pull."
+            fi
         fi
     fi
 
     # Required direct binaries are host dependencies only in mamba mode.
-    if [[ "${EXEC_MODE}" == "mamba" ]]; then
-        local required_bins=(bowtie2 bowtie2-build samtools jgi_summarize_bam_contig_depths coverm)
-        [[ "${RUN_FASTP}" == true ]]   && required_bins+=(fastp)
-        [[ "${RUN_MEGAHIT}" == true ]] && required_bins+=(megahit)
-        [[ "${RUN_KRAKEN2}" == true ]] && required_bins+=(kraken2 bracken)
+    if [[ "${RUN_FASTP}" == true || "${RUN_KRAKEN2}" == true || \
+          ( "${RUN_MEGAHIT}" == true && -z "${ASSEMBLY_IN}" ) ]]; then
+        need_tools=true
+    fi
+    local stage
+    for stage in mapping binning refinement reassembly checkm2 gtdbtk coverm summary; do
+        if stage_in_scope "${stage}"; then
+            case "${stage}" in
+                mapping) if [[ "${RUN_MAPPING}" == true ]]; then need_tools=true; fi ;;
+                binning) if [[ "${RUN_BINNING}" == true ]]; then need_tools=true; fi ;;
+                refinement) if [[ "${RUN_REFINEMENT}" == true ]]; then need_tools=true; fi ;;
+                reassembly) if [[ "${RUN_REASSEMBLY}" == true ]]; then need_tools=true; fi ;;
+                checkm2) if [[ "${RUN_CHECKM2}" == true ]]; then need_tools=true; fi ;;
+                gtdbtk) if [[ "${RUN_GTDBTK}" == true ]]; then need_tools=true; fi ;;
+                coverm) if [[ "${RUN_COVERM}" == true ]]; then need_tools=true; fi ;;
+                summary) if [[ "${RUN_SUMMARY}" == true ]]; then need_tools=true; fi ;;
+            esac
+        fi
+    done
+
+    if [[ "${EXEC_MODE}" == "mamba" ]] && [[ "${need_tools}" == true ]]; then
+        local required_bins=()
+        if [[ "${RUN_MAPPING}" == true ]] && stage_in_scope mapping; then
+            required_bins+=(bowtie2 bowtie2-build samtools jgi_summarize_bam_contig_depths)
+        fi
+        if [[ "${RUN_COVERM}" == true ]] && stage_in_scope coverm; then
+            required_bins+=(coverm)
+        fi
+        if [[ "${RUN_FASTP}" == true ]]; then required_bins+=(fastp); fi
+        if [[ "${RUN_MEGAHIT}" == true && -z "${ASSEMBLY_IN}" ]]; then required_bins+=(megahit); fi
+        if [[ "${RUN_KRAKEN2}" == true ]]; then required_bins+=(kraken2 bracken); fi
         for tool in "${required_bins[@]}"; do
             if ! command -v "${tool}" &>/dev/null; then
                 log_error "Required binary not found in PATH: ${tool}"
-                (( errors++ )) || true
+                (( errors += 1 ))
             fi
         done
     fi
 
     # Container / environment runtime
-    if [[ "${EXEC_MODE}" == "apptainer" ]]; then
+    if [[ "${EXEC_MODE}" == "apptainer" ]] && [[ "${need_tools}" == true ]]; then
         if ! command -v apptainer &>/dev/null && ! command -v singularity &>/dev/null; then
             log_error "EXEC_MODE=apptainer but neither 'apptainer' nor 'singularity' found in PATH."
-            (( errors++ )) || true
+            (( errors += 1 ))
         else
             local _rt="apptainer"
             command -v apptainer &>/dev/null || _rt="singularity"
@@ -801,29 +1301,27 @@ preflight_check() {
         if [[ ! -d "${SIF_DIR}" ]]; then
             log_warn "SIF_DIR does not exist yet (${SIF_DIR}); it will be created on first pull."
         fi
-    else
-        # mamba mode
+    elif [[ "${EXEC_MODE}" == "mamba" ]] && [[ "${need_tools}" == true ]]; then
         if ! command -v mamba &>/dev/null; then
             log_error "'mamba' not found in PATH."
-            (( errors++ )) || true
+            (( errors += 1 ))
         fi
     fi
 
     # Detect reads and verify each R1 has its matching R2.
-    if [[ -d "${READS_DIR}" ]]; then
-        shopt -s nullglob
-        local _probe=("${READS_DIR}"/*${READ_SUFFIX_R1})
-        shopt -u nullglob
+    if [[ "${reads_required}" == true && -d "${READS_DIR}" ]]; then
+        local _probe=()
+        collect_files_by_suffix "${READS_DIR}" "${READ_SUFFIX_R1}" _probe
         if [[ ${#_probe[@]} -eq 0 ]]; then
             log_error "No reads matching *${READ_SUFFIX_R1} found in ${READS_DIR}"
-            (( errors++ )) || true
+            (( errors += 1 ))
         else
             local _r1 _r2
             for _r1 in "${_probe[@]}"; do
                 _r2="${_r1/${READ_SUFFIX_R1}/${READ_SUFFIX_R2}}"
                 if [[ ! -f "${_r2}" ]]; then
                     log_error "R2 file not found for R1 read: ${_r1} (expected ${_r2})"
-                    (( errors++ )) || true
+                    (( errors += 1 ))
                 fi
             done
             log_info "Found ${#_probe[@]} R1 read file(s) in ${READS_DIR}"
@@ -843,18 +1341,15 @@ preflight_check() {
 
 # ── Step 01: fastp QC ─────────────────────────────────────────────────────────
 step_01_fastp() {
-    log_step "01" "QC — fastp"
-
     if [[ "${RUN_FASTP}" == false ]]; then
         log_info "[Step 01] RUN_FASTP=false — skipping fastp."
         return 0
     fi
+    log_step "01" "QC — fastp"
 
     if is_done "01_fastp"; then
         log_info "[Step 01] Checkpoint found — repopulating CLEAN arrays from existing trimmed files."
-        shopt -s nullglob
-        CLEAN_R1_FILES=("${QC_DIR}/trimmed"/*${READ_SUFFIX_R1})
-        shopt -u nullglob
+        collect_files_by_suffix "${QC_DIR}/trimmed" "${READ_SUFFIX_R1}" CLEAN_R1_FILES
         CLEAN_R2_FILES=()
         for r1 in "${CLEAN_R1_FILES[@]}"; do
             CLEAN_R2_FILES+=("${r1/${READ_SUFFIX_R1}/${READ_SUFFIX_R2}}")
@@ -867,9 +1362,8 @@ step_01_fastp() {
 
     local fastp_threads=$(( THREADS > 16 ? 16 : THREADS ))
 
-    shopt -s nullglob
-    local raw_r1_files=("${READS_DIR}"/*${READ_SUFFIX_R1})
-    shopt -u nullglob
+    local raw_r1_files=()
+    collect_files_by_suffix "${READS_DIR}" "${READ_SUFFIX_R1}" raw_r1_files
 
     if [[ ${#raw_r1_files[@]} -eq 0 ]]; then
         log_error "[Step 01] No R1 read files found in ${READS_DIR} with suffix ${READ_SUFFIX_R1}"
@@ -951,8 +1445,8 @@ step_02_megahit() {
     # Case 2: RUN_MEGAHIT=false (skip assembly, use existing)
     if [[ "${RUN_MEGAHIT}" == false ]]; then
         CONTIGS="${ASSEMBLY_DIR}/final.contigs.fa"
-        if [[ ! -f "${CONTIGS}" ]]; then
-            log_error "[Step 02] RUN_MEGAHIT=false but assembly not found at: ${CONTIGS}"
+        if ! require_nonempty_file "${CONTIGS}" "assembly"; then
+            log_error "[Step 02] RUN_MEGAHIT=false but a valid assembly was not found at: ${CONTIGS}"
             exit 1
         fi
         log_info "[Step 02] RUN_MEGAHIT=false — using existing assembly: ${CONTIGS}"
@@ -973,9 +1467,8 @@ step_02_megahit() {
         r2_list=$(IFS=','; echo "${CLEAN_R2_FILES[*]}")
         log_info "[Step 02] Using fastp-trimmed reads for assembly."
     else
-        shopt -s nullglob
-        local raw_r1_arr=("${READS_DIR}"/*${READ_SUFFIX_R1})
-        shopt -u nullglob
+        local raw_r1_arr=()
+        collect_files_by_suffix "${READS_DIR}" "${READ_SUFFIX_R1}" raw_r1_arr
         if [[ ${#raw_r1_arr[@]} -eq 0 ]]; then
             log_error "[Step 02] No raw R1 reads found for assembly in ${READS_DIR}"
             exit 1
@@ -1032,12 +1525,11 @@ step_02_megahit() {
 
 # ── Step 03: Kraken2 + Bracken ────────────────────────────────────────────────
 step_03_kraken2_bracken() {
-    log_step "03" "Taxonomy — Kraken2 + Bracken"
-
     if [[ "${RUN_KRAKEN2}" == false ]]; then
         log_info "[Step 03] RUN_KRAKEN2=false — skipping."
         return 0
     fi
+    log_step "03" "Taxonomy — Kraken2 + Bracken"
 
     if is_done "03_kraken2"; then
         log_info "[Step 03] Checkpoint found — skipping Kraken2/Bracken."
@@ -1052,9 +1544,7 @@ step_03_kraken2_bracken() {
         r2_sources=("${CLEAN_R2_FILES[@]}")
         log_info "[Step 03] Using fastp-trimmed reads for Kraken2."
     else
-        shopt -s nullglob
-        r1_sources=("${READS_DIR}"/*${READ_SUFFIX_R1})
-        shopt -u nullglob
+        collect_files_by_suffix "${READS_DIR}" "${READ_SUFFIX_R1}" r1_sources
         for r1 in "${r1_sources[@]}"; do
             r2_sources+=("${r1/${READ_SUFFIX_R1}/${READ_SUFFIX_R2}}")
         done
@@ -1104,13 +1594,15 @@ step_03_kraken2_bracken() {
 
 # ── Step 04: Bowtie2 Mapping + JGI Depth ─────────────────────────────────────
 step_04_mapping_depth() {
+    if [[ "${RUN_MAPPING}" != true ]]; then
+        log_info "[Step 04] Mapping disabled; skipping."
+        return 0
+    fi
     log_step "04" "Mapping — Bowtie2 + SAMtools + JGI depth"
 
     if is_done "04_mapping"; then
         log_info "[Step 04] Checkpoint found — repopulating SORTED_BAMS and DEPTH_FILE."
-        shopt -s nullglob
-        SORTED_BAMS=("${MAPPING_DIR}"/*_sorted.bam)
-        shopt -u nullglob
+        collect_files_by_pattern "${MAPPING_DIR}" "*_sorted.bam" SORTED_BAMS
         DEPTH_FILE="${BINNING_DIR}/depth_matrix.txt"
         log_info "[Step 04] Repopulated ${#SORTED_BAMS[@]} BAM(s) from checkpoint."
         return 0
@@ -1141,9 +1633,7 @@ step_04_mapping_depth() {
         r2_sources=("${CLEAN_R2_FILES[@]}")
         log_info "[Step 04] Using fastp-trimmed reads for mapping."
     else
-        shopt -s nullglob
-        r1_sources=("${READS_DIR}"/*${READ_SUFFIX_R1})
-        shopt -u nullglob
+        collect_files_by_suffix "${READS_DIR}" "${READ_SUFFIX_R1}" r1_sources
         for r1 in "${r1_sources[@]}"; do
             r2_sources+=("${r1/${READ_SUFFIX_R1}/${READ_SUFFIX_R2}}")
         done
@@ -1194,6 +1684,10 @@ step_04_mapping_depth() {
 
 # ── Step 05a: Vamb Binning ────────────────────────────────────────────────────
 step_05a_vamb() {
+    if [[ "${RUN_BINNING}" != true ]]; then
+        log_info "[Step 05a] Binning disabled; skipping."
+        return 0
+    fi
     log_step "05a" "Binning — Vamb"
 
     if is_done "05a_vamb"; then
@@ -1264,6 +1758,10 @@ VAMB_SCRIPT
 
 # ── Step 05b: MetaBinner Binning ──────────────────────────────────────────────
 step_05b_metabinner() {
+    if [[ "${RUN_BINNING}" != true ]]; then
+        log_info "[Step 05b] Binning disabled; skipping."
+        return 0
+    fi
     log_step "05b" "Binning — MetaBinner"
 
     if is_done "05b_metabinner"; then
@@ -1299,10 +1797,6 @@ step_05b_metabinner() {
     # Step 2: Symlink assembly
     log_info "[Step 05b] Symlinking assembly to MetaBinner directory..."
     ln -sf "${CONTIGS}" "${METABINNER_DIR}/assembly.fa"
-
-    # Derive filenames
-    local mb_filtered="${METABINNER_DIR}/assembly_${MIN_CONTIG_LEN}.fa"
-    local mb_kmer="${METABINNER_DIR}/assembly_${MIN_CONTIG_LEN}_kmer_4_f${MIN_CONTIG_LEN}.csv"
 
     # Step 3: Write and run prep script
     local mb_prep_script="${TMPSCRIPTS_DIR}/step_05b_metabinner_prep.sh"
@@ -1475,6 +1969,10 @@ MB_RUN_SCRIPT
 
 # ── Step 05c: COMEBin Binning ─────────────────────────────────────────────────
 step_05c_comebin() {
+    if [[ "${RUN_BINNING}" != true ]]; then
+        log_info "[Step 05c] Binning disabled; skipping."
+        return 0
+    fi
     log_step "05c" "Binning — COMEBin"
 
     if is_done "05c_comebin"; then
@@ -1521,6 +2019,10 @@ COMEBIN_SCRIPT
 
 # ── Step 06: MetaWrap Bin Refinement ──────────────────────────────────────────
 step_06_bin_refinement() {
+    if [[ "${RUN_REFINEMENT}" != true ]]; then
+        log_info "[Step 06] Refinement disabled; skipping."
+        return 0
+    fi
     log_step "06" "Refinement — MetaWrap bin_refinement"
 
     if is_done "06_refinement"; then
@@ -1570,13 +2072,14 @@ REFINEMENT_SCRIPT
 
 # ── Step 07: MetaWrap Reassembly ──────────────────────────────────────────────
 step_07_reassembly() {
-    log_step "07" "Reassembly — MetaWrap reassemble_bins"
-
-    if [[ "${RUN_REASSEMBLY}" == false ]]; then
-        log_info "[Step 07] RUN_REASSEMBLY=false — skipping reassembly."
-        BINS_FOR_QC="${REFINED_BINS_DIR}"
+    if [[ "${RUN_REASSEMBLY}" != true ]]; then
+        log_info "[Step 07] Reassembly disabled; skipping."
+        if [[ -n "${REFINED_BINS_DIR}" ]]; then
+            BINS_FOR_QC="${REFINED_BINS_DIR}"
+        fi
         return 0
     fi
+    log_step "07" "Reassembly — MetaWrap reassemble_bins"
 
     if is_done "07_reassembly"; then
         log_info "[Step 07] Checkpoint found — skipping reassembly."
@@ -1594,9 +2097,7 @@ step_07_reassembly() {
         r2_sources=("${CLEAN_R2_FILES[@]}")
         log_info "[Step 07] Using fastp-trimmed reads for reassembly."
     else
-        shopt -s nullglob
-        r1_sources=("${READS_DIR}"/*${READ_SUFFIX_R1})
-        shopt -u nullglob
+        collect_files_by_suffix "${READS_DIR}" "${READ_SUFFIX_R1}" r1_sources
         for r1 in "${r1_sources[@]}"; do
             r2_sources+=("${r1/${READ_SUFFIX_R1}/${READ_SUFFIX_R2}}")
         done
@@ -1634,6 +2135,10 @@ REASSEMBLY_SCRIPT
 
 # ── Step 08: CheckM2 Quality Assessment ───────────────────────────────────────
 step_08_checkm2() {
+    if [[ "${RUN_CHECKM2}" != true ]]; then
+        log_info "[Step 08] CheckM2 disabled; skipping."
+        return 0
+    fi
     log_step "08" "Quality — CheckM2 predict"
 
     if is_done "08_checkm2"; then
@@ -1679,6 +2184,11 @@ CHECKM2_SCRIPT
 
 # ── Step 09: Filter MAGs ──────────────────────────────────────────────────────
 step_09_filter_mags() {
+    if [[ "${RUN_MAG_FILTERING}" != true ]]; then
+        log_info "[Step 09] MAG filtering disabled; using available bins without filtering."
+        HQ_BINS_DIR="${BINS_FOR_QC}"
+        return 0
+    fi
     log_step "09" "Filter — HQ/MQ MAG selection (Completeness >= ${COMPLETENESS}%, Contamination <= ${CONTAMINATION}%)"
 
     if is_done "09_filter_mags"; then
@@ -1721,8 +2231,8 @@ step_09_filter_mags() {
     done < "${CHECKM2_DIR}/quality_report.tsv"
 
     if [[ ${#passing_bins[@]} -eq 0 ]]; then
-        log_warn "[Step 09] WARNING: Zero bins passed the quality filters (Completeness >= ${COMPLETENESS}%, Contamination <= ${CONTAMINATION}%)."
-        log_warn "[Step 09] Downstream steps (GTDB-Tk, CoverM, Summary) may produce empty results."
+        log_error "[Step 09] Zero MAGs were retained (Completeness >= ${COMPLETENESS}%, Contamination <= ${CONTAMINATION}%). No successful filter checkpoint will be written."
+        exit 1
     else
         log_info "[Step 09] ${#passing_bins[@]} MAG(s) passed quality filters. Written to: ${MAGS_DIR}"
     fi
@@ -1733,12 +2243,11 @@ step_09_filter_mags() {
 
 # ── Step 10: GTDB-Tk Taxonomy ─────────────────────────────────────────────────
 step_10_gtdbtk() {
-    log_step "10" "Taxonomy — GTDB-Tk classify_wf"
-
-    if [[ "${RUN_GTDBTK}" == false ]]; then
-        log_info "[Step 10] RUN_GTDBTK=false — skipping GTDB-Tk."
+    if [[ "${RUN_GTDBTK}" != true ]]; then
+        log_info "[Step 10] GTDB-Tk disabled; skipping."
         return 0
     fi
+    log_step "10" "Taxonomy — GTDB-Tk classify_wf"
 
     if is_done "10_gtdbtk"; then
         log_info "[Step 10] Checkpoint found — skipping GTDB-Tk."
@@ -1778,6 +2287,10 @@ GTDBTK_SCRIPT
 
 # ── Step 11: CoverM Abundance ─────────────────────────────────────────────────
 step_11_coverm() {
+    if [[ "${RUN_COVERM}" != true ]]; then
+        log_info "[Step 11] CoverM disabled; skipping."
+        return 0
+    fi
     log_step "11" "Abundance — CoverM genome"
 
     if is_done "11_coverm"; then
@@ -1804,9 +2317,7 @@ step_11_coverm() {
         r2_sources=("${CLEAN_R2_FILES[@]}")
         log_info "[Step 11] Using fastp-trimmed reads for CoverM."
     else
-        shopt -s nullglob
-        r1_sources=("${READS_DIR}"/*${READ_SUFFIX_R1})
-        shopt -u nullglob
+        collect_files_by_suffix "${READS_DIR}" "${READ_SUFFIX_R1}" r1_sources
         for r1 in "${r1_sources[@]}"; do
             r2_sources+=("${r1/${READ_SUFFIX_R1}/${READ_SUFFIX_R2}}")
         done
@@ -1827,13 +2338,13 @@ step_11_coverm() {
         local coverm_log="${LOGS_DIR}/step_11_coverm_${base}.log"
 
         # Build optional flags
-        local methods_flag=""
-        local min_cov_flag=""
+        local -a methods_args=()
+        local -a min_cov_args=()
         if [[ -n "${COVERM_METHODS}" ]]; then
-            methods_flag="--methods ${COVERM_METHODS}"
+            methods_args=(--methods "${COVERM_METHODS}")
         fi
         if [[ -n "${COVERM_MIN_COVERED_FRACTION}" ]]; then
-            min_cov_flag="--min-covered-fraction ${COVERM_MIN_COVERED_FRACTION}"
+            min_cov_args=(--min-covered-fraction "${COVERM_MIN_COVERED_FRACTION}")
         fi
 
         log_info "[Step 11] Running CoverM for sample: ${base}"
@@ -1843,8 +2354,8 @@ step_11_coverm() {
             --genome-fasta-directory "${HQ_BINS_DIR}" \
             --genome-fasta-extension fa \
             --threads "${THREADS}" \
-            ${methods_flag} \
-            ${min_cov_flag} \
+            "${methods_args[@]}" \
+            "${min_cov_args[@]}" \
             -o "${out_tsv}" \
             2>&1 | tee "${coverm_log}"
     done
@@ -1854,7 +2365,62 @@ step_11_coverm() {
 
 # ── Step 12: R Summary Table ───────────────────────────────────────────────────
 step_12_summary_r() {
+    if [[ "${RUN_SUMMARY}" != true ]]; then
+        log_info "[Step 12] Summary disabled; skipping."
+        return 0
+    fi
     log_step "12" "Summary — R left-join TSV (base R)"
+
+    local mags_dir="${HQ_BINS_DIR}"
+    local checkm2_tsv="${CHECKM2_DIR}/quality_report.tsv"
+    local gtdbtk_bac="${GTDBTK_DIR}/gtdbtk.bac120.summary.tsv"
+    local gtdbtk_ar="${GTDBTK_DIR}/gtdbtk.ar53.summary.tsv"
+    local abundance_dir="${ABUNDANCE_DIR}"
+    local out_tsv="${SUMMARY_DIR}/final_summary.tsv"
+    local -a mag_files=()
+    local -a abundance_files=()
+    if [[ -z "${mags_dir}" || ! -d "${mags_dir}" ]]; then
+        log_warn "[Step 12] No MAG directory is available; omitting the summary."
+        invalidate_checkpoint "12_summary" "no MAG directory is available"
+        return 0
+    fi
+    collect_files_by_pattern "${mags_dir}" "*.fa" mag_files
+    local -a nonempty_mag_files=()
+    local path
+    for path in "${mag_files[@]}"; do
+        if [[ -s "${path}" ]]; then
+            nonempty_mag_files+=("${path}")
+        fi
+    done
+    if [[ ${#nonempty_mag_files[@]} -eq 0 ]] && [[ "${DRY_RUN}" != true ]]; then
+        log_warn "[Step 12] No non-empty MAG FASTA files found in ${mags_dir}; omitting the summary."
+        invalidate_checkpoint "12_summary" "no non-empty MAG FASTA files are available"
+        return 0
+    elif [[ ${#nonempty_mag_files[@]} -eq 0 ]]; then
+        log_info "[Step 12] Dry-run: will check for MAGs before generating the summary."
+    fi
+    collect_files_by_pattern "${abundance_dir}" "abundance_*.tsv" abundance_files
+    if [[ -f "${checkm2_tsv}" && -s "${checkm2_tsv}" ]]; then
+        log_info "[Step 12] CheckM2 source available."
+    else
+        log_info "[Step 12] CheckM2 source unavailable; summary will use MAG IDs and any other available sources."
+    fi
+    if [[ -f "${gtdbtk_bac}" && -s "${gtdbtk_bac}" ]] || [[ -f "${gtdbtk_ar}" && -s "${gtdbtk_ar}" ]]; then
+        log_info "[Step 12] GTDB-Tk source available."
+    else
+        log_info "[Step 12] GTDB-Tk source unavailable."
+    fi
+    local nonempty_abundance=0
+    for path in "${abundance_files[@]}"; do
+        if [[ -s "${path}" ]]; then
+            (( nonempty_abundance += 1 ))
+        fi
+    done
+    if [[ "${nonempty_abundance}" -gt 0 ]]; then
+        log_info "[Step 12] CoverM source available (${nonempty_abundance} abundance table(s))."
+    else
+        log_info "[Step 12] CoverM source unavailable."
+    fi
 
     if is_done "12_summary"; then
         log_info "[Step 12] Checkpoint found — skipping summary."
@@ -1862,18 +2428,6 @@ step_12_summary_r() {
     fi
 
     mkdir -p "${SUMMARY_DIR}"
-
-    local checkm2_tsv="${CHECKM2_DIR}/quality_report.tsv"
-    local gtdbtk_bac="${GTDBTK_DIR}/gtdbtk.bac120.summary.tsv"
-    local gtdbtk_ar="${GTDBTK_DIR}/gtdbtk.ar53.summary.tsv"
-    local abundance_dir="${ABUNDANCE_DIR}"
-    local out_tsv="${SUMMARY_DIR}/final_summary.tsv"
-
-    if [[ ! -f "${checkm2_tsv}" ]]; then
-        log_error "[Step 12] CheckM2 quality_report.tsv not found: ${checkm2_tsv}"
-        exit 1
-    fi
-
     log_info "[Step 12] Running R summary script..."
 
     run_tool "12" "${SIF_R}" "${SIF_R_URI}" Rscript - <<RSCRIPT
@@ -1881,103 +2435,110 @@ step_12_summary_r() {
 # Final summary — base R only, no external packages
 ###############################################################################
 
+mag_dir      <- "${mags_dir}"
 checkm2_tsv  <- "${checkm2_tsv}"
 gtdbtk_bac   <- "${gtdbtk_bac}"
 gtdbtk_ar    <- "${gtdbtk_ar}"
 abundance_dir <- "${abundance_dir}"
 out_tsv      <- "${out_tsv}"
 
-cat("[Step 12] Reading CheckM2 quality report...\n")
-checkm2_df <- read.table(checkm2_tsv, sep = "\t", header = TRUE,
-                          stringsAsFactors = FALSE, check.names = FALSE)
-# Rename first column to Bin_ID
-colnames(checkm2_df)[1] <- "Bin_ID"
-cat(sprintf("[Step 12] CheckM2: %d bins\n", nrow(checkm2_df)))
-
-cat("[Step 12] Reading GTDB-Tk outputs...\n")
-bac_df <- NULL
-ar_df  <- NULL
-
-if (file.exists(gtdbtk_bac)) {
-    bac_df <- read.table(gtdbtk_bac, sep = "\t", header = TRUE,
-                          stringsAsFactors = FALSE, check.names = FALSE)
-    colnames(bac_df)[colnames(bac_df) == "user_genome"] <- "Bin_ID"
-    cat(sprintf("[Step 12] GTDB-Tk bac120: %d entries\n", nrow(bac_df)))
-} else {
-    cat("[Step 12] WARN: gtdbtk.bac120.summary.tsv not found.\n")
+normalize_bin_id <- function(x) {
+    sub("[.](fa|fasta|fna)$", "", basename(x), ignore.case = TRUE)
 }
 
-if (file.exists(gtdbtk_ar)) {
-    ar_df <- read.table(gtdbtk_ar, sep = "\t", header = TRUE,
-                         stringsAsFactors = FALSE, check.names = FALSE)
-    colnames(ar_df)[colnames(ar_df) == "user_genome"] <- "Bin_ID"
-    cat(sprintf("[Step 12] GTDB-Tk ar53: %d entries\n", nrow(ar_df)))
-} else {
-    cat("[Step 12] WARN: gtdbtk.ar53.summary.tsv not found.\n")
+mag_files <- list.files(mag_dir, pattern = "[.]fa$", full.names = TRUE)
+mag_file_info <- file.info(mag_files)
+mag_files <- mag_files[mag_file_info[["size"]] > 0]
+summary_df <- data.frame(Bin_ID = normalize_bin_id(mag_files),
+                         stringsAsFactors = FALSE)
+cat(sprintf("[Step 12] MAG list base: %d MAG(s) from %s\n",
+            nrow(summary_df), mag_dir))
+
+merge_source <- function(base, source, label) {
+    if (is.null(source) || nrow(source) == 0) {
+        cat(sprintf("[Step 12] %s source unavailable; remaining fields will be NA.\n", label))
+        return(base)
+    }
+    source <- source[!is.na(source[["Bin_ID"]]) & nzchar(source[["Bin_ID"]]), , drop = FALSE]
+    if (nrow(source) == 0) {
+        cat(sprintf("[Step 12] %s contains no usable bin IDs; omitting it.\n", label))
+        return(merge(base, source, by = "Bin_ID", all.x = TRUE, sort = FALSE))
+    }
+    source[["Bin_ID"]] <- normalize_bin_id(source[["Bin_ID"]])
+    cat(sprintf("[Step 12] Incorporating %s: %d row(s).\n", label, nrow(source)))
+    merge(base, source, by = "Bin_ID", all.x = TRUE, sort = FALSE)
 }
 
-# Combine bac120 + ar53 by intersected columns
-if (!is.null(bac_df) && !is.null(ar_df)) {
-    shared_cols <- intersect(colnames(bac_df), colnames(ar_df))
-    gtdbtk_df <- rbind(bac_df[, shared_cols, drop = FALSE],
-                        ar_df[, shared_cols, drop = FALSE])
-    cat(sprintf("[Step 12] GTDB-Tk combined: %d entries\n", nrow(gtdbtk_df)))
-} else if (!is.null(bac_df)) {
-    gtdbtk_df <- bac_df
-} else if (!is.null(ar_df)) {
-    gtdbtk_df <- ar_df
-} else {
-    gtdbtk_df <- NULL
-    cat("[Step 12] WARN: No GTDB-Tk data available — adding NA column.\n")
-}
-
-cat("[Step 12] Reading CoverM abundance tables...\n")
-abund_files <- list.files(abundance_dir, pattern = "^abundance_.*\\.tsv$",
-                           full.names = TRUE)
-
-if (length(abund_files) == 0) {
-    cat("[Step 12] WARN: No CoverM abundance files found.\n")
-    coverm_wide <- NULL
-} else {
-    abund_list <- lapply(abund_files, function(f) {
-        sample_name <- sub("abundance_", "",
-                           sub("\\.tsv$", "", basename(f)))
-        df <- read.table(f, sep = "\t", header = TRUE,
-                          stringsAsFactors = FALSE, check.names = FALSE)
-        colnames(df)[1] <- "Bin_ID"
-        # Strip path and .fa from Bin_ID values
-        df[["Bin_ID"]] <- sub("\\.fa$", "", basename(df[["Bin_ID"]]))
-        # Rename remaining columns as <sample>__<metric>, sanitize spaces
-        for (j in seq(2, ncol(df))) {
-            orig <- colnames(df)[j]
-            sanitized <- gsub(" ", "_", orig)
-            colnames(df)[j] <- paste0(sample_name, "__", sanitized)
+read_optional_tsv <- function(path, label) {
+    if (!file.exists(path) || file.info(path)[["size"]] == 0) {
+        cat(sprintf("[Step 12] %s file missing or empty; omitting it.\n", label))
+        return(NULL)
+    }
+    tryCatch(
+        read.table(path, sep = "\t", header = TRUE, stringsAsFactors = FALSE,
+                   check.names = FALSE, quote = "", comment.char = ""),
+        error = function(e) {
+            cat(sprintf("[Step 12] WARN: Could not read %s: %s\n", label, conditionMessage(e)))
+            NULL
         }
-        df
-    })
-
-    # Merge all CoverM tables wide by Bin_ID
-    coverm_wide <- Reduce(function(a, b) {
-        merge(a, b, by = "Bin_ID", all = TRUE)
-    }, abund_list)
-    cat(sprintf("[Step 12] CoverM wide table: %d bins x %d columns\n",
-                nrow(coverm_wide), ncol(coverm_wide)))
+    )
 }
 
-cat("[Step 12] Merging all tables...\n")
-# Start with CheckM2
-summary_df <- checkm2_df
+checkm2_added <- FALSE
+checkm2_df <- read_optional_tsv(checkm2_tsv, "CheckM2")
+if (!is.null(checkm2_df) && nrow(checkm2_df) > 0 && ncol(checkm2_df) > 0) {
+    colnames(checkm2_df)[1] <- "Bin_ID"
+    if (!"Completeness" %in% colnames(checkm2_df)) checkm2_df[["Completeness"]] <- NA_real_
+    if (!"Contamination" %in% colnames(checkm2_df)) checkm2_df[["Contamination"]] <- NA_real_
+    summary_df <- merge_source(summary_df, checkm2_df, "CheckM2")
+    checkm2_added <- TRUE
+}
+if (!checkm2_added) {
+    summary_df[["Completeness"]] <- NA_real_
+    summary_df[["Contamination"]] <- NA_real_
+}
 
-# Left-join GTDB-Tk
-if (!is.null(gtdbtk_df)) {
-    summary_df <- merge(summary_df, gtdbtk_df, by = "Bin_ID", all.x = TRUE)
-} else {
+gtdbtk_df <- NULL
+for (path in c(gtdbtk_bac, gtdbtk_ar)) {
+    label <- basename(path)
+    df <- read_optional_tsv(path, label)
+    if (!is.null(df) && nrow(df) > 0) {
+        if ("user_genome" %in% colnames(df)) {
+            colnames(df)[colnames(df) == "user_genome"] <- "Bin_ID"
+            gtdbtk_df <- if (is.null(gtdbtk_df)) df else {
+                all_cols <- union(colnames(gtdbtk_df), colnames(df))
+                for (column in setdiff(all_cols, colnames(gtdbtk_df))) gtdbtk_df[[column]] <- NA
+                for (column in setdiff(all_cols, colnames(df))) df[[column]] <- NA
+                rbind(gtdbtk_df[, all_cols, drop = FALSE], df[, all_cols, drop = FALSE])
+            }
+        } else {
+            cat(sprintf("[Step 12] WARN: %s has no user_genome column; omitting it.\n", label))
+        }
+    }
+}
+if (is.null(gtdbtk_df)) {
+    cat("[Step 12] GTDB-Tk source unavailable; adding NA classification.\n")
     summary_df[["GTDB_classification"]] <- NA_character_
+} else {
+    summary_df <- merge_source(summary_df, gtdbtk_df, "GTDB-Tk")
 }
 
-# Left-join CoverM wide
-if (!is.null(coverm_wide)) {
-    summary_df <- merge(summary_df, coverm_wide, by = "Bin_ID", all.x = TRUE)
+abund_files <- list.files(abundance_dir, pattern = "^abundance_.*[.]tsv$",
+                          full.names = TRUE)
+abund_file_info <- file.info(abund_files)
+abund_files <- abund_files[abund_file_info[["size"]] > 0]
+for (f in abund_files) {
+    sample_name <- sub("^abundance_|[.]tsv$", "", basename(f))
+    df <- read_optional_tsv(f, paste0("CoverM ", sample_name))
+    if (is.null(df) || nrow(df) == 0 || ncol(df) == 0) next
+    colnames(df)[1] <- "Bin_ID"
+    df[["Bin_ID"]] <- normalize_bin_id(df[["Bin_ID"]])
+    if (ncol(df) >= 2) {
+        for (j in seq(2, ncol(df))) {
+            colnames(df)[j] <- paste0(sample_name, "__", gsub(" ", "_", colnames(df)[j]))
+        }
+    }
+    summary_df <- merge_source(summary_df, df, paste0("CoverM ", sample_name))
 }
 
 cat(sprintf("[Step 12] Final summary: %d bins x %d columns\n",
@@ -2039,6 +2600,14 @@ main() {
     echo -e "${CYAN}${BOLD}║${NC}  RUN_KRAKEN2            : ${RUN_KRAKEN2}"
     echo -e "${CYAN}${BOLD}║${NC}  RUN_REASSEMBLY         : ${RUN_REASSEMBLY}"
     echo -e "${CYAN}${BOLD}║${NC}  RUN_GTDBTK             : ${RUN_GTDBTK}"
+    echo -e "${CYAN}${BOLD}║${NC}  RUN_MAPPING            : ${RUN_MAPPING}"
+    echo -e "${CYAN}${BOLD}║${NC}  RUN_BINNING            : ${RUN_BINNING}"
+    echo -e "${CYAN}${BOLD}║${NC}  RUN_REFINEMENT         : ${RUN_REFINEMENT}"
+    echo -e "${CYAN}${BOLD}║${NC}  RUN_CHECKM2            : ${RUN_CHECKM2}"
+    echo -e "${CYAN}${BOLD}║${NC}  RUN_MAG_FILTERING      : ${RUN_MAG_FILTERING}"
+    echo -e "${CYAN}${BOLD}║${NC}  RUN_COVERM             : ${RUN_COVERM}"
+    echo -e "${CYAN}${BOLD}║${NC}  RUN_SUMMARY            : ${RUN_SUMMARY}"
+    echo -e "${CYAN}${BOLD}║${NC}  STOP_AFTER             : ${STOP_AFTER:-<none>}"
     echo -e "${CYAN}${BOLD}║${NC}  DRY_RUN                : ${DRY_RUN}"
     echo -e "${CYAN}${BOLD}║${NC}  FORCE_RERUN            : ${FORCE_RERUN}"
     echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}\n"
@@ -2049,9 +2618,7 @@ main() {
     # Initialize read arrays:
     # If RUN_FASTP=false, pre-populate CLEAN_R1_FILES/CLEAN_R2_FILES with raw reads
     if [[ "${RUN_FASTP}" == false ]]; then
-        shopt -s nullglob
-        CLEAN_R1_FILES=("${READS_DIR}"/*${READ_SUFFIX_R1})
-        shopt -u nullglob
+        collect_files_by_suffix "${READS_DIR}" "${READ_SUFFIX_R1}" CLEAN_R1_FILES
         for r1 in "${CLEAN_R1_FILES[@]}"; do
             CLEAN_R2_FILES+=("${r1/${READ_SUFFIX_R1}/${READ_SUFFIX_R2}}")
         done
@@ -2065,22 +2632,47 @@ main() {
     step_01_fastp
     step_02_megahit
     step_03_kraken2_bracken
-    step_04_mapping_depth
-    step_05a_vamb
-    step_05b_metabinner
-    step_05c_comebin
-    step_06_bin_refinement
-    step_07_reassembly
-    # Ensure BINS_FOR_QC is set (fallback to refined bins)
-    BINS_FOR_QC="${BINS_FOR_QC:-${REFINED_BINS_DIR}}"
-    step_08_checkm2
-    step_09_filter_mags
-    step_10_gtdbtk
-    step_11_coverm
-    step_12_summary_r
+    while true; do
+        step_04_mapping_depth
+        if stop_after_reached mapping; then log_info "Stopping successfully after mapping."; break; fi
+
+        step_05a_vamb
+        step_05b_metabinner
+        step_05c_comebin
+        if stop_after_reached binning; then log_info "Stopping successfully after binning."; break; fi
+
+        step_06_bin_refinement
+        if [[ "${RUN_REFINEMENT}" != true ]]; then
+            BINS_FOR_QC="${REFINED_BINS_DIR:-${VAMB_DIR}/vamb_out/bins}"
+        fi
+        if stop_after_reached refinement; then log_info "Stopping successfully after refinement."; break; fi
+
+        step_07_reassembly
+        if stop_after_reached reassembly; then log_info "Stopping successfully after reassembly."; break; fi
+
+        step_08_checkm2
+        if stop_after_reached checkm2; then log_info "Stopping successfully after CheckM2."; break; fi
+
+        step_09_filter_mags
+        if stop_after_reached mag-filtering; then log_info "Stopping successfully after MAG filtering."; break; fi
+
+        step_10_gtdbtk
+        if stop_after_reached gtdbtk; then log_info "Stopping successfully after GTDB-Tk."; break; fi
+
+        step_11_coverm
+        if stop_after_reached coverm; then log_info "Stopping successfully after CoverM."; break; fi
+
+        step_12_summary_r
+        if stop_after_reached summary; then log_info "Stopping successfully after summary."; break; fi
+        break
+    done
 
     # Print final summary
-    echo -e "\n${GREEN}${BOLD}PIPELINE COMPLETE 🎉${NC}"
+    if [[ -n "${STOP_AFTER}" ]]; then
+        echo -e "\n${GREEN}${BOLD}PIPELINE STOPPED SUCCESSFULLY AFTER ${STOP_AFTER} 🎉${NC}"
+    else
+        echo -e "\n${GREEN}${BOLD}PIPELINE COMPLETE 🎉${NC}"
+    fi
     echo "Output root    : ${OUTDIR}"
     echo "Assembly       : ${CONTIGS}"
     echo "Mapped samples : ${#SORTED_BAMS[@]}"
@@ -2089,7 +2681,11 @@ main() {
     echo "COMEBin bins   : $(find "${COMEBIN_DIR}" -name '*.fa' 2>/dev/null | wc -l)"
     echo "Refined bins   : $(find "${REFINEMENT_DIR}" -name '*.fa' 2>/dev/null | wc -l)"
     echo "MAGs (HQ/MQ)   : $(find "${MAGS_DIR}" -name '*.fa' 2>/dev/null | wc -l)"
-    echo "Final summary  : ${SUMMARY_DIR}/final_summary.tsv"
+    if [[ -s "${SUMMARY_DIR}/final_summary.tsv" ]]; then
+        echo "Final summary  : ${SUMMARY_DIR}/final_summary.tsv"
+    else
+        echo "Final summary  : not generated (disabled or no MAGs available)"
+    fi
     echo "Logs           : ${LOGS_DIR}/"
     echo "Mamba scripts  : ${TMPSCRIPTS_DIR}/"
 }
