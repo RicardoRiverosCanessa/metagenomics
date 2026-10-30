@@ -9,10 +9,73 @@ DEF_DIR     := ./defs
 TMP_DIR     := $(CURDIR)/.apptainer_tmp
 PIPELINE    := ./run_metagenomics_pipeline.sh
 READS_DIR ?=
+CLEAN_READS_DIR ?=
+ASSEMBLY_IN ?=
+RUN_MEGAHIT ?=
+RUN_FASTP ?=
+RUN_KRAKEN2 ?=
+RUN_MAPPING ?= true
+RUN_BINNING ?=
+RUN_REASSEMBLY ?=
+RUN_CHECKM2 ?=
+RUN_MAG_FILTERING ?=
+RUN_GTDBTK ?=
+RUN_COVERM ?=
+RUN_SUMMARY ?=
+BINNERS ?= vamb,metabinner,comebin
+VAMB_BINSPLIT_SEPARATOR ?=
+REFINEMENT_MODE ?= auto
+BINS_SOURCE ?= auto
+PROFILE ?= full
 KRAKEN2_DB ?=
 CHECKM2_DB ?=
 GTDBTK_DATA_PATH ?=
 OUTDIR ?= ./metagenomics_out_test
+BAM_DIR ?=
+BAM_MANIFEST ?=
+JGI_DEPTH_FILE ?=
+FORCE_STAGE ?=
+RESTART_FROM ?=
+
+READ_INPUT_ARGS = $(if $(strip $(READS_DIR)),--reads-dir "$(READS_DIR)") \
+                  $(if $(strip $(CLEAN_READS_DIR)),--clean-reads-dir "$(CLEAN_READS_DIR)")
+ASSEMBLY_ARGS = $(if $(strip $(ASSEMBLY_IN)),-a "$(ASSEMBLY_IN)")
+MEGAHIT_ARGS = $(if $(filter no false 0,$(RUN_MEGAHIT)),--no-megahit) \
+               $(if $(filter yes true 1,$(RUN_MEGAHIT)),--megahit)
+FASTP_STAGE_ARGS = $(if $(filter no false 0,$(RUN_FASTP)),--no-fastp) \
+                   $(if $(filter yes true 1,$(RUN_FASTP)),--fastp)
+KRAKEN2_ARGS = $(if $(filter no false 0,$(RUN_KRAKEN2)),--no-kraken2) \
+               $(if $(filter yes true 1,$(RUN_KRAKEN2)),--kraken2)
+# Do not let the implicit true default override a profile such as taxonomy.
+MAPPING_ARGS = $(if $(filter command% environment override,$(origin RUN_MAPPING)),\
+                 $(if $(filter false,$(RUN_MAPPING)),--no-mapping,--mapping))
+BINNING_ARGS = $(if $(filter no false 0,$(RUN_BINNING)),--no-binning) \
+               $(if $(filter yes true 1,$(RUN_BINNING)),--binning)
+REASSEMBLY_ARGS = $(if $(filter no false 0,$(RUN_REASSEMBLY)),--no-reassembly) \
+                  $(if $(filter yes true 1,$(RUN_REASSEMBLY)),--reassembly)
+CHECKM2_ARGS = $(if $(filter no false 0,$(RUN_CHECKM2)),--no-checkm2) \
+               $(if $(filter yes true 1,$(RUN_CHECKM2)),--checkm2)
+MAG_FILTERING_ARGS = $(if $(filter no false 0,$(RUN_MAG_FILTERING)),--no-mag-filtering) \
+                     $(if $(filter yes true 1,$(RUN_MAG_FILTERING)),--mag-filtering)
+GTDBTK_ARGS = $(if $(filter no false 0,$(RUN_GTDBTK)),--no-gtdbtk) \
+              $(if $(filter yes true 1,$(RUN_GTDBTK)),--gtdbtk)
+COVERM_ARGS = $(if $(filter no false 0,$(RUN_COVERM)),--no-coverm) \
+              $(if $(filter yes true 1,$(RUN_COVERM)),--coverm)
+SUMMARY_ARGS = $(if $(filter no false 0,$(RUN_SUMMARY)),--no-summary) \
+               $(if $(filter yes true 1,$(RUN_SUMMARY)),--summary)
+DATABASE_ARGS = $(if $(strip $(KRAKEN2_DB)),--kraken2-db "$(KRAKEN2_DB)") \
+                $(if $(strip $(CHECKM2_DB)),--checkm2-db "$(CHECKM2_DB)") \
+                $(if $(strip $(GTDBTK_DATA_PATH)),--gtdbtk-data-path "$(GTDBTK_DATA_PATH)")
+FASTP_ARGS = $(if $(strip $(CLEAN_READS_DIR)),--no-fastp)
+BAM_ARGS = $(if $(strip $(BAM_DIR)),--bam-dir "$(BAM_DIR)") \
+           $(if $(strip $(BAM_MANIFEST)),--bam-manifest "$(BAM_MANIFEST)") \
+           $(if $(strip $(JGI_DEPTH_FILE)),--jgi-depth-file "$(JGI_DEPTH_FILE)")
+shell_quote = '$(subst ','"'"',$(1))'
+VAMB_ARGS = $(if $(VAMB_BINSPLIT_SEPARATOR),\
+             --vamb-binsplit-separator $(call shell_quote,$(VAMB_BINSPLIT_SEPARATOR)))
+comma := ,
+FORCE_STAGE_ARGS = $(foreach stage,$(subst $(comma), ,$(strip $(FORCE_STAGE))),--force-stage "$(stage)")
+RESTART_FROM_ARGS = $(if $(strip $(RESTART_FROM)),--restart-from "$(RESTART_FROM)")
 
 # Redirect Apptainer/Singularity temp and cache dirs to local disk instead of /tmp RAM
 export APPTAINER_TMPDIR     := $(TMP_DIR)/tmp
@@ -136,16 +199,32 @@ clean-tmp:
 
 ## test-dry-run: Check Bash syntax and execute a pipeline dry-run (--dry-run)
 test-dry-run:
+	@case "$(RUN_MAPPING)" in true|false) ;; *) echo '[ERROR] RUN_MAPPING must be true or false.'; exit 1 ;; esac
 	bash -n $(PIPELINE)
-	@test -n "$(READS_DIR)" || { echo '[ERROR] Set READS_DIR.'; exit 1; }
-	@test -n "$(KRAKEN2_DB)" || { echo '[ERROR] Set KRAKEN2_DB.'; exit 1; }
-	@test -n "$(CHECKM2_DB)" || { echo '[ERROR] Set CHECKM2_DB.'; exit 1; }
-	@test -n "$(GTDBTK_DATA_PATH)" || { echo '[ERROR] Set GTDBTK_DATA_PATH.'; exit 1; }
 	bash $(PIPELINE) \
-	  --reads-dir "$(READS_DIR)" \
-	  --kraken2-db "$(KRAKEN2_DB)" \
-	  --checkm2-db "$(CHECKM2_DB)" \
-	  --gtdbtk-data-path "$(GTDBTK_DATA_PATH)" \
+	  $(READ_INPUT_ARGS) \
+	  --profile "$(PROFILE)" \
+	  $(ASSEMBLY_ARGS) \
+	  $(MEGAHIT_ARGS) \
+	  $(FASTP_STAGE_ARGS) \
+	  $(KRAKEN2_ARGS) \
+	  $(MAPPING_ARGS) \
+	  --binners "$(BINNERS)" \
+	  $(VAMB_ARGS) \
+	  --refinement-mode "$(REFINEMENT_MODE)" \
+	  --bins-source "$(BINS_SOURCE)" \
+	  $(BINNING_ARGS) \
+	  $(REASSEMBLY_ARGS) \
+	  $(CHECKM2_ARGS) \
+	  $(MAG_FILTERING_ARGS) \
+	  $(GTDBTK_ARGS) \
+	  $(COVERM_ARGS) \
+	  $(SUMMARY_ARGS) \
+	  $(FASTP_ARGS) \
+	  $(BAM_ARGS) \
+	  $(FORCE_STAGE_ARGS) \
+	  $(RESTART_FROM_ARGS) \
+	  $(DATABASE_ARGS) \
 	  --outdir "$(OUTDIR)" \
 	  --dry-run
 
@@ -162,7 +241,29 @@ help:
 	@echo ''
 	@echo 'Example:'
 	@echo '  make test-dry-run \'
-	@echo '    READS_DIR=/data/reads \'
+	@echo '    PROFILE=full READS_DIR=/data/raw_reads \'
 	@echo '    KRAKEN2_DB=/databases/kraken2 \'
 	@echo '    CHECKM2_DB=/databases/checkm2/uniref100.KO.1.dmnd \'
 	@echo '    GTDBTK_DATA_PATH=/databases/gtdbtk'
+	@echo ''
+	@echo 'External assembly (explicitly disable MEGAHIT):'
+	@echo '  make test-dry-run PROFILE=assembly RUN_MEGAHIT=no \'
+	@echo '    ASSEMBLY_IN=/data/assembly/final.contigs.fa CLEAN_READS_DIR=/data/clean_reads'
+	@echo ''
+	@echo 'Binner selection dry-runs:'
+	@echo '  make test-dry-run PROFILE=assembly BINNERS=vamb CLEAN_READS_DIR=/data/clean_reads'
+	@echo '  make test-dry-run PROFILE=assembly BINNERS=vamb CLEAN_READS_DIR=/data/clean_reads  # binsplitting disabled by default'
+	@echo '  make test-dry-run PROFILE=assembly BINNERS=vamb VAMB_BINSPLIT_SEPARATOR=C CLEAN_READS_DIR=/data/clean_reads'
+	@echo '  make test-dry-run PROFILE=assembly BINNERS=metabinner CLEAN_READS_DIR=/data/clean_reads'
+	@echo '  make test-dry-run PROFILE=assembly BINNERS=comebin CLEAN_READS_DIR=/data/clean_reads'
+	@echo '  make test-dry-run PROFILE=assembly BINNERS=vamb,metabinner REFINEMENT_MODE=auto BINS_SOURCE=auto CLEAN_READS_DIR=/data/clean_reads'
+	@echo '  make test-dry-run PROFILE=assembly BINNERS=vamb,metabinner,comebin REFINEMENT_MODE=auto BINS_SOURCE=auto CLEAN_READS_DIR=/data/clean_reads'
+	@echo '  make test-dry-run PROFILE=assembly BINNERS=vamb,comebin REFINEMENT_MODE=never BINS_SOURCE=comebin CLEAN_READS_DIR=/data/clean_reads'
+	@echo '  make test-dry-run PROFILE=custom RUN_FASTP=no RUN_KRAKEN2=no RUN_MEGAHIT=no RUN_MAPPING=no RUN_BINNING=no RUN_CHECKM2=no RUN_MAG_FILTERING=no RUN_GTDBTK=no RUN_COVERM=no RUN_SUMMARY=no'
+	@echo ''
+	@echo 'External coverage and selective resume:'
+	@echo '  make test-dry-run PROFILE=assembly CLEAN_READS_DIR=/data/clean_reads'
+	@echo '  make test-dry-run PROFILE=assembly RUN_MAPPING=false BAM_DIR=/data/bams BINNERS=comebin'
+	@echo '  make test-dry-run PROFILE=assembly RUN_MAPPING=false JGI_DEPTH_FILE=/data/depth.txt BINNERS=vamb'
+	@echo '  make test-dry-run PROFILE=assembly RUN_MAPPING=false JGI_DEPTH_FILE=/data/depth.txt BINNERS=vamb FORCE_STAGE=vamb'
+	@echo '  make test-dry-run PROFILE=assembly RUN_MAPPING=false BAM_MANIFEST=/data/bams.tsv BINNERS=comebin RESTART_FROM=comebin'
