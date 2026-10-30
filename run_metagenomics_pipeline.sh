@@ -48,6 +48,7 @@ JGI_DEPTH_FILE_INPUT="${JGI_DEPTH_FILE_INPUT:-}"
 BAM_DIR_ACTIVE=""
 BAM_MANIFEST_ACTIVE=""
 JGI_DEPTH_FILE_ACTIVE=""
+COMEBIN_BAM_DIR=""
 COVERAGE_SOURCE=""
 RESUME_CONTROL=resume
 FORCE_STAGE_NAMES=()
@@ -177,6 +178,15 @@ METABINNER_RUNNER="${METABINNER_RUNNER:-run_metabinner.sh}"
 # ── COMEBin Script Path ───────────────────────────────────────────────────────
 # Same logic: run_comebin.sh lives inside the container when EXEC_MODE="apptainer".
 COMEBIN_SCRIPT="${COMEBIN_SCRIPT:-run_comebin.sh}"
+COMEBIN_VERSION="1.1.0"
+COMEBIN_DEVICE="${COMEBIN_DEVICE:-cpu}"
+COMEBIN_SEED="${COMEBIN_SEED:-42}"
+COMEBIN_DEVICE_CLI_SET=false
+COMEBIN_PYTORCH_VERSION="uninspected"
+COMEBIN_PYTORCH_CUDA_BUILD="uninspected"
+COMEBIN_PYTORCH_CUDA_AVAILABLE="uninspected"
+COMEBIN_CUDA_DEVICE_COUNT="uninspected"
+COMEBIN_APPTAINER_NV=false
 
 # ── Assembly Parameters ───────────────────────────────────────────────────────
 MIN_CONTIG_LEN=1000    # bp — contigs shorter than this are discarded
@@ -282,6 +292,10 @@ Options:
   --mapping / --no-mapping     Enable/disable mapping (default: enabled)
   --binning / --no-binning     Enable/disable binning (default: enabled)
   --binners <list>             Comma-separated: vamb,metabinner,comebin
+  --comebin-device DEVICE      Training device passed to COMEBin through
+                               run_comebin.sh -d. Accepted values: cpu,
+                               cuda, cuda:N. Default: cpu.
+  --comebin-seed INTEGER       COMEBin random seed (default: 42)
   --vamb-binsplit-separator CHAR
                                Advanced Vamb binsplitting; disabled by default
   --refinement-mode <mode>     Consensus refinement: auto, always, or never
@@ -356,6 +370,7 @@ while [[ ${#_profile_scan[@]} -gt 0 ]]; do
         -a|--assembly-in|\
         --bam-dir|--bam-manifest|--jgi-depth-file|--force-stage|--restart-from|\
         --binners|--refinement-mode|--bins-source|--vamb-binsplit-separator|\
+        --comebin-device|--comebin-seed|\
         -o|--outdir|--metabinner-scripts-dir|-t|--threads|-m|--memory|-e|--engine|--stop-after)
             _profile_scan=("${_profile_scan[@]:2}") ;;
         *) _profile_scan=("${_profile_scan[@]:1}") ;;
@@ -432,6 +447,16 @@ while [[ $# -gt 0 ]]; do
             [[ -z "${2:-}" || "${2}" == -* ]] && {
                 echo "[ERROR] --binners requires a comma-separated method list." >&2; exit 1; }
             SELECTED_BINNERS="$2"; shift 2 ;;
+        --comebin-device)
+            [[ -z "${2:-}" || "${2}" == -* ]] && {
+                echo "[ERROR] --comebin-device requires exactly one value (cpu, cuda, or cuda:N)." >&2; exit 1; }
+            COMEBIN_DEVICE="$2"
+            COMEBIN_DEVICE_CLI_SET=true
+            shift 2 ;;
+        --comebin-seed)
+            [[ -z "${2:-}" || ! "${2}" =~ ^[0-9]+$ ]] && {
+                echo "[ERROR] --comebin-seed requires a non-negative integer." >&2; exit 1; }
+            COMEBIN_SEED="$2"; shift 2 ;;
         --refinement-mode)
             [[ -z "${2:-}" || "${2}" == -* ]] && {
                 echo "[ERROR] --refinement-mode requires auto, always, or never." >&2; exit 1; }
@@ -905,6 +930,234 @@ _has_gpu() {
         --format=csv,noheader &>/dev/null
 }
 
+validate_comebin_device() {
+    if [[ "${COMEBIN_DEVICE}" == cpu || "${COMEBIN_DEVICE}" == cuda || \
+          "${COMEBIN_DEVICE}" =~ ^cuda:[0-9]+$ ]]; then
+        return 0
+    fi
+
+    log_error "Invalid COMEBin device: ${COMEBIN_DEVICE}"
+    log_error "Allowed values: cpu, cuda, cuda:N"
+    return 1
+}
+
+validate_comebin_preflight() {
+    local runtime="apptainer" wrapper_path="" runtime_info="" python_check="" wrapper_check="" version_output=""
+    local torch_cuda_requested=false device_index=""
+    local -a bind_args=() runtime_args=() visible_inputs=()
+    local input
+
+    [[ "${RUN_BINNING}" == true ]] && binner_selected comebin || return 0
+    validate_comebin_device || return 1
+    stage_in_scope binning || return 0
+
+    if [[ "${COMEBIN_DEVICE}" == cuda || "${COMEBIN_DEVICE}" == cuda:* ]]; then
+        torch_cuda_requested=true
+    fi
+    COMEBIN_APPTAINER_NV=false
+    if [[ "${EXEC_MODE}" == apptainer ]]; then
+        if [[ "${torch_cuda_requested}" == true ]]; then
+            COMEBIN_APPTAINER_NV=true
+            runtime_args+=(--nv)
+        fi
+        command -v apptainer &>/dev/null || runtime="singularity"
+        ensure_sif_image "${SIF_COMEBIN}" "${SIF_COMEBIN_URI}" || return 1
+        if [[ ! -f "${SIF_COMEBIN}" ]]; then
+            log_info "[COMEBin] Runtime inspection deferred; image will be pulled before execution."
+            log_info "COMEBin selected       : true"
+            log_info "COMEBin version        : ${COMEBIN_VERSION}"
+            log_info "COMEBin device         : ${COMEBIN_DEVICE}"
+            log_info "COMEBin seed           : ${COMEBIN_SEED}"
+            log_info "PyTorch version        : uninspected"
+            log_info "PyTorch CUDA build     : uninspected"
+            log_info "CUDA available         : uninspected"
+            log_info "CUDA device count      : uninspected"
+            log_info "Apptainer --nv         : ${COMEBIN_APPTAINER_NV}"
+            [[ "${DRY_RUN}" == true ]] && show_comebin_command
+            return 0
+        fi
+        build_bind_mounts bind_args
+        if [[ ! -d "${OUTDIR}" ]]; then
+            local outdir_abs
+            outdir_abs="$(realpath -m "${OUTDIR}")"
+            local -a existing_binds=()
+            local bind_index
+            for (( bind_index=0; bind_index<${#bind_args[@]}; bind_index++ )); do
+                if [[ "${bind_args[$bind_index]}" == -B && \
+                      "${bind_args[$((bind_index + 1))]:-}" == "${outdir_abs}:${outdir_abs}" ]]; then
+                    bind_index=$((bind_index + 1))
+                    continue
+                fi
+                existing_binds+=("${bind_args[$bind_index]}")
+            done
+            bind_args=("${existing_binds[@]}")
+        fi
+    else
+        runtime="mamba"
+    fi
+    wrapper_check="$(cat <<'SH_COMEBIN_WRAPPER'
+runner=$(command -v "$1") || exit 1
+test -x "$runner" || exit 1
+help_output=$(bash "$runner" -h 2>&1) || exit 1
+grep -Eq "^[[:space:]]*-d[[:space:]]" <<< "$help_output" || exit 1
+printf "%s\n" "$runner"
+SH_COMEBIN_WRAPPER
+)"
+    if [[ "${EXEC_MODE}" == apptainer ]]; then
+        if ! wrapper_path="$("${runtime}" exec --cleanenv "${bind_args[@]}" \
+                "${SIF_COMEBIN}" bash -c "${wrapper_check}" _ "${COMEBIN_SCRIPT}" 2>&1)"; then
+            log_error "[COMEBin] run_comebin.sh is missing, not executable, or does not accept -d in ${SIF_COMEBIN}."
+            log_error "${wrapper_path}"
+            return 1
+        fi
+    else
+        if ! wrapper_path="$(mamba run -n "${ENV_COMEBIN}" \
+                bash -c "${wrapper_check}" _ "${COMEBIN_SCRIPT}" 2>&1)"; then
+            log_error "[COMEBin] run_comebin.sh is missing, not executable, or does not accept -d in ${ENV_COMEBIN}."
+            log_error "${wrapper_path}"
+            return 1
+        fi
+    fi
+    if [[ "${EXEC_MODE}" == apptainer ]]; then
+        if ! version_output="$("${runtime}" exec --cleanenv "${bind_args[@]}" \
+                "${SIF_COMEBIN}" "${wrapper_path}" -V 2>&1)"; then
+            log_error "[COMEBin] Could not query the version from ${SIF_COMEBIN}."
+            log_error "${version_output}"
+            return 1
+        fi
+    else
+        if ! version_output="$(mamba run -n "${ENV_COMEBIN}" "${wrapper_path}" -V 2>&1)"; then
+            log_error "[COMEBin] Could not query the version from ${ENV_COMEBIN}."
+            log_error "${version_output}"
+            return 1
+        fi
+    fi
+    if [[ "${version_output}" =~ COMEBin[[:space:]]version:[[:space:]]*([^[:space:]]+) ]]; then
+        COMEBIN_VERSION="${BASH_REMATCH[1]}"
+    else
+        log_error "[COMEBin] Could not parse the version reported by run_comebin.sh."
+        log_error "${version_output}"
+        return 1
+    fi
+
+    [[ -s "${CONTIGS}" ]] && visible_inputs+=("${CONTIGS}")
+    if [[ "${COVERAGE_SOURCE}" == external ]]; then
+        visible_inputs+=("${ACTIVE_BAMS[@]}" "${ACTIVE_BAM_INDEXES[@]}")
+    elif [[ -d "${MAPPING_DIR}" ]]; then
+        while IFS= read -r input; do
+            [[ -s "${input}" ]] && visible_inputs+=("${input}")
+        done < <(find "${MAPPING_DIR}" -maxdepth 1 -type f -name '*_sorted.bam' -print | sort)
+    fi
+
+    python_check="$(cat <<'PY_COMEBIN_RUNTIME'
+import os
+import sys
+import torch
+import Bio
+import click
+import hnswlib
+import igraph
+import leidenalg
+import numpy
+import pandas
+import sklearn
+import tensorboard
+import yaml
+from torch.utils.tensorboard import SummaryWriter
+
+runner = os.path.realpath(sys.argv[1])
+sys.path.insert(0, os.path.dirname(runner))
+import cluster
+import simclr
+import train_CLmodel
+import utils
+
+torch.tensor([1], device="cpu")
+for path in sys.argv[2:]:
+    if not os.path.exists(path):
+        raise SystemExit("COMEBin input is not visible in its runtime: " + path)
+print("\t".join((
+    torch.__version__,
+    torch.version.cuda or "none",
+    "true" if torch.cuda.is_available() else "false",
+    str(torch.cuda.device_count()),
+)))
+PY_COMEBIN_RUNTIME
+)"
+    if [[ "${EXEC_MODE}" == apptainer ]]; then
+        if ! runtime_info="$("${runtime}" exec --cleanenv "${runtime_args[@]}" \
+                "${bind_args[@]}" "${SIF_COMEBIN}" \
+                /opt/env/bin/python -c "${python_check}" "${wrapper_path}" "${visible_inputs[@]}" 2>&1)"; then
+            log_error "[COMEBin] PyTorch/dependency/input preflight failed in ${SIF_COMEBIN}."
+            log_error "${runtime_info}"
+            if [[ "${torch_cuda_requested}" == true ]]; then
+                log_error "COMEBin device '${COMEBIN_DEVICE}' was requested, but the selected runtime does not provide a usable CUDA-enabled PyTorch environment. Use --comebin-device cpu or provide a CUDA-enabled COMEBin image."
+            fi
+            return 1
+        fi
+    else
+        if ! runtime_info="$(mamba run -n "${ENV_COMEBIN}" \
+                python -c "${python_check}" "${wrapper_path}" "${visible_inputs[@]}" 2>&1)"; then
+            log_error "[COMEBin] PyTorch/dependency/input preflight failed in ${ENV_COMEBIN}."
+            log_error "${runtime_info}"
+            if [[ "${torch_cuda_requested}" == true ]]; then
+                log_error "COMEBin device '${COMEBIN_DEVICE}' was requested, but the selected runtime does not provide a usable CUDA-enabled PyTorch environment. Use --comebin-device cpu or provide a CUDA-enabled COMEBin image."
+            fi
+            return 1
+        fi
+    fi
+
+    runtime_info="${runtime_info##*$'\n'}"
+    IFS=$'\t' read -r COMEBIN_PYTORCH_VERSION COMEBIN_PYTORCH_CUDA_BUILD \
+        COMEBIN_PYTORCH_CUDA_AVAILABLE COMEBIN_CUDA_DEVICE_COUNT <<< "${runtime_info}"
+    if [[ -z "${COMEBIN_PYTORCH_VERSION}" || \
+          ( "${COMEBIN_PYTORCH_CUDA_AVAILABLE}" != true && \
+            "${COMEBIN_PYTORCH_CUDA_AVAILABLE}" != false ) || \
+          ! "${COMEBIN_CUDA_DEVICE_COUNT}" =~ ^[0-9]+$ ]]; then
+        log_error "[COMEBin] Could not parse PyTorch runtime inspection output."
+        log_error "${runtime_info}"
+        return 1
+    fi
+    if [[ "${torch_cuda_requested}" == true ]]; then
+        if [[ "${COMEBIN_PYTORCH_CUDA_BUILD}" == none || \
+             "${COMEBIN_PYTORCH_CUDA_AVAILABLE}" != true || \
+             ! "${COMEBIN_CUDA_DEVICE_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
+            log_error "COMEBin device '${COMEBIN_DEVICE}' was requested, but the selected runtime does not provide a usable CUDA-enabled PyTorch environment. Use --comebin-device cpu or provide a CUDA-enabled COMEBin image."
+            return 1
+        fi
+        if [[ "${COMEBIN_DEVICE}" == cuda:* ]]; then
+            device_index="${COMEBIN_DEVICE#cuda:}"
+            if ! python3 -c 'import sys; raise SystemExit(int(sys.argv[1]) >= int(sys.argv[2]))' \
+                    "${device_index}" "${COMEBIN_CUDA_DEVICE_COUNT}"; then
+                log_error "COMEBin device index ${device_index} is out of range; CUDA device count is ${COMEBIN_CUDA_DEVICE_COUNT}."
+                return 1
+            fi
+        fi
+    fi
+
+    log_info "COMEBin selected       : true"
+    log_info "COMEBin version        : ${COMEBIN_VERSION}"
+    log_info "COMEBin device         : ${COMEBIN_DEVICE}"
+    log_info "COMEBin seed           : ${COMEBIN_SEED}"
+    log_info "PyTorch version        : ${COMEBIN_PYTORCH_VERSION}"
+    log_info "PyTorch CUDA build     : ${COMEBIN_PYTORCH_CUDA_BUILD}"
+    log_info "CUDA available         : ${COMEBIN_PYTORCH_CUDA_AVAILABLE}"
+    log_info "CUDA device count      : ${COMEBIN_CUDA_DEVICE_COUNT}"
+    log_info "Apptainer --nv         : ${COMEBIN_APPTAINER_NV}"
+    if [[ -s "${CONTIGS}" ]]; then
+        log_info "[COMEBin] Assembly is present and readable in the selected runtime."
+    else
+        log_info "[COMEBin] Assembly visibility check deferred until upstream assembly completes."
+    fi
+    if (( ${#visible_inputs[@]} == 1 )) && [[ -s "${CONTIGS}" ]]; then
+        log_info "[COMEBin] BAM visibility check deferred until mapping completes."
+    elif (( ${#visible_inputs[@]} > 1 )); then
+        log_info "[COMEBin] Existing BAM inputs are visible in the selected runtime."
+    fi
+    [[ "${DRY_RUN}" == true ]] && show_comebin_command
+    return 0
+}
+
 # ── run_mamba_file(step_label, env_name, script_file) ────────────────────────
 # Hybrid dispatcher: routes execution through Apptainer or mamba depending on
 # EXEC_MODE. Signature is unchanged so all step functions work without edits.
@@ -928,12 +1181,15 @@ run_mamba_file() {
         local -a bind_args=()
         build_bind_mounts bind_args
 
-        # Optional GPU flag (Vamb and COMEBin can use CUDA)
+        # Vamb retains its historical GPU behavior; COMEBin opts in only for CUDA.
         local -a gpu_args=()
-        if { [[ "${env_name}" == "${ENV_VAMB}" ]] || \
-             [[ "${env_name}" == "${ENV_COMEBIN}" ]]; } && _has_gpu; then
+        if [[ "${env_name}" == "${ENV_VAMB}" ]] && _has_gpu; then
             gpu_args=(--nv)
             log_info "[Step ${step_label}] GPU detected — adding --nv flag."
+        elif [[ "${env_name}" == "${ENV_COMEBIN}" && \
+                ( "${COMEBIN_DEVICE}" == cuda || "${COMEBIN_DEVICE}" == cuda:* ) ]]; then
+            gpu_args=(--nv)
+            log_info "[Step ${step_label}] COMEBin CUDA requested — adding --nv flag."
         fi
 
         # Determine available runtime
@@ -1393,10 +1649,30 @@ checkpoint_config_manifest() {
                 append_assembly_manifest
                 append_bins_manifest "${METABINNER_FINAL_BINS_DIR}" ;;
             05c_comebin)
-                printf 'coverage_source=%s\ncontigs=%s\nbam_dir=%s\noutput_dir=%s\nfinal_bins=%s\nthreads=%s\nimage=%s\n' \
-                    "${COVERAGE_SOURCE}" "${CONTIGS}" "${BAM_DIR_ACTIVE}" "${COMEBIN_DIR}/comebin_res/comebin_res_bins" \
-                    "${COMEBIN_FINAL_BINS_DIR}" "${THREADS}" "${SIF_COMEBIN_URI}"
+                local comebin_bam_dir="${COMEBIN_BAM_DIR:-${BAM_DIR_ACTIVE}}"
+                local comebin_output_dir
+                comebin_output_dir="$(realpath -m "${COMEBIN_DIR}")"
+                [[ "${COVERAGE_SOURCE}" == external && -z "${comebin_bam_dir}" ]] && \
+                    comebin_bam_dir="${COMEBIN_DIR}/external_bams"
+                [[ -n "${comebin_bam_dir}" ]] && \
+                    comebin_bam_dir="$(realpath -m "${comebin_bam_dir}")"
+                printf 'coverage_source=%s\ncontigs=%s\nbam_dir=%s\noutput_dir=%s\nfinal_bins=%s\n' \
+                    "${COVERAGE_SOURCE}" "${CONTIGS}" "${comebin_bam_dir}" "${comebin_output_dir}/comebin_res/comebin_res_bins" \
+                    "${COMEBIN_FINAL_BINS_DIR}"
+                printf 'comebin_version=%s\ncomebin_device=%s\ncomebin_seed=%s\nthreads=%s\n' \
+                    "${COMEBIN_VERSION}" "${COMEBIN_DEVICE}" "${COMEBIN_SEED}" "${THREADS}"
+                printf 'pytorch_version=%s\npytorch_cuda_build=%s\npytorch_cuda_available=%s\ncuda_device_count=%s\n' \
+                    "${COMEBIN_PYTORCH_VERSION}" "${COMEBIN_PYTORCH_CUDA_BUILD}" \
+                    "${COMEBIN_PYTORCH_CUDA_AVAILABLE}" "${COMEBIN_CUDA_DEVICE_COUNT}"
+                printf 'runtime=%s\nimage_uri=%s\ncomebin_parameters=%q\n' \
+                    "${EXEC_MODE}" "${SIF_COMEBIN_URI}" \
+                    "-a ${CONTIGS} -o ${comebin_output_dir} -p ${comebin_bam_dir} -s ${COMEBIN_SEED} -t ${THREADS} -d ${COMEBIN_DEVICE}; wrapper defaults: -n 6 -w same_as_-t -m 100 -E 1e-5 -l 0.07_if_N50_gt_10000_else_0.15 -e 2048 -c 2048 -b 1024"
                 append_file_fingerprint contigs "${CONTIGS}"
+                if [[ "${EXEC_MODE}" == apptainer ]]; then
+                    append_file_fingerprint comebin_image "${SIF_COMEBIN}"
+                else
+                    printf 'mamba_environment=%s\n' "${ENV_COMEBIN}"
+                fi
                 append_assembly_manifest
                 if [[ "${COVERAGE_SOURCE}" == external ]]; then
                     local coverage_index
@@ -2374,6 +2650,52 @@ PY_VAMB_SEPARATOR
     else
         log_info "[Vamb] External assembly is used as supplied; no pipeline contig-length filter is recorded. Vamb internal minimum: ${VAMB_INTERNAL_MIN_CONTIG_LEN} bp."
     fi
+}
+
+build_comebin_args() {
+    local output_name="$1"
+    local output_dir
+    # shellcheck disable=SC2178
+    local -n output_args="${output_name}"
+    local bam_dir="${COMEBIN_BAM_DIR:-${BAM_DIR_ACTIVE}}"
+    output_dir="$(realpath -m "${COMEBIN_DIR}")"
+    [[ "${COVERAGE_SOURCE}" == external && -z "${COMEBIN_BAM_DIR}" ]] && \
+        bam_dir="${COMEBIN_DIR}/external_bams"
+    [[ -n "${bam_dir}" ]] && bam_dir="$(realpath -m "${bam_dir}")"
+    output_args=(
+        -a "${CONTIGS}"
+        -o "${output_dir}"
+        -p "${bam_dir}"
+        -s "${COMEBIN_SEED}"
+        -t "${THREADS}"
+        -d "${COMEBIN_DEVICE}"
+    )
+}
+
+write_comebin_script() {
+    local script="$1" argument quoted_wrapper
+    local -a comebin_args=()
+    build_comebin_args comebin_args
+    printf -v quoted_wrapper '%q' "${COMEBIN_SCRIPT}"
+    {
+        printf '%s\n' '#!/usr/bin/env bash' 'set -euo pipefail' 'comebin_args=('
+        for argument in "${comebin_args[@]}"; do
+            printf '    %q\n' "${argument}"
+        done
+        printf '%s\n' ')' "bash ${quoted_wrapper} \"\${comebin_args[@]}\""
+    } > "${script}"
+    chmod +x "${script}"
+}
+
+show_comebin_command() {
+    local argument
+    local -a comebin_args=()
+    build_comebin_args comebin_args
+    printf '[DRY-RUN] COMEBin command: bash %q' "${COMEBIN_SCRIPT}"
+    for argument in "${comebin_args[@]}"; do
+        printf ' %q' "${argument}"
+    done
+    printf '\n'
 }
 
 resolve_coverage_inputs() {
@@ -3381,6 +3703,19 @@ preflight_check() {
     if ! validate_vamb_preflight; then
         errors=$((errors + 1))
     fi
+    if [[ "${RUN_BINNING}" == true ]] && binner_selected comebin; then
+        if [[ ! "${COMEBIN_SEED}" =~ ^[0-9]+$ ]]; then
+            log_error "COMEBIN_SEED must be a non-negative integer."
+            errors=$((errors + 1))
+        fi
+        if ! validate_comebin_preflight; then
+            errors=$((errors + 1))
+        fi
+    elif [[ "${COMEBIN_DEVICE_CLI_SET}" == true ]]; then
+        if ! validate_comebin_device; then
+            errors=$((errors + 1))
+        fi
+    fi
     [[ "${RUN_MAG_FILTERING}" == true ]] && HQ_BINS_DIR="${MAGS_DIR}"
     if ! configure_stage_actions; then
         errors=$((errors + 1))
@@ -4256,20 +4591,8 @@ step_05c_comebin() {
     fi
 
     local comebin_script="${TMPSCRIPTS_DIR}/step_05c_comebin.sh"
-    local comebin_bam_dir
-    comebin_bam_dir="$(prepare_comebin_bam_dir)"
-    cat > "${comebin_script}" <<COMEBIN_SCRIPT
-#!/usr/bin/env bash
-set -euo pipefail
-bash "${COMEBIN_SCRIPT}" \\
-    -a "${CONTIGS}" \\
-    -o "${COMEBIN_DIR}" \\
-    -p "${comebin_bam_dir}" \\
-    -s 42 \\
-    -t "${THREADS}"
-COMEBIN_SCRIPT
-
-    chmod +x "${comebin_script}"
+    COMEBIN_BAM_DIR="$(prepare_comebin_bam_dir)"
+    write_comebin_script "${comebin_script}"
     run_mamba_file "05c" "${ENV_COMEBIN}" "${comebin_script}" 2>&1 | tee "${LOGS_DIR}/step_05c_comebin.log"
 
     local cb_bins_dir="${COMEBIN_DIR}/comebin_res/comebin_res_bins"

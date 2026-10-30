@@ -24,22 +24,46 @@ From: condaforge/miniforge3:latest
         hmmer \
         scikit-learn \
         biopython \
+        click \
         pandas \
         numpy \
         scipy \
         tqdm && \
         mamba clean -afy
 
+    # Verificar dependencias Python requeridas por MetaBinner
+    /opt/env/bin/python - <<'PY'
+import click
+import Bio
+
+print("Click:", click.__version__)
+print("Biopython:", Bio.__version__)
+print("MetaBinner Python dependencies OK")
+PY
+
     # 2. Clonar MetaBinner directamente en /opt/metabinner
-    git clone --depth 1 https://github.com/ziyewang/MetaBinner.git /opt/metabinner
+    git clone --depth 1 \
+        https://github.com/ziyewang/MetaBinner.git \
+        /opt/metabinner
 
     # 3. Dar permisos de ejecución a scripts y binarios auxiliares
-    chmod -R +x /opt/metabinner/run_metabinner.sh /opt/metabinner/scripts /opt/metabinner/auxiliary
+    chmod -R +x \
+        /opt/metabinner/run_metabinner.sh \
+        /opt/metabinner/scripts \
+        /opt/metabinner/auxiliary
 
-    # 4. Enlazar run_metabinner.sh y scripts dentro de /opt/env/bin para que MBPATH funcione
-    ln -sf /opt/metabinner/run_metabinner.sh /opt/env/bin/run_metabinner.sh
-    ln -sf /opt/metabinner/scripts /opt/env/bin/scripts
-    ln -sf /opt/metabinner/auxiliary /opt/env/bin/auxiliary
+    # 4. Enlazar runner y directorios dentro de /opt/env/bin
+    ln -sf \
+        /opt/metabinner/run_metabinner.sh \
+        /opt/env/bin/run_metabinner.sh
+
+    ln -sf \
+        /opt/metabinner/scripts \
+        /opt/env/bin/scripts
+
+    ln -sf \
+        /opt/metabinner/auxiliary \
+        /opt/env/bin/auxiliary
 
     rm -rf /tmp/conda-pkgs
 
@@ -48,9 +72,20 @@ From: condaforge/miniforge3:latest
     export PATH="/opt/env/bin:/opt/metabinner:/opt/metabinner/scripts:/opt/metabinner/auxiliary:/opt/conda/bin:${PATH}"
     export METABINNER_SCRIPTS_DIR="/opt/metabinner/scripts"
     export METABINNER_RUNNER="/opt/env/bin/run_metabinner.sh"
+    export METABINNER_PYTHON="/opt/env/bin/python"
 
 %test
+    set -eu
+
     /opt/env/bin/python --version
-    which run_metabinner.sh
-    test -f /opt/metabinner/scripts/Filter_tooshort.py
-    test -f /opt/metabinner/scripts/gen_kmer.py
+
+    /opt/env/bin/python -c \
+        'import click, Bio; print("Click:", click.__version__); print("Biopython:", Bio.__version__)'
+
+    command -v run_metabinner.sh
+
+    test -r /opt/metabinner/scripts/Filter_tooshort.py
+    test -r /opt/metabinner/scripts/gen_kmer.py
+
+    /opt/env/bin/python -c \
+        'from Bio import SeqIO; import click; print("MetaBinner helper dependencies OK")'

@@ -23,6 +23,8 @@ RUN_GTDBTK ?=
 RUN_COVERM ?=
 RUN_SUMMARY ?=
 BINNERS ?= vamb,metabinner,comebin
+COMEBIN_DEVICE ?= cpu
+COMEBIN_SEED ?= 42
 VAMB_BINSPLIT_SEPARATOR ?=
 REFINEMENT_MODE ?= auto
 BINS_SOURCE ?= auto
@@ -76,6 +78,8 @@ VAMB_ARGS = $(if $(VAMB_BINSPLIT_SEPARATOR),\
 comma := ,
 FORCE_STAGE_ARGS = $(foreach stage,$(subst $(comma), ,$(strip $(FORCE_STAGE))),--force-stage "$(stage)")
 RESTART_FROM_ARGS = $(if $(strip $(RESTART_FROM)),--restart-from "$(RESTART_FROM)")
+COMEBIN_ARGS = --comebin-device "$(COMEBIN_DEVICE)" \
+               --comebin-seed "$(COMEBIN_SEED)"
 
 # Redirect Apptainer/Singularity temp and cache dirs to local disk instead of /tmp RAM
 export APPTAINER_TMPDIR     := $(TMP_DIR)/tmp
@@ -200,6 +204,13 @@ clean-tmp:
 ## test-dry-run: Check Bash syntax and execute a pipeline dry-run (--dry-run)
 test-dry-run:
 	@case "$(RUN_MAPPING)" in true|false) ;; *) echo '[ERROR] RUN_MAPPING must be true or false.'; exit 1 ;; esac
+	@case $(call shell_quote,$(COMEBIN_DEVICE)) in \
+	  cpu|cuda) ;; \
+	  cuda:*) device_index=$(call shell_quote,$(patsubst cuda:%,%,$(COMEBIN_DEVICE))); \
+	    case "$$device_index" in ''|*[!0-9]*) echo '[ERROR] COMEBIN_DEVICE must be cpu, cuda, or cuda:N with N a non-negative integer.'; exit 1 ;; esac ;; \
+	  *) echo '[ERROR] COMEBIN_DEVICE must be cpu, cuda, or cuda:N with N a non-negative integer.'; exit 1 ;; \
+	esac
+	@case $(call shell_quote,$(COMEBIN_SEED)) in ''|*[!0-9]*) echo '[ERROR] COMEBIN_SEED must be a non-negative integer.'; exit 1 ;; esac
 	bash -n $(PIPELINE)
 	bash $(PIPELINE) \
 	  $(READ_INPUT_ARGS) \
@@ -210,6 +221,7 @@ test-dry-run:
 	  $(KRAKEN2_ARGS) \
 	  $(MAPPING_ARGS) \
 	  --binners "$(BINNERS)" \
+	  $(COMEBIN_ARGS) \
 	  $(VAMB_ARGS) \
 	  --refinement-mode "$(REFINEMENT_MODE)" \
 	  --bins-source "$(BINS_SOURCE)" \
@@ -256,6 +268,14 @@ help:
 	@echo '  make test-dry-run PROFILE=assembly BINNERS=vamb VAMB_BINSPLIT_SEPARATOR=C CLEAN_READS_DIR=/data/clean_reads'
 	@echo '  make test-dry-run PROFILE=assembly BINNERS=metabinner CLEAN_READS_DIR=/data/clean_reads'
 	@echo '  make test-dry-run PROFILE=assembly BINNERS=comebin CLEAN_READS_DIR=/data/clean_reads'
+	@echo '  CPU:'
+	@echo '  make test-dry-run \'
+	@echo '    BINNERS=comebin \'
+	@echo '    COMEBIN_DEVICE=cpu'
+	@echo '  CUDA:'
+	@echo '  make test-dry-run \'
+	@echo '    BINNERS=comebin \'
+	@echo '    COMEBIN_DEVICE=cuda:0'
 	@echo '  make test-dry-run PROFILE=assembly BINNERS=vamb,metabinner REFINEMENT_MODE=auto BINS_SOURCE=auto CLEAN_READS_DIR=/data/clean_reads'
 	@echo '  make test-dry-run PROFILE=assembly BINNERS=vamb,metabinner,comebin REFINEMENT_MODE=auto BINS_SOURCE=auto CLEAN_READS_DIR=/data/clean_reads'
 	@echo '  make test-dry-run PROFILE=assembly BINNERS=vamb,comebin REFINEMENT_MODE=never BINS_SOURCE=comebin CLEAN_READS_DIR=/data/clean_reads'

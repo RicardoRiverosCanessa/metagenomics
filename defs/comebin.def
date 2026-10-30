@@ -1,27 +1,51 @@
 Bootstrap: docker
-From: condaforge/miniforge3:latest
+From: condaforge/miniforge3:24.7.1-0
 
 %labels
     Author Ricardo Riveros
     Tool COMEBin
-    Version 1.0.4
+    Version 1.1.0
+    Source https://github.com/ziyewang/COMEBin
 
 %post
-    set -e
-    export LC_ALL=C
+    set -eu
+
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
     export CONDA_PKGS_DIRS=/tmp/conda-pkgs
+    export PATH="/opt/env/bin:${PATH}"
+
     mkdir -p /tmp/conda-pkgs
 
-    apt-get update && apt-get install -y --no-install-recommends \
-        git wget build-essential ca-certificates procps && \
-        rm -rf /var/lib/apt/lists/*
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        bash \
+        ca-certificates \
+        git \
+        procps && \
+    rm -rf /var/lib/apt/lists/*
 
-    # 1. Crear entorno dedicado en /opt/env usando --copy
+    # Crear un entorno específico para COMEBin.
+    #
+    # Dependencias añadidas tras comprobar los imports:
+    # - pyyaml proporciona import yaml
+    # - tensorboard es requerido por torch.utils.tensorboard
+    # - hnswlib es requerido por cluster.py
+    # - python-igraph y leidenalg son requeridos para clustering Leiden
+    # - click es utilizado por scripts auxiliares
     mamba create -y -p /opt/env --copy \
-        -c pytorch -c conda-forge -c bioconda \
+        -c pytorch \
+        -c conda-forge \
+        -c bioconda \
         python=3.9 \
         pytorch \
         cpuonly \
+        tensorboard \
+        pyyaml \
+        hnswlib \
+        python-igraph \
+        leidenalg \
+        click \
         scikit-learn \
         pandas \
         biopython \
@@ -32,33 +56,276 @@ From: condaforge/miniforge3:latest
         prodigal \
         samtools \
         bedtools \
-        fraggenescan && \
-        mamba clean -afy
+        fraggenescan \
+        bwa && \
+    mamba clean -afy
 
-    # 2. Clonar COMEBin desde GitHub
-    git clone --depth 1 https://github.com/ziyewang/COMEBin.git /opt/COMEBin_repo
+    # Asegurar que el entorno recién creado esté primero en PATH.
+    export PATH="/opt/env/bin:${PATH}"
 
-    # 3. Localizar run_comebin.sh (viene dentro de /opt/COMEBin_repo/COMEBin/)
+    # Validar dependencias Python antes de clonar COMEBin.
+    /opt/env/bin/python - <<'PY'
+import Bio
+import click
+import hnswlib
+import igraph
+import leidenalg
+import numpy
+import pandas
+import sklearn
+import tensorboard
+import torch
+import yaml
+
+from torch.utils.tensorboard import SummaryWriter
+
+print("Python:", __import__("sys").version)
+print("PyYAML:", yaml.__version__)
+print("TensorBoard:", tensorboard.__version__)
+print("hnswlib:", getattr(hnswlib, "__version__", "installed"))
+print("python-igraph:", igraph.__version__)
+print("leidenalg:", getattr(leidenalg, "__version__", "installed"))
+print("Click:", click.__version__)
+print("PyTorch:", torch.__version__)
+print("NumPy:", numpy.__version__)
+print("pandas:", pandas.__version__)
+print("scikit-learn:", sklearn.__version__)
+print("Biopython:", Bio.__version__)
+print("SummaryWriter import OK")
+print("COMEBin Python dependencies OK")
+PY
+
+    # Clonar COMEBin.
+    git clone \
+        https://github.com/ziyewang/COMEBin.git \
+        /opt/COMEBin_repo
+
+    cd /opt/COMEBin_repo
+
+    # Fijar COMEBin 1.1.0.
+    git fetch --tags --force
+
+    if git rev-parse "1.1.0^{commit}" >/dev/null 2>&1; then
+        git checkout --detach 1.1.0
+    elif git rev-parse "v1.1.0^{commit}" >/dev/null 2>&1; then
+        git checkout --detach v1.1.0
+    else
+        echo "ERROR: COMEBin tag 1.1.0 or v1.1.0 was not found." >&2
+        echo "Available tags:" >&2
+        git tag --list >&2
+        exit 1
+    fi
+
+    # Registrar el commit efectivo.
+    git rev-parse HEAD > /opt/COMEBin_commit.txt
+
+    # Localizar el runner de manera robusta.
     if [ -f "/opt/COMEBin_repo/COMEBin/run_comebin.sh" ]; then
         COMEBIN_HOME="/opt/COMEBin_repo/COMEBin"
     else
-        COMEBIN_HOME=$(dirname "$(find /opt/COMEBin_repo -name 'run_comebin.sh' | head -n 1)")
+        COMEBIN_RUNNER="$(
+            find /opt/COMEBin_repo \
+                -type f \
+                -name "run_comebin.sh" \
+                -print \
+                -quit
+        )"
+
+        if [ -z "${COMEBIN_RUNNER}" ]; then
+            echo "ERROR: run_comebin.sh was not found." >&2
+            exit 1
+        fi
+
+        COMEBIN_HOME="$(dirname "${COMEBIN_RUNNER}")"
     fi
 
-    chmod -R +x "${COMEBIN_HOME}"
+    echo "COMEBin home: ${COMEBIN_HOME}"
 
-    # 4. Crear enlace estándar en /opt/COMEBin y en /opt/env/bin
-    ln -sf "${COMEBIN_HOME}" /opt/COMEBin
-    ln -sf "${COMEBIN_HOME}/run_comebin.sh" /opt/env/bin/run_comebin.sh
+    # Validar archivos principales.
+    test -r "${COMEBIN_HOME}/run_comebin.sh"
+    test -r "${COMEBIN_HOME}/main.py"
+    test -r "${COMEBIN_HOME}/utils.py"
+    test -r "${COMEBIN_HOME}/simclr.py"
+    test -r "${COMEBIN_HOME}/train_CLmodel.py"
+    test -r "${COMEBIN_HOME}/cluster.py"
 
+    chmod -R a+rX "${COMEBIN_HOME}"
+    chmod +x "${COMEBIN_HOME}/run_comebin.sh"
+
+    # Crear rutas estables utilizadas por el pipeline.
+    ln -sfn "${COMEBIN_HOME}" /opt/COMEBin
+
+    ln -sfn \
+        "${COMEBIN_HOME}/run_comebin.sh" \
+        /opt/env/bin/run_comebin.sh
+
+    # Comprobar que los enlaces sean válidos y ejecutables.
+    test -x /opt/COMEBin/run_comebin.sh
+    test -x /opt/env/bin/run_comebin.sh
+
+    # Verificar la cadena de imports que usa la ejecución real.
+    cd /opt/COMEBin
+
+    /opt/env/bin/python - <<'PY'
+import cluster
+import simclr
+import train_CLmodel
+import utils
+
+print("COMEBin cluster import OK")
+print("COMEBin simclr import OK")
+print("COMEBin train_CLmodel import OK")
+print("COMEBin utils import OK")
+print("COMEBin import chain OK")
+PY
+
+    # Verificar ejecutables mediante rutas absolutas.
+    # No depender de %environment durante %post.
+    test -x /opt/env/bin/bwa
+    test -x /opt/env/bin/samtools
+    test -x /opt/env/bin/bedtools
+    test -x /opt/env/bin/prodigal
+    test -x /opt/env/bin/hmmsearch
+
+    # FragGeneScan puede estar expuesto con nombres diferentes.
+    FRAGGENESCAN_EXE="$(
+        find /opt/env/bin \
+            -maxdepth 1 \
+            \( -type f -o -type l \) \
+            \( \
+                -name "FragGeneScan" \
+                -o -name "run_FragGeneScan.pl" \
+                -o -iname "*fraggenescan*" \
+            \) \
+            -print \
+            -quit
+    )"
+
+    if [ -z "${FRAGGENESCAN_EXE}" ]; then
+        echo "ERROR: FragGeneScan executable was not found." >&2
+        echo "Files in /opt/env/bin matching *frag*:" >&2
+
+        find /opt/env/bin \
+            -maxdepth 1 \
+            \( -type f -o -type l \) \
+            -iname "*frag*" \
+            -print >&2
+
+        exit 1
+    fi
+
+    if [ ! -x "${FRAGGENESCAN_EXE}" ]; then
+        echo "ERROR: FragGeneScan exists but is not executable:" >&2
+        echo "${FRAGGENESCAN_EXE}" >&2
+        exit 1
+    fi
+
+    echo "FragGeneScan found: ${FRAGGENESCAN_EXE}"
+    echo "COMEBin executables found"
+
+    # Mostrar versiones básicas para el log de construcción.
+    /opt/env/bin/python --version
+    /opt/env/bin/samtools --version
+    /opt/env/bin/bedtools --version
+    /opt/env/bin/prodigal -v
+    /opt/env/bin/hmmsearch -h >/dev/null
+
+    # Limpiar únicamente el cache temporal.
     rm -rf /tmp/conda-pkgs
 
 %environment
-    export LC_ALL=C
-    export PATH="/opt/env/bin:/opt/COMEBin:/opt/conda/bin:${PATH}"
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PATH="/opt/env/bin:/opt/COMEBin:${PATH}"
+    export COMEBIN_HOME="/opt/COMEBin"
     export COMEBIN_SCRIPT="/opt/COMEBin/run_comebin.sh"
+    export COMEBIN_PYTHON="/opt/env/bin/python"
+
+%runscript
+    exec /opt/COMEBin/run_comebin.sh "$@"
 
 %test
-    /opt/env/bin/python -c "import torch; print('PyTorch OK:', torch.__version__)"
-    which run_comebin.sh
-    test -f /opt/COMEBin/run_comebin.sh
+    set -eu
+
+    export PATH="/opt/env/bin:/opt/COMEBin:${PATH}"
+
+    # Verificar rutas principales.
+    test -x /opt/COMEBin/run_comebin.sh
+    test -x /opt/env/bin/run_comebin.sh
+    test -s /opt/COMEBin_commit.txt
+
+    test -r /opt/COMEBin/main.py
+    test -r /opt/COMEBin/utils.py
+    test -r /opt/COMEBin/simclr.py
+    test -r /opt/COMEBin/train_CLmodel.py
+    test -r /opt/COMEBin/cluster.py
+
+    # Verificar dependencias Python.
+    /opt/env/bin/python - <<'PY'
+import Bio
+import click
+import hnswlib
+import igraph
+import leidenalg
+import numpy
+import pandas
+import sklearn
+import tensorboard
+import torch
+import yaml
+
+from torch.utils.tensorboard import SummaryWriter
+
+print("PyYAML:", yaml.__version__)
+print("TensorBoard:", tensorboard.__version__)
+print("hnswlib:", getattr(hnswlib, "__version__", "installed"))
+print("python-igraph:", igraph.__version__)
+print("leidenalg:", getattr(leidenalg, "__version__", "installed"))
+print("Click:", click.__version__)
+print("PyTorch:", torch.__version__)
+print("NumPy:", numpy.__version__)
+print("pandas:", pandas.__version__)
+print("scikit-learn:", sklearn.__version__)
+print("Biopython:", Bio.__version__)
+print("SummaryWriter import OK")
+print("COMEBin Python dependency test OK")
+PY
+
+    # Verificar los módulos internos de COMEBin.
+    cd /opt/COMEBin
+
+    /opt/env/bin/python - <<'PY'
+import cluster
+import simclr
+import train_CLmodel
+import utils
+
+print("COMEBin module import chain OK")
+PY
+
+    # Verificar ejecutables conocidos mediante rutas absolutas.
+    test -x /opt/env/bin/bwa
+    test -x /opt/env/bin/samtools
+    test -x /opt/env/bin/bedtools
+    test -x /opt/env/bin/prodigal
+    test -x /opt/env/bin/hmmsearch
+
+    # Verificar FragGeneScan sin asumir un único nombre.
+    FRAGGENESCAN_EXE="$(
+        find /opt/env/bin \
+            -maxdepth 1 \
+            \( -type f -o -type l \) \
+            \( \
+                -name "FragGeneScan" \
+                -o -name "run_FragGeneScan.pl" \
+                -o -iname "*fraggenescan*" \
+            \) \
+            -print \
+            -quit
+    )"
+
+    test -n "${FRAGGENESCAN_EXE}"
+    test -x "${FRAGGENESCAN_EXE}"
+
+    echo "FragGeneScan found: ${FRAGGENESCAN_EXE}"
+    echo "COMEBin 1.1.0 container test completed successfully"

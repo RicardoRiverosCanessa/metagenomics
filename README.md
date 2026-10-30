@@ -183,6 +183,8 @@ The script uses Apptainer mode by default. Missing remote images may be pulled a
 | `-o, --outdir DIR` | Output directory; default: `./metagenomics_out` |
 | `--metabinner-scripts-dir DIR` | MetaBinner scripts path; mainly required in Mamba mode |
 | `--binners LIST` | Comma-separated selection: `vamb`, `metabinner`, `comebin`; default: all three |
+| `--comebin-device DEVICE` | COMEBin training device: `cpu`, `cuda`, or `cuda:N`; default: `cpu` |
+| `--comebin-seed INTEGER` | Non-negative COMEBin random seed; default: `42` |
 | `--vamb-binsplit-separator CHAR` | Advanced Vamb binsplitting separator; disabled unless explicitly supplied |
 | `--refinement-mode MODE` | Consensus refinement policy: `auto`, `always`, or `never` |
 | `--refinement` / `--no-refinement` | Aliases for `--refinement-mode always` / `never` |
@@ -199,6 +201,49 @@ The script uses Apptainer mode by default. Missing remote images may be pulled a
 | `-h, --help` | Display command-line help |
 
 When threads or memory remain set to `auto`, the pipeline detects available resources. It reserves two logical CPU cores on hosts with more than four cores and uses up to 85% of available RAM.
+
+### COMEBin training device
+
+COMEBin defaults to CPU (`COMEBIN_DEVICE=cpu`, seed `COMEBIN_SEED=42`).
+`--comebin-device DEVICE` accepts `cpu`, `cuda`, or `cuda:N`, where `N` is a
+zero-based non-negative CUDA device index. `cpu` works with CPU-only or
+CUDA-enabled PyTorch and does not require a GPU. `cuda` lets COMEBin choose the
+default CUDA device; `cuda:N` requests a specific device and is checked against
+the selected runtime's visible device count.
+
+The pipeline passes the selection to COMEBin's short-option wrapper as
+`run_comebin.sh -d DEVICE`. The wrapper parses options with `getopts`;
+`--device` is not valid and must not be used. CUDA requires a CUDA-built
+PyTorch, a visible GPU, and `torch.cuda.is_available()` to be true. In
+Apptainer mode the pipeline adds `--nv` only to the COMEBin invocation when
+`cuda` or `cuda:N` is requested; CPU execution never adds `--nv`. Mamba mode
+checks the selected COMEBin environment directly.
+
+The current `defs/comebin.def` builds PyTorch with `pytorch` and `cpuonly`.
+That image supports CPU training, but it does not support CUDA requests. To use
+CUDA, build and select a separate COMEBin image containing CUDA-enabled
+PyTorch and compatible host GPU drivers.
+
+Examples:
+
+### CPU
+
+```bash
+bash run_metagenomics_pipeline.sh --binners comebin \
+  --comebin-device cpu
+```
+
+### CUDA
+
+```bash
+bash run_metagenomics_pipeline.sh --binners comebin \
+  --comebin-device cuda:0
+```
+
+The CUDA example requires a different COMEBin image built with CUDA-enabled
+PyTorch. Both the device and seed are recorded in the COMEBin checkpoint; a
+change invalidates COMEBin and its effective descendants, but not independent
+stages such as mapping, Vamb, or MetaBinner.
 
 ### Enable or disable optional stages
 
@@ -557,6 +602,14 @@ make test-dry-run PROFILE=assembly CLEAN_READS_DIR=/data/clean_reads \
 
 make test-dry-run PROFILE=assembly CLEAN_READS_DIR=/data/clean_reads \
   RUN_MAPPING=false BAM_DIR=/data/bams BINNERS=comebin
+
+make test-dry-run \
+  BINNERS=comebin \
+  COMEBIN_DEVICE=cpu
+
+make test-dry-run \
+  BINNERS=comebin \
+  COMEBIN_DEVICE=cuda:0
 
 make test-dry-run PROFILE=assembly CLEAN_READS_DIR=/data/clean_reads \
   RUN_MAPPING=false JGI_DEPTH_FILE=/data/coverage/depth.txt BINNERS=vamb
