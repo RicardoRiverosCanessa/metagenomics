@@ -25,8 +25,11 @@ RUN_SUMMARY ?=
 BINNERS ?= vamb,metabinner,comebin
 COMEBIN_DEVICE ?= cpu
 COMEBIN_SEED ?= 42
+MIN_COMPLETENESS ?= 70
+MAX_CONTAMINATION ?= 10
 VAMB_BINSPLIT_SEPARATOR ?=
 REFINEMENT_MODE ?= auto
+BINS_DIR ?=
 BINS_SOURCE ?= auto
 PROFILE ?= full
 KRAKEN2_DB ?=
@@ -53,6 +56,7 @@ MAPPING_ARGS = $(if $(filter command% environment override,$(origin RUN_MAPPING)
                  $(if $(filter false,$(RUN_MAPPING)),--no-mapping,--mapping))
 BINNING_ARGS = $(if $(filter no false 0,$(RUN_BINNING)),--no-binning) \
                $(if $(filter yes true 1,$(RUN_BINNING)),--binning)
+BINS_DIR_ARGS = $(if $(strip $(BINS_DIR)),--bins-dir "$(BINS_DIR)" --no-binning)
 REASSEMBLY_ARGS = $(if $(filter no false 0,$(RUN_REASSEMBLY)),--no-reassembly) \
                   $(if $(filter yes true 1,$(RUN_REASSEMBLY)),--reassembly)
 CHECKM2_ARGS = $(if $(filter no false 0,$(RUN_CHECKM2)),--no-checkm2) \
@@ -80,6 +84,8 @@ FORCE_STAGE_ARGS = $(foreach stage,$(subst $(comma), ,$(strip $(FORCE_STAGE))),-
 RESTART_FROM_ARGS = $(if $(strip $(RESTART_FROM)),--restart-from "$(RESTART_FROM)")
 COMEBIN_ARGS = --comebin-device "$(COMEBIN_DEVICE)" \
                --comebin-seed "$(COMEBIN_SEED)"
+MAG_FILTER_ARGS = --min-completeness $(call shell_quote,$(MIN_COMPLETENESS)) \
+                   --max-contamination $(call shell_quote,$(MAX_CONTAMINATION))
 
 # Redirect Apptainer/Singularity temp and cache dirs to local disk instead of /tmp RAM
 export APPTAINER_TMPDIR     := $(TMP_DIR)/tmp
@@ -211,6 +217,8 @@ test-dry-run:
 	  *) echo '[ERROR] COMEBIN_DEVICE must be cpu, cuda, or cuda:N with N a non-negative integer.'; exit 1 ;; \
 	esac
 	@case $(call shell_quote,$(COMEBIN_SEED)) in ''|*[!0-9]*) echo '[ERROR] COMEBIN_SEED must be a non-negative integer.'; exit 1 ;; esac
+	@LC_ALL=C awk -v value=$(call shell_quote,$(MIN_COMPLETENESS)) 'BEGIN { if (value !~ /^[0-9]+([.][0-9]+)?$$/ || value < 0 || value > 100) exit 1 }' || { echo '[ERROR] MIN_COMPLETENESS must be a number between 0 and 100.'; exit 1; }
+	@LC_ALL=C awk -v value=$(call shell_quote,$(MAX_CONTAMINATION)) 'BEGIN { if (value !~ /^[0-9]+([.][0-9]+)?$$/ || value < 0 || value > 100) exit 1 }' || { echo '[ERROR] MAX_CONTAMINATION must be a number between 0 and 100.'; exit 1; }
 	bash -n $(PIPELINE)
 	bash $(PIPELINE) \
 	  $(READ_INPUT_ARGS) \
@@ -222,10 +230,12 @@ test-dry-run:
 	  $(MAPPING_ARGS) \
 	  --binners "$(BINNERS)" \
 	  $(COMEBIN_ARGS) \
+	  $(MAG_FILTER_ARGS) \
 	  $(VAMB_ARGS) \
 	  --refinement-mode "$(REFINEMENT_MODE)" \
 	  --bins-source "$(BINS_SOURCE)" \
 	  $(BINNING_ARGS) \
+	  $(BINS_DIR_ARGS) \
 	  $(REASSEMBLY_ARGS) \
 	  $(CHECKM2_ARGS) \
 	  $(MAG_FILTERING_ARGS) \

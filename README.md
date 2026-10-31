@@ -56,6 +56,9 @@ combinations during preflight rather than silently changing stage settings.
 │   ├── metabinner.def
 │   ├── comebin.def
 │   └── vamb.def
+├── scripts/
+│   ├── generate_pipeline_summaries.py
+│   └── validate_pipeline_outputs.py
 └── containers/                 # Created automatically
 ```
 
@@ -185,10 +188,13 @@ The script uses Apptainer mode by default. Missing remote images may be pulled a
 | `--binners LIST` | Comma-separated selection: `vamb`, `metabinner`, `comebin`; default: all three |
 | `--comebin-device DEVICE` | COMEBin training device: `cpu`, `cuda`, or `cuda:N`; default: `cpu` |
 | `--comebin-seed INTEGER` | Non-negative COMEBin random seed; default: `42` |
+| `--min-completeness VALUE` | Minimum CheckM2 completeness to retain a MAG; inclusive, default: `70` |
+| `--max-contamination VALUE` | Maximum CheckM2 contamination to retain a MAG; inclusive, default: `10` |
 | `--vamb-binsplit-separator CHAR` | Advanced Vamb binsplitting separator; disabled unless explicitly supplied |
 | `--refinement-mode MODE` | Consensus refinement policy: `auto`, `always`, or `never` |
 | `--refinement` / `--no-refinement` | Aliases for `--refinement-mode always` / `never` |
-| `--bins-source SOURCE` | `auto`, `vamb`, `metabinner`, `comebin`, or `refined`; default: `auto` |
+| `--bins-dir DIR` | Directory containing one final external bin collection; requires `--no-binning` |
+| `--bins-source SOURCE` | `auto`, `vamb`, `metabinner`, `comebin`, `refined`, or `external`; default: `auto` |
 | `--bam-dir DIR` | External `<sample>.sorted.bam` files and `.bai`/`.csi` indexes |
 | `--bam-manifest FILE` | External BAM manifest with `sample_id`, `bam`, and `index` columns |
 | `--jgi-depth-file FILE` | External JGI `jgi_summarize_bam_contig_depths` table |
@@ -261,6 +267,10 @@ stages such as mapping, Vamb, or MetaBinner.
 | `--mag-filtering` | `--no-mag-filtering` | Enabled |
 | `--coverm` | `--no-coverm` | Enabled |
 | `--summary` | `--no-summary` | Enabled |
+| `--taxonomy-summary` | `--no-taxonomy-summary` | Enabled |
+| `--mag-summary` | `--no-mag-summary` | Enabled |
+| `--run-overview` | `--no-run-overview` | Enabled |
+| `--bracken` | `--no-bracken` | Enabled |
 | `--dry-run` | `--no-dry-run` | Disabled |
 | `--force` | `--no-force` | Disabled |
 
@@ -431,9 +441,12 @@ refined source; `never` requires a direct source if multiple binners are
 selected. A direct `--bins-source vamb|metabinner|comebin` skips refinement
 under `auto`, but all selected binners still execute. Invalid combinations
 fail preflight rather than changing the requested options.
-External bin directories are not supported as `--bins-source`; choose a
-selected binner or `refined`. With binning disabled, dependent MAG stages must
-also be disabled explicitly and `--bins-source` must remain `auto`.
+Use `--bins-dir DIR` to point at one external final bin collection. The option
+requires `--no-binning` and resolves the target to `external` automatically when
+`--bins-source` is left at `auto`. A direct `--bins-source external` also works
+when paired with `--bins-dir DIR`; internal and external collections are not
+mixed in one run. With binning disabled, dependent MAG stages must be disabled
+explicitly as needed.
 
 Normalized bins are exposed at:
 
@@ -611,6 +624,11 @@ make test-dry-run \
   BINNERS=comebin \
   COMEBIN_DEVICE=cuda:0
 
+make test-dry-run \
+  PROFILE=assembly \
+  MIN_COMPLETENESS=80 \
+  MAX_CONTAMINATION=5
+
 make test-dry-run PROFILE=assembly CLEAN_READS_DIR=/data/clean_reads \
   RUN_MAPPING=false JGI_DEPTH_FILE=/data/coverage/depth.txt BINNERS=vamb
 
@@ -734,7 +752,12 @@ metagenomics_out/
 ├── 10_gtdbtk/
 ├── 11_abundance/
 ├── 12_summary/
-│   └── final_summary.tsv
+│   ├── taxonomy_summary.tsv
+│   ├── taxonomy_summary.meta.json
+│   ├── mag_summary.tsv
+│   ├── mag_summary.meta.json
+│   ├── run_overview.tsv
+│   └── run_overview.meta.json
 ├── logs/
 └── .checkpoints/
 ```
@@ -751,19 +774,205 @@ Important outputs include:
 - `09_mags/`: MAGs meeting the configured quality thresholds.
 - `10_gtdbtk/`: GTDB-Tk classifications.
 - `11_abundance/`: per-sample CoverM abundance tables.
-- `12_summary/final_summary.tsv`: MAG-based summary with available CheckM2, GTDB-Tk, and CoverM data.
+- `12_summary/taxonomy_summary.tsv`: Read-based taxonomic classifications and abundances (Kraken2/Bracken).
+- `12_summary/mag_summary.tsv`: MAG-based quality, taxonomy (GTDB-Tk), and sample coverage/abundance (CoverM).
+- `12_summary/run_overview.tsv`: Technical execution overview, stage statuses, and environment inventories.
 - `logs/`: step-specific execution logs and generated helper scripts.
 
-## MAG filtering defaults
+## Configurable MAG filtering
 
-The pipeline retains bins meeting both thresholds:
+MAG filtering defaults to `MIN_COMPLETENESS=70` and
+`MAX_CONTAMINATION=10`. It retains a bin only when both inclusive comparisons
+hold:
 
 ```text
-Completeness >= 50%
-Contamination <= 10%
+completeness >= MIN_COMPLETENESS
+contamination <= MAX_CONTAMINATION
 ```
 
-These values are currently configured inside the script as `COMPLETENESS` and `CONTAMINATION`.
+Thresholds accept integers or decimal values between 0 and 100, such as `80`,
+`70.0`, `82.5`, or `5.5`; values are not rounded. For example:
+
+```bash
+bash run_metagenomics_pipeline.sh --min-completeness 80 \
+  --max-contamination 5
+```
+
+For the defaults, a bin with completeness `70` and contamination `10` is
+retained; completeness `69.99` or contamination `10.01` is excluded.
+
+Only MAG filtering and effective downstream consumers of the quality-filtered
+MAG collection use these thresholds. CheckM2 evaluates the selected input bins
+independently of the filtering thresholds. The thresholds have no effect on
+taxonomy-only runs or upstream stages such as assembly, mapping, binning,
+refinement, and reassembly. They are configurable pipeline selection criteria,
+not a universal classification of MAG quality. Each filtering run writes
+`09_mags/mag_filter_manifest.tsv`, including reported values, thresholds,
+retention status, reason, and source/output paths.
+
+Example manifest row:
+
+```text
+mag_id	completeness	contamination	min_completeness	max_contamination	retained	reason	source_path	output_path
+bin_001	70	10	70	10	true	retained	/data/bins/bin_001.fa	/results/09_mags/bin_001.fa
+```
+
+## Summary Products: Taxonomy, MAG, and Run Overview
+
+The pipeline decomposes final reporting into three conceptually and analytically independent products located in `OUTDIR/12_summary/`:
+
+1. **`taxonomy_summary.tsv`**: Read-based taxonomic classifications and abundances from Kraken2 and Bracken.
+2. **`mag_summary.tsv`**: MAG-based quality, GTDB-Tk taxonomy, and sample-level coverage/abundance from CoverM.
+3. **`run_overview.tsv`**: Technical execution metadata, stage statuses, configuration, outputs, and runtime/database inventory links.
+
+Each product includes an accompanying `.meta.json` document providing JSON-formatted provenance, timestamps, source file paths, SHA-256 fingerprints, and publication status.
+
+### Fundamental Architectural Guarantees
+
+To ensure scientific rigor and avoid cross-contamination of analytical concepts:
+- **`taxonomy_summary.tsv` strictly does NOT contain MAGs**: It only reports reads classified directly against reference k-mer databases.
+- **`mag_summary.tsv` strictly does NOT contain Kraken2 or Bracken read abundances**: It only evaluates assembled, binned, and filtered genomes.
+- **`run_overview.tsv` is NOT a biological summary**: It strictly contains execution parameters, stage plans, runtimes, error counters, and technical inventories.
+- **CoverM measures MAG coverage and relative depth**, not read-based taxonomic abundance.
+- **Bracken estimates read redistribution**, but does NOT substitute GTDB-Tk genome-based taxonomic placement.
+- **GTDB-Tk classifies assembled genomes**, but does NOT provide read-based community profiles.
+
+---
+
+### 1. `taxonomy_summary.tsv`
+
+#### Exact TSV Header
+```text
+sample_id	source	taxonomic_level	taxon_name	taxonomy_id	assigned_reads	estimated_reads	fraction_total_reads	status
+```
+
+#### Granularity & Columns
+- **Granularity**: Long format; one row per `(sample_id, source, taxonomic_level, taxon_name)`.
+- **`sample_id`**: Canonical sample identifier from `sample_manifest.tsv`. Stray reports not in the active manifest are ignored.
+- **`source`**: `kraken2` or `bracken`.
+- **`taxonomic_level`**: Standard rank codes (e.g., `U`, `R`, `D`, `P`, `C`, `O`, `F`, `G`, `S`) for Kraken2; configured level (e.g., `S`) for Bracken. Intermediate clades are preserved without artificial flattening.
+- **`taxon_name`**: Taxon name reported by the tool with leading hierarchical indentation stripped. Cell values are sanitised against embedded tabs and newlines.
+- **`taxonomy_id`**: NCBI taxonomy ID (integer). For unclassified reads in Kraken2, `taxonomy_id=0`.
+- **`assigned_reads`**: Direct read count assigned to the taxon. For Kraken2, reports `direct_reads` (clade reads for `unclassified` and `root`). For Bracken, reports `kraken_assigned_reads`.
+- **`estimated_reads`**: Re-estimated read count from Bracken (`new_est_reads`). When source is `kraken2`, reports `NA`.
+- **`fraction_total_reads`**: Fraction of total reads (0.0 to 1.0).
+- **`status`**: `classified`, `unclassified`, `zero-count`, or `estimated`.
+
+#### Applicability
+- Applicable only when `RUN_KRAKEN2=true`.
+- If Kraken2 is enabled and Bracken is enabled, includes both sources.
+- If Kraken2 is enabled and Bracken is disabled, includes only Kraken2 rows (`estimated_reads=NA`).
+- If Kraken2 is disabled, `taxonomy_summary` is marked `not-applicable` (exit code 4), produces no output TSV, and does not read residual files from prior runs.
+
+---
+
+### 2. `mag_summary.tsv`
+
+#### Exact TSV Header
+```text
+mag_id	sample_id	completeness	contamination	retained	filter_reason	gtdb_classification	gtdb_domain	gtdb_class	gtdb_order	gtdb_family	gtdb_genus	gtdb_species	classification_method	closest_reference	ani	af	coverm_metric	coverm_value	status
+```
+
+#### Granularity & Columns
+- **Granularity**: Long format by MAG, sample, and CoverM metric.
+  - When CoverM is **active**: One row per `mag_id + sample_id + coverm_metric`.
+  - When CoverM is **disabled**: One row per `mag_id`, with `sample_id=NA`, `coverm_metric=NA`, `coverm_value=NA`.
+  - Filtered-out MAGs (`retained=false`): Excluded from downstream GTDB-Tk and CoverM evaluation. They appear as a single row with quality metrics, `sample_id=NA`, `coverm_metric=NA`, `coverm_value=NA`, and status `quality-reported;excluded`.
+- **`mag_id`**: Canonical genome identifier without `.fa`/`.fasta` extensions.
+- **`sample_id`**: Sample identifier from `sample_manifest.tsv` or `NA` when CoverM is not active.
+- **`completeness` / `contamination`**: Estimated percentage (0..100) from CheckM2.
+- **`retained`**: `true` or `false` when MAG filtering is active; `NA` when MAG filtering is disabled.
+- **`filter_reason`**: Exact retention or exclusion rationale from `mag_filter_manifest.tsv` (e.g. `retained`, `completeness_too_low`, `contamination_too_high`). `NA` when filtering is disabled.
+- **`gtdb_*`**: Lineage ranks parsed from GTDB-Tk (`domain`, `class`, `order`, `family`, `genus`, `species`) alongside full `gtdb_classification`. `NA` when GTDB-Tk is disabled.
+- **`classification_method` / `closest_reference` / `ani` / `af`**: Placement method, reference accession, ANI (0..100), and alignment fraction (0..1) from GTDB-Tk. `NA` when GTDB-Tk is disabled.
+- **`coverm_metric` / `coverm_value`**: Metric name (`relative_abundance`, `mean_coverage`, `covered_fraction`, etc.) and float value. If a sample was not mapped or is missing in CoverM tables, `coverm_value=NA`.
+- **`status`**: Composite status flags separated by semicolons: `quality-reported`, `retained`, `excluded`, `checkm2-only`, `classified`, `unclassified`, `coverm-reported`, `coverm-zero`, `coverm-missing`.
+
+#### Applicability
+- Applicable when at least one MAG stage is active: CheckM2, MAG filtering, GTDB-Tk, or CoverM.
+- If all MAG stages are disabled, `mag_summary` is marked `not-applicable` (exit code 4) and produces no TSV.
+- Never reads residual outputs from disabled MAG stages.
+
+---
+
+### 3. `run_overview.tsv`
+
+#### Exact TSV Header
+```text
+section	key	value	source	status
+```
+
+#### Granularity & Columns
+- **Granularity**: Key-value table (one row per key).
+- **`section`**: Permitted sections: `run`, `inputs`, `configuration`, `stages`, `outputs`, `software`, `databases`, `warnings`, `errors`.
+- **`key`**: Stable unique identifier within each section (e.g. `pipeline_version`, `threads`, `01_fastp.action`, `01_fastp.status`, `01_fastp.duration_seconds`, `software_inventory.path`).
+- **`value`**: Text serialized value, strictly sanitised against embedded tabs, carriage returns, and newlines.
+- **`source`**: Provenance identifier: `configuration`, `resume_plan`, `run_status`, `sample_manifest`, `checkpoint`, `software_inventory`, `database_inventory`, or `summary_stage`.
+- **`status`**: `available`, `unknown`, `unavailable`, `pending`, `not-applicable`, `warning`, or `failed`.
+
+#### Applicability & Failure Handling
+- Applicable in every execution that passes preflight checks.
+- On successful runs, published with `final_status=completed`.
+- On pipeline failure, `pipeline_error()` generates a partial `run_overview.tsv` recording `final_status=failed` and incrementing `errors.count` to preserve error diagnostics.
+
+---
+
+### 4. Metadata JSON Files (`.meta.json`)
+
+Each summary TSV is published atomically with a companion `.meta.json` file:
+- `taxonomy_summary.meta.json`
+- `mag_summary.meta.json`
+- `run_overview.meta.json`
+
+Common metadata fields include:
+```json
+{
+  "schema_version": "1",
+  "summary_type": "taxonomy|mag|run-overview",
+  "created_at": "2026-10-31T15:30:00Z",
+  "pipeline_version": "2.0.0",
+  "row_count": 42,
+  "source_files": ["..."],
+  "source_fingerprints": {"file.tsv": "sha256..."},
+  "summary_fingerprint": "sha256...",
+  "status": "available|not-applicable|failed"
+}
+```
+
+---
+
+### 5. Independent Checkpoints and Selective Invalidation
+
+The summary stage is divided into three distinct logical checkpoints under `OUTDIR/.checkpoints/`:
+- `12a_taxonomy_summary.done`
+- `12b_mag_summary.done`
+- `12c_run_overview.done`
+
+#### Dependency Graph and Invalidation Isolation
+- **Kraken2 / Bracken changes**: Invalidate `12a_taxonomy_summary` and `12c_run_overview`. They **never** invalidate `12b_mag_summary`.
+- **CheckM2 / Filter Thresholds / GTDB-Tk / CoverM changes**: Invalidate `12b_mag_summary` and `12c_run_overview`. They **never** invalidate `12a_taxonomy_summary`.
+- **Inventory changes**: Only invalidate `12c_run_overview`.
+- **Independent Execution**:
+  - `--force-stage taxonomy-summary` reruns `12a_taxonomy_summary` and updates `12c_run_overview`, leaving `12b_mag_summary` intact.
+  - `--force-stage mag-summary` reruns `12b_mag_summary` and updates `12c_run_overview`, leaving `12a_taxonomy_summary` intact.
+  - `--force-stage run-overview` regenerates `12c_run_overview` without recalculating biological tables.
+  - Requesting the legacy name `--force-stage summary` fails immediately with an informative error prompting the user to specify `taxonomy-summary`, `mag-summary`, or `run-overview`.
+
+#### Legacy Migration Policy
+When the pipeline detects an older monolithic checkpoint `12_summary.done` or `12_summary.config`:
+- The legacy checkpoint is **not** deleted during preflight.
+- It is renamed/marked as `12_summary.legacy`.
+- It is **never** reused as compatible with `12a`, `12b`, or `12c`.
+- The new summaries are constructed cleanly and independently.
+
+---
+
+### 6. Atomic Publishing and Security Contracts
+
+- **No Partial Files**: Summary files are written to temporary staging folders (`.build.<summary>.<pid>/`), validated against expected column counts, and atomically renamed into `OUTDIR/12_summary/`.
+- **Failure Safety**: If summary generation fails or aborts, previous valid versions of TSVs and metadata remain intact.
+- **TSV Sanitization**: All tab, carriage return, and newline characters within metadata or taxonomic names are converted to single spaces.
+- **Dry-Run Protection**: Invoking `--dry-run` performs validation and argument resolution without creating staging directories or writing files.
 
 ## Checkpoints and reproducibility
 
@@ -782,6 +991,14 @@ inputs or the effective bin collection invalidates the appropriate downstream
 MAG checkpoints. Unselected binner checkpoints and outputs are left untouched
 and ignored. `--binners` configures the pipeline; it is not a comparison or
 benchmark facility.
+
+The MAG-filtering checkpoint records both thresholds, inclusive comparison
+operators, the CheckM2 report fingerprint, input-bin fingerprint, retained-MAG
+fingerprint, and filter-manifest fingerprint. Changing either threshold
+repeats MAG filtering and its effective consumers (GTDB-Tk, CoverM, and/or
+summary) while reusing a valid CheckM2 checkpoint and preserving upstream
+stages. In taxonomy-only runs the threshold values are validated and reported
+as unused; they do not activate MAG filtering or affect Kraken2/Bracken.
 
 The Vamb checkpoint records its effective version and image URI/fingerprint,
 assembly and generated abundance-table fingerprints, ordered abundance header
@@ -876,7 +1093,164 @@ The controlled output roots are:
 | MAG filtering | `09_mags/` |
 | GTDB-Tk | `10_gtdbtk/` |
 | CoverM | `11_abundance/` |
-| summary | `12_summary/` |
+| taxonomy-summary | `12_summary/taxonomy_summary.tsv`, `12_summary/taxonomy_summary.meta.json` |
+| mag-summary | `12_summary/mag_summary.tsv`, `12_summary/mag_summary.meta.json` |
+| run-overview | `12_summary/run_overview.tsv`, `12_summary/run_overview.meta.json` |
+
+### Runtime and database identity inventories
+
+Each planned run builds a coordinated inventory generation under
+`logs/inventory/current/`. The public paths remain
+`logs/software_versions.tsv` and `logs/database_versions.tsv`; they are
+relative symbolic links to the current generation. A generation is validated
+before publication, and the previous generation is retained until both new
+TSVs and public links are checked. Inventory files are logs/traceability data,
+not analytical outputs, checkpoints, or inputs to compatibility decisions.
+The stage `.config` manifest remains the primary compatibility record.
+
+The software inventory has this exact header and column order:
+
+```text
+stage_id	tool	role	version	version_source	execution_mode	runtime_name	runtime_uri	runtime_path	runtime_size_bytes	runtime_mtime_ns	runtime_fingerprint_method	runtime_fingerprint	command_used	status
+```
+
+The database inventory has this exact header and column order:
+
+```text
+stage_id	database	role	path	release_or_version	version_source	size_bytes	mtime_ns	fingerprint_method	fingerprint	status
+```
+
+Example rows (illustrative values):
+
+```text
+stage_id	tool	role	version	version_source	execution_mode	runtime_name	runtime_uri	runtime_path	runtime_size_bytes	runtime_mtime_ns	runtime_fingerprint_method	runtime_fingerprint	command_used	status
+03_kraken2	kraken2	current-runtime	2.1.3	runtime-command	apptainer	kraken2	docker://staphb/kraken2:2.1.3	/opt/containers/kraken2.sif	123456789	1793415102948000000	sha256-file	0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef	kraken2 --version	available
+```
+
+```text
+stage_id	database	role	path	release_or_version	version_source	size_bytes	mtime_ns	fingerprint_method	fingerprint	status
+08_checkm2	checkm2	current-runtime	/databases/checkm2/uniref100.KO.1.dmnd	unknown	unknown	987654321	1793415102948000000	sha256-file	abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef	available
+```
+
+Software rows are emitted for selected active stages only. A `producer` row is
+read from the historical checkpoint manifest; a `current-runtime` row records
+the identity resolved for this invocation. A reused stage can therefore have
+both rows. Database rows use the same role distinction. Valid role values are
+`producer` and `current-runtime`; status values are `available`, `unknown`,
+`unavailable`, and `reused`. `unknown` means the resource was present but some
+identity could not be established; it is not the same as `unavailable`, and
+`unknown` never compares equal as evidence of compatibility. A producer whose
+old checkpoint has no identity metadata is recorded as `unknown`/`reused` and
+is eligible for the non-destructive migration policy.
+
+Version sources are `runtime-command`, `checkpoint-manifest`, `image-label`,
+`commit`, or `unknown`. A current version query failure is not treated as an
+absent tool. A tool/runtime that is missing for a stage that must execute is a
+preflight error; reuse can proceed without the current runtime when the
+checkpoint products remain valid. New checkpoints record the effective
+runtime version, execution mode, runtime name/URI/path/size/mtime/fingerprint,
+and database release/path/fingerprint fields where the stage consumes a
+database. They do not record database fields in unrelated stages, nor
+Apptainer-only values as if they applied to Mamba.
+
+#### Current software queries
+
+The executable is queried in the selected runtime. The command column contains
+only the version query, not the analytical command.
+
+| Tool | Query |
+|---|---|
+| fastp | `fastp --version` |
+| MEGAHIT | `megahit --version` |
+| Kraken2 | `kraken2 --version` |
+| Bracken | `bracken -v` |
+| Bowtie2 | `bowtie2 --version` |
+| SAMtools | `samtools --version` |
+| Vamb | `vamb --version` |
+| MetaBinner | `metabinner --version`, then package metadata when available |
+| COMEBin | `run_comebin.sh -V`, then package metadata when available |
+| MetaWRAP | `metawrap --version` |
+| CheckM2 | `checkm2 --version` |
+| GTDB-Tk | `gtdbtk --version` |
+| CoverM | `coverm --version` |
+| Rscript summary runtime | `Rscript --version` |
+
+When an Apptainer command does not report a version, an explicit image version
+or revision label is used when present. Otherwise the version is `unknown`.
+Mamba identity is calculated from the exact selected environment's
+`conda-meta/*.json`: package name, version, build, and channel are sorted in
+binary order and hashed as `conda-meta-v1`. Absolute paths, timestamps,
+command history, credentials, and full environment exports are excluded.
+`runtime_path` is the environment prefix when it can be resolved; size and
+mtime are `not-applicable` for Mamba.
+
+Apptainer images are resolved to absolute paths and identified with the
+lowercase SHA-256 of the SIF (`sha256-file`). Size and nanosecond mtime are
+also recorded for traceability. The SIF hash and version query are cached for
+the invocation. Moving an unchanged SIF changes its recorded path but not its
+functional identity. Once the plan is frozen, changes to its resolved path,
+size, mtime, or filesystem object abort execution without replanning.
+
+#### Database identities
+
+`CHECKM2_DB` is a file and receives a full SHA-256 (`sha256-file`), size, and
+nanosecond mtime. The release is taken only from trusted metadata when
+available; it is otherwise `unknown`. A known file fingerprint is sufficient
+to identify the database even when its release is unknown.
+
+Kraken2/Bracken and GTDB-Tk databases are directories. They are never hashed
+recursively. Their `metadata-keyfiles-v1` fingerprint is SHA-256 over sorted
+`relative_path<TAB>size_bytes<TAB>mtime_ns` records with a final newline.
+Only these known keyfiles are considered:
+
+| Database | Metadata/keyfiles considered |
+|---|---|
+| Kraken2/Bracken | `hash.k2d`, `opts.k2d`, `taxo.k2d`, `seqid2taxid.map`, `taxonomy/nodes.dmp`, `taxonomy/names.dmp`, `taxonomy/merged.dmp`, `taxonomy/delnodes.dmp`, `database.kraken`, and top-level `*.kmer_distrib` / `*.kraken` files |
+| GTDB-Tk | `VERSION`, `release.txt`, `gtdbtk.package_version`, `metadata/metadata.tsv`, `metadata/metadata.txt`, `metadata/genome_metadata.tsv`, `metadata/taxonomy.tsv`, and `taxonomy/gtdb_taxonomy.tsv` |
+
+Missing optional keyfiles are omitted. If none of the known files is present,
+the fingerprint and version remain `unknown`; the pipeline does not walk the
+rest of a large database as a fallback and does not download metadata. For a
+directory, `size_bytes` is the sum of only the included keyfiles and `mtime_ns`
+is the maximum keyfile mtime; neither describes the total database size.
+Database location is recorded for access and traceability but is not part of
+functional identity.
+
+#### Functional identity versus traceability
+
+| Functional compatibility fields | Traceability/access fields |
+|---|---|
+| Runtime: execution mode, known runtime fingerprint method/hash, and known effective tool version | Runtime: logical name, configured URI, resolved path, size, mtime, and version-query command |
+| Database: known fingerprint method/hash and known release/version | Database: absolute path, size, and mtime |
+
+When a known fingerprint is available it is compared first; a known version or
+release is also compared. Paths, URIs, size, and mtime do not invalidate
+analytically identical resources. A missing historical identity follows the
+legacy migration policy; a newly written checkpoint must have a known runtime
+version or runtime fingerprint. An `unknown` value is never used as a matching
+identity.
+
+The order is: resolve active/applicable stages and current runtimes/databases;
+calculate their identities; load producer identities from existing checkpoint
+manifests; compare each stage's checkpoint; freeze the plan; build and publish
+the inventory generation; then execute. Inventory TSVs are not read to make
+reuse decisions. A changed functional identity rebuilds only its consuming
+stage and effective descendants in the active dependency graph. For example,
+Kraken2/Bracken changes do not rebuild the MAG branch, and CoverM changes do
+not invalidate GTDB-Tk.
+
+Dry-run performs only read-only resolution and queries, constructs inventory
+rows in memory, and reports the paths and entry/unknown/unavailable counts it
+would publish. It does not create the inventory directory, TSVs, checkpoints,
+or analytical outputs. The inventories are protected from stage cleanup,
+`--force-stage`, `--restart-from`, and selective invalidation.
+
+Limitations: version options and labels vary between tool/image releases, so
+some tools can legitimately be recorded as `unknown`; the keyfile sets are
+deliberately conservative and do not prove byte-for-byte identity of every
+large database file. Mamba host tools run outside a named environment use the
+active Conda prefix when available; without a prefix, their version may be
+known while their environment fingerprint is `unknown`.
 
 ## Pre-flight validation
 

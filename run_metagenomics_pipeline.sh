@@ -27,6 +27,10 @@ trap 'pipeline_error "$?" "${LINENO}"' ERR
 trap 'pipeline_signal INT 130' INT
 trap 'pipeline_signal TERM 143' TERM
 
+PIPELINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PIPELINE_SCRIPTS_DIR="${PIPELINE_DIR}/scripts"
+SUMMARY_GENERATOR="${PIPELINE_SCRIPTS_DIR}/generate_pipeline_summaries.py"
+
 ###############################################################################
 #  CONFIGURATION  —  Edit everything in this block before running             #
 ###############################################################################
@@ -74,6 +78,19 @@ declare -A STAGE_EXIT_CODE=()
 declare -A STAGE_CHECKPOINT_WRITTEN=()
 declare -A STAGE_FROZEN_EXTERNAL=()
 declare -A PREPARED_STAGES=()
+declare -A ID_VERSION=() ID_VERSION_SOURCE=() ID_EXECUTION_MODE=()
+declare -A ID_RUNTIME_NAME=() ID_RUNTIME_URI=() ID_RUNTIME_PATH=()
+declare -A ID_RUNTIME_SIZE=() ID_RUNTIME_MTIME=() ID_RUNTIME_METHOD=()
+declare -A ID_RUNTIME_FINGERPRINT=() ID_COMMAND=() ID_STATUS=()
+declare -A ID_DATABASE_RELEASE=() ID_DATABASE_VERSION_SOURCE=()
+declare -A ID_DATABASE_PATH=() ID_DATABASE_SIZE=() ID_DATABASE_MTIME=()
+declare -A ID_DATABASE_METHOD=() ID_DATABASE_FINGERPRINT=() ID_DATABASE_STATUS=()
+declare -A SIF_IDENTITY_CACHE=() MAMBA_IDENTITY_CACHE=() VERSION_CACHE=() DB_IDENTITY_CACHE=() DB_SNAPSHOT=()
+declare -A SIF_OBJECT_CACHE=() MAMBA_OBJECT_CACHE=()
+SOFTWARE_INVENTORY_ROWS=()
+DATABASE_INVENTORY_ROWS=()
+INVENTORY_UNKNOWN_COUNT=0
+INVENTORY_UNAVAILABLE_COUNT=0
 
 # ── Read File Patterns ────────────────────────────────────────────────────────
 READ_SUFFIX_R1="_R1.fastq.gz"
@@ -146,9 +163,6 @@ SIF_GTDBTK_URI="docker://quay.io/biocontainers/gtdbtk:2.4.0--pyhdfd78af_0"
 SIF_COVERM="${SIF_DIR}/coverm.sif"
 SIF_COVERM_URI="docker://quay.io/biocontainers/coverm:0.6.1--h9f5acd7_1"
 
-SIF_R="${SIF_DIR}/r_base.sif"
-SIF_R_URI="docker://rocker/r-base:latest"
-
 # ── Mamba Environment Names (used when EXEC_MODE="mamba") ────────────────────
 ENV_VAMB="vamb"
 ENV_METABINNER="metabinner_env"
@@ -197,8 +211,9 @@ BRACKEN_TAX_LEVEL="S"   # S=Species G=Genus F=Family O=Order C=Class P=Phylum
 BRACKEN_THRESHOLD=10
 
 # ── MAG Quality Filtering (CheckM2) ──────────────────────────────────────────
-COMPLETENESS=50          # minimum % completeness
-CONTAMINATION=10         # maximum % contamination
+MIN_COMPLETENESS="${MIN_COMPLETENESS:-70}"
+MAX_CONTAMINATION="${MAX_CONTAMINATION:-10}"
+MAG_FILTERING_APPLICABLE=false
 
 # ── MetaWrap Refinement Thresholds ────────────────────────────────────────────
 METAWRAP_COMPLETENESS=50    # passed to bin_refinement -c
@@ -212,6 +227,7 @@ COVERM_MIN_COVERED_FRACTION="0.0"
 RUN_FASTP="${RUN_FASTP:-true}"                # Step 01
 RUN_MEGAHIT="${RUN_MEGAHIT:-true}"            # Internal checkpoint 02_megahit
 RUN_KRAKEN2="${RUN_KRAKEN2:-true}"            # Internal checkpoint 03_kraken2
+RUN_BRACKEN="${RUN_BRACKEN:-true}"
 RUN_REASSEMBLY="${RUN_REASSEMBLY:-false}"     # Step 07
 RUN_GTDBTK="${RUN_GTDBTK:-true}"              # Step 10
 RUN_MAPPING="${RUN_MAPPING:-true}"
@@ -228,14 +244,20 @@ else
 fi
 unset RUN_REFINEMENT
 SELECTED_BINNERS="${SELECTED_BINNERS:-vamb,metabinner,comebin}"
+BINS_DIR_INPUT="${BINS_DIR_INPUT:-}"
 BINS_SOURCE="${BINS_SOURCE:-auto}"
 RUN_REFINEMENT_EFFECTIVE=false
 SELECTED_BINNER_ARRAY=()
 BINS_SOURCE_RESOLVED=""
+BINS_FOR_REASSEMBLY=""
+BINS_FOR_QC=""
 RUN_CHECKM2="${RUN_CHECKM2:-true}"
 RUN_MAG_FILTERING="${RUN_MAG_FILTERING:-true}"
 RUN_COVERM="${RUN_COVERM:-true}"
 RUN_SUMMARY="${RUN_SUMMARY:-true}"
+RUN_TAXONOMY_SUMMARY="${RUN_TAXONOMY_SUMMARY:-true}"
+RUN_MAG_SUMMARY="${RUN_MAG_SUMMARY:-true}"
+RUN_RUN_OVERVIEW="${RUN_RUN_OVERVIEW:-true}"
 STOP_AFTER="${STOP_AFTER:-}"
 REQUESTED_PROFILE="${PROFILE:-full}"
 RESULTING_PROFILE="${REQUESTED_PROFILE}"
@@ -285,7 +307,8 @@ Options:
   --taxonomy-only              Alias for --profile taxonomy
   --assembly-only              Alias for --profile assembly
   --megahit / --no-megahit     Enable/disable MEGAHIT (default: enabled)
-  --kraken2 / --no-kraken2     Enable/disable Kraken2 + Bracken (default: enabled)
+  --kraken2 / --no-kraken2     Enable/disable Kraken2 (default: enabled)
+  --bracken / --no-bracken     Enable/disable Bracken abundance estimation (default: enabled)
   --reassembly / --no-reassembly
                                Enable/disable MetaWrap reassembly (default: disabled)
   --gtdbtk / --no-gtdbtk       Enable/disable GTDB-Tk (default: enabled)
@@ -296,24 +319,38 @@ Options:
                                run_comebin.sh -d. Accepted values: cpu,
                                cuda, cuda:N. Default: cpu.
   --comebin-seed INTEGER       COMEBin random seed (default: 42)
+  --min-completeness VALUE     Minimum CheckM2 completeness required to retain
+                               a MAG. Inclusive threshold. Default: 70.
+  --max-contamination VALUE    Maximum CheckM2 contamination allowed to retain
+                               a MAG. Inclusive threshold. Default: 10.
   --vamb-binsplit-separator CHAR
                                Advanced Vamb binsplitting; disabled by default
   --refinement-mode <mode>     Consensus refinement: auto, always, or never
   --refinement                 Alias for --refinement-mode always
   --no-refinement              Alias for --refinement-mode never
-  --bins-source <source>       auto, vamb, metabinner, comebin, or refined
+  --bins-dir <directory>      Directory containing one external final bin collection
+  --bins-source <source>       auto, vamb, metabinner, comebin, refined, or external
   --checkm2 / --no-checkm2     Enable/disable CheckM2 (default: enabled)
   --mag-filtering / --no-mag-filtering
                                Enable/disable MAG filtering (default: enabled)
   --coverm / --no-coverm       Enable/disable CoverM (default: enabled)
-  --summary / --no-summary     Enable/disable final summary (default: enabled)
+  --summary / --no-summary     Enable/disable all summaries (default: enabled)
+  --taxonomy-summary / --no-taxonomy-summary
+                               Enable/disable read-based taxonomy summary (default: enabled)
+  --mag-summary / --no-mag-summary
+                               Enable/disable MAG quality/taxonomy/abundance summary (default: enabled)
+  --run-overview / --no-run-overview
+                               Enable/disable technical run overview (default: enabled)
   --stop-after <stage>         Stop after: mapping, binning, refinement,
                                reassembly, checkm2, mag-filtering, gtdbtk,
-                               coverm, or summary
+                               coverm, taxonomy-summary, mag-summary, or run-overview
   --dry-run / --no-dry-run     Validate and print the frozen plan without writing results
   --force / --no-force         Force all active stages / cancel prior --force
   --resume                     Reuse compatible checkpoints (default)
-  --force-stage <stage>        Force a stage and run its effective descendants
+  --force-stage <stage>        Force a stage and run its effective descendants (canonical names:
+                               fastp, kraken2, megahit, mapping, vamb, metabinner, comebin,
+                               refinement, reassembly, checkm2, mag-filtering, gtdbtk, coverm,
+                               taxonomy-summary, mag-summary, run-overview)
   --restart-from <stage>       Destructively restart one effective chain
   -h, --help                   Show this help message and exit
 
@@ -369,8 +406,8 @@ while [[ ${#_profile_scan[@]} -gt 0 ]]; do
         -r|--reads-dir|--clean-reads-dir|--kraken2-db|--checkm2-db|--gtdbtk-data-path|\
         -a|--assembly-in|\
         --bam-dir|--bam-manifest|--jgi-depth-file|--force-stage|--restart-from|\
-        --binners|--refinement-mode|--bins-source|--vamb-binsplit-separator|\
-        --comebin-device|--comebin-seed|\
+        --binners|--refinement-mode|--bins-dir|--bins-source|--vamb-binsplit-separator|\
+        --comebin-device|--comebin-seed|--min-completeness|--max-contamination|\
         -o|--outdir|--metabinner-scripts-dir|-t|--threads|-m|--memory|-e|--engine|--stop-after)
             _profile_scan=("${_profile_scan[@]:2}") ;;
         *) _profile_scan=("${_profile_scan[@]:1}") ;;
@@ -393,7 +430,10 @@ case "${REQUESTED_PROFILE}" in
         RUN_CHECKM2=true
         RUN_MAG_FILTERING=true
         RUN_COVERM=true
-        RUN_SUMMARY=true ;;
+        RUN_SUMMARY=true
+        RUN_TAXONOMY_SUMMARY=true
+        RUN_MAG_SUMMARY=true
+        RUN_RUN_OVERVIEW=true ;;
     taxonomy)
         RUN_KRAKEN2=true
         RUN_MEGAHIT=false
@@ -405,7 +445,10 @@ case "${REQUESTED_PROFILE}" in
         RUN_MAG_FILTERING=false
         RUN_GTDBTK=false
         RUN_COVERM=false
-        RUN_SUMMARY=false ;;
+        RUN_SUMMARY=true
+        RUN_TAXONOMY_SUMMARY=true
+        RUN_MAG_SUMMARY=false
+        RUN_RUN_OVERVIEW=true ;;
     assembly)
         RUN_KRAKEN2=false
         RUN_MEGAHIT=true
@@ -415,7 +458,10 @@ case "${REQUESTED_PROFILE}" in
         RUN_CHECKM2=true
         RUN_MAG_FILTERING=true
         RUN_COVERM=true
-        RUN_SUMMARY=true ;;
+        RUN_SUMMARY=true
+        RUN_TAXONOMY_SUMMARY=false
+        RUN_MAG_SUMMARY=true
+        RUN_RUN_OVERVIEW=true ;;
     custom) ;;
 esac
 
@@ -457,14 +503,35 @@ while [[ $# -gt 0 ]]; do
             [[ -z "${2:-}" || ! "${2}" =~ ^[0-9]+$ ]] && {
                 echo "[ERROR] --comebin-seed requires a non-negative integer." >&2; exit 1; }
             COMEBIN_SEED="$2"; shift 2 ;;
+        --min-completeness)
+            [[ "${2+x}" != x ]] && {
+                echo "[ERROR] --min-completeness requires a value." >&2; exit 1; }
+            MIN_COMPLETENESS="$2"
+            shift 2 ;;
+        --max-contamination)
+            [[ "${2+x}" != x ]] && {
+                echo "[ERROR] --max-contamination requires a value." >&2; exit 1; }
+            MAX_CONTAMINATION="$2"
+            shift 2 ;;
         --refinement-mode)
             [[ -z "${2:-}" || "${2}" == -* ]] && {
                 echo "[ERROR] --refinement-mode requires auto, always, or never." >&2; exit 1; }
             REFINEMENT_MODE="$2"; shift 2 ;;
+        --bins-dir)
+            [[ -z "${2:-}" || "${2}" == -* ]] && {
+                echo "[ERROR] --bins-dir requires a directory value." >&2; exit 1; }
+            BINS_DIR_INPUT="$2"; shift 2 ;;
         --bins-source)
             [[ -z "${2:-}" || "${2}" == -* ]] && {
-                echo "[ERROR] --bins-source requires auto, vamb, metabinner, comebin, or refined." >&2; exit 1; }
-            BINS_SOURCE="$2"; shift 2 ;;
+                echo "[ERROR] --bins-source requires auto, vamb, metabinner, comebin, refined, or external." >&2; exit 1; }
+            case "${2}" in
+                auto|vamb|metabinner|comebin|refined|external) BINS_SOURCE="$2" ;;
+                *)
+                    echo "\`--bins-source\` selects a logical collection. Use \`--bins-dir DIR\` to provide the location of external bins." >&2
+                    exit 1
+                    ;;
+            esac
+            shift 2 ;;
         --vamb-binsplit-separator)
             [[ "${2+x}" != x ]] && {
                 echo "[ERROR] --vamb-binsplit-separator requires exactly one non-empty character." >&2; exit 1; }
@@ -512,6 +579,8 @@ while [[ $# -gt 0 ]]; do
         --no-megahit)  RUN_MEGAHIT=false;    shift ;;
         --kraken2)     RUN_KRAKEN2=true;     shift ;;
         --no-kraken2)  RUN_KRAKEN2=false;    shift ;;
+        --bracken)     RUN_BRACKEN=true;     shift ;;
+        --no-bracken)  RUN_BRACKEN=false;    shift ;;
         --reassembly)     RUN_REASSEMBLY=true;  shift ;;
         --no-reassembly)  RUN_REASSEMBLY=false; shift ;;
         --gtdbtk)     RUN_GTDBTK=true;    shift ;;
@@ -530,6 +599,12 @@ while [[ $# -gt 0 ]]; do
         --no-coverm) RUN_COVERM=false; shift ;;
         --summary) RUN_SUMMARY=true; shift ;;
         --no-summary) RUN_SUMMARY=false; shift ;;
+        --taxonomy-summary) RUN_TAXONOMY_SUMMARY=true; shift ;;
+        --no-taxonomy-summary) RUN_TAXONOMY_SUMMARY=false; shift ;;
+        --mag-summary) RUN_MAG_SUMMARY=true; shift ;;
+        --no-mag-summary) RUN_MAG_SUMMARY=false; shift ;;
+        --run-overview) RUN_RUN_OVERVIEW=true; shift ;;
+        --no-run-overview) RUN_RUN_OVERVIEW=false; shift ;;
         --stop-after)
             [[ -z "${2:-}" || "${2:-}" == -* ]] && {
                 echo "[ERROR] --stop-after requires a stage value." >&2; exit 1; }
@@ -624,12 +699,15 @@ visible_stage_number() {
         09) internal=09_filter_mags ;;
         10) internal=10_gtdbtk ;;
         11) internal=11_coverm ;;
-        12) internal=12_summary ;;
+        12a) internal=12a_taxonomy_summary ;;
+        12b) internal=12b_mag_summary ;;
+        12c) internal=12c_run_overview ;;
+        12) internal=12c_run_overview ;;
         *) printf '%s' "${requested}"; return ;;
     esac
     local -a order=(01_fastp 03_kraken2 02_megahit 04_mapping 05a_vamb 05b_metabinner
                    05c_comebin 06_refinement 07_reassembly 08_checkm2 09_filter_mags
-                   10_gtdbtk 11_coverm 12_summary)
+                   10_gtdbtk 11_coverm 12a_taxonomy_summary 12b_mag_summary 12c_run_overview)
     for id in "${order[@]}"; do
         case "${id}" in
             01_fastp) enabled="${RUN_FASTP}" ;;
@@ -645,7 +723,9 @@ visible_stage_number() {
             09_filter_mags) enabled="${RUN_MAG_FILTERING}" ;;
             10_gtdbtk) enabled="${RUN_GTDBTK}" ;;
             11_coverm) enabled="${RUN_COVERM}" ;;
-            12_summary) enabled="${RUN_SUMMARY}" ;;
+            12a_taxonomy_summary) enabled=false; [[ "${RUN_SUMMARY}" == true && "${RUN_TAXONOMY_SUMMARY}" == true && "${RUN_KRAKEN2}" == true ]] && enabled=true ;;
+            12b_mag_summary) enabled=false; [[ "${RUN_SUMMARY}" == true && "${RUN_MAG_SUMMARY}" == true && ( "${RUN_CHECKM2}" == true || "${RUN_MAG_FILTERING}" == true || "${RUN_GTDBTK}" == true || "${RUN_COVERM}" == true ) ]] && enabled=true ;;
+            12c_run_overview) enabled=false; [[ "${RUN_SUMMARY}" == true && "${RUN_RUN_OVERVIEW}" == true ]] && enabled=true ;;
         esac
         [[ "${enabled}" == true ]] || continue
         number=$((number + 1))
@@ -657,10 +737,10 @@ visible_stage_number() {
 _format_visible_steps() {
     local text="$*" internal visible
     local -a replacements=()
-    for internal in 01 02 03 04 05a 05b 05c 06 07 08 09 10 11 12; do
+    for internal in 01 02 03 04 05a 05b 05c 06 07 08 09 10 11 12 12a 12b 12c; do
         replacements+=(-e "s/\\[Step ${internal}\\]/__STEP_${internal}__/g")
     done
-    for internal in 01 02 03 04 05a 05b 05c 06 07 08 09 10 11 12; do
+    for internal in 01 02 03 04 05a 05b 05c 06 07 08 09 10 11 12 12a 12b 12c; do
         visible="$(visible_stage_number "${internal}")"
         replacements+=(-e "s/__STEP_${internal}__/[Step ${visible}]/g")
     done
@@ -677,6 +757,21 @@ log_step()  {
     echo -e "\n${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
     echo -e "${CYAN}${BOLD}║  [Step ${n}]  $*${NC}"
     echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}\n"
+}
+
+validate_percentage_threshold() {
+    local name="$1"
+    local value="$2"
+    if ! LC_ALL=C awk -v value="${value}" '
+        BEGIN {
+            if (value !~ /^[0-9]+([.][0-9]+)?$/ || value < 0 || value > 100) {
+                exit 1
+            }
+        }
+    '; then
+        log_error "${name} must be a number between 0 and 100: ${value}"
+        return 1
+    fi
 }
 
 # ── Utility Functions ─────────────────────────────────────────────────────────
@@ -860,12 +955,9 @@ build_bind_mounts() {
     _add_bind "${OUTDIR}"
     if [[ "${NEEDS_READS}" == true ]]; then
         local read_file
-        if [[ "${ACTIVE_READS_SOURCE}" == fastp-clean && "${RUN_FASTP}" == true ]]; then
-            local -a raw_read_files=()
-            collect_files_by_suffix "${RAW_READS_DIR}" "${READ_SUFFIX_R1}" raw_read_files
-            for read_file in "${raw_read_files[@]}"; do
+        if [[ "${RUN_FASTP}" == true && ${#INPUT_R1_FILES[@]} -gt 0 ]]; then
+            for read_file in "${INPUT_R1_FILES[@]}" "${INPUT_R2_FILES[@]}"; do
                 _add_bind "${read_file}" ro
-                _add_bind "${read_file/${READ_SUFFIX_R1}/${READ_SUFFIX_R2}}" ro
             done
         elif [[ "${ACTIVE_READS_SOURCE}" == raw || "${ACTIVE_READS_SOURCE}" == external-clean ]]; then
             for read_file in "${ACTIVE_R1_FILES[@]}" "${ACTIVE_R2_FILES[@]}"; do
@@ -1265,6 +1357,334 @@ collect_files_by_suffix() {
     )
 }
 
+compute_file_fingerprint() {
+    local path="$1"
+    python3 - "$path" <<'PY'
+import hashlib, os, sys
+path = sys.argv[1]
+st = os.stat(path)
+print(f"{st.st_size}:{st.st_mtime_ns}")
+PY
+}
+
+validate_sample_id() {
+    local sample_id="$1"
+    if [[ -z "${sample_id}" ]]; then
+        log_error "Sample ID is empty."
+        return 1
+    fi
+    if [[ ! "${sample_id}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+        log_error "Invalid sample ID '${sample_id}'. It must match ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ and contain no spaces or reserved characters."
+        return 1
+    fi
+    local lower="${sample_id,,}"
+    case "${lower}" in
+        na|null|none|true|false|unknown)
+            log_error "Sample ID '${sample_id}' is reserved and cannot be used."
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+discover_paired_reads() {
+    local source_dir="$1"
+    local out_sample_name="$2"
+    local out_r1_name="$3"
+    local out_r2_name="$4"
+    local -n out_sample_ref="${out_sample_name}"
+    local -n out_r1_ref="${out_r1_name}"
+    local -n out_r2_ref="${out_r2_name}"
+    out_sample_ref=()
+    out_r1_ref=()
+    out_r2_ref=()
+    local -a files=()
+    local -A seen_exact=()
+    local -A seen_case=()
+    local file sample_id r1 r2 lower
+
+    [[ -d "${source_dir}" ]] || {
+        log_error "Read directory does not exist: ${source_dir}"
+        return 1
+    }
+    mapfile -d '' -t files < <(find "${source_dir}" -maxdepth 1 -type f -name "*${READ_SUFFIX_R1}" -print0 | LC_ALL=C sort -z)
+
+    for file in "${files[@]}"; do
+        if [[ -L "${file}" ]]; then
+            log_error "Symbolic links for read files are not supported in this version: ${file}"
+            return 1
+        fi
+        sample_id="$(basename "${file}" "${READ_SUFFIX_R1}")"
+        if ! validate_sample_id "${sample_id}"; then
+            return 1
+        fi
+        lower="${sample_id,,}"
+        if [[ -n "${seen_exact[${sample_id}]:-}" ]]; then
+            log_error "Duplicate sample identifier: ${sample_id}"
+            return 1
+        fi
+        if [[ -n "${seen_case[${lower}]:-}" ]]; then
+            log_error "Sample IDs must also be unique when compared case-insensitively: '${sample_id}' conflicts with '${seen_case[${lower}]}'."
+            return 1
+        fi
+        seen_exact["${sample_id}"]=1
+        seen_case["${lower}"]="${sample_id}"
+
+        r1="${file}"
+        r2="${file/${READ_SUFFIX_R1}/${READ_SUFFIX_R2}}"
+        if [[ "${r1}" == "${r2}" ]]; then
+            log_error "Read pair resolution failed for sample ${sample_id}: ${r1}"
+            return 1
+        fi
+        if [[ ! -f "${r1}" || ! -s "${r1}" ]]; then
+            log_error "R1 read is missing or empty: ${r1}"
+            return 1
+        fi
+        if [[ ! -f "${r2}" || ! -s "${r2}" ]]; then
+            log_error "Matching R2 read is missing or empty: ${r2}"
+            return 1
+        fi
+        if [[ -L "${r2}" ]]; then
+            log_error "Symbolic links for read files are not supported in this version: ${r2}"
+            return 1
+        fi
+        out_sample_ref+=("${sample_id}")
+        out_r1_ref+=("${r1}")
+        out_r2_ref+=("${r2}")
+    done
+
+    if (( ${#out_sample_ref[@]} == 0 )); then
+        log_error "No reads matching *${READ_SUFFIX_R1} found in ${source_dir}."
+        return 1
+    fi
+}
+
+build_sample_manifest_candidate() {
+    local source_dir="$1"
+    local reads_source="$2"
+    local tmp_path="$3"
+    local -a sample_ids=() r1_files=() r2_files=()
+    discover_paired_reads "${source_dir}" sample_ids r1_files r2_files || return 1
+    local sample_id r1 r2 resolved_r1 resolved_r2 size1 size2 fp1 fp2
+    : > "${tmp_path}"
+    {
+        printf '%s\n' "sample_id	reads_layout	reads_source	read1_path	read1_resolved_path	read2_path	read2_resolved_path	read1_size_bytes	read2_size_bytes	read1_fingerprint	read2_fingerprint	fingerprint_method	input_read1_name	input_read2_name"
+        for i in "${!sample_ids[@]}"; do
+            sample_id="${sample_ids[$i]}"
+            r1="${r1_files[$i]}"
+            r2="${r2_files[$i]}"
+            resolved_r1="$(realpath "${r1}")"
+            resolved_r2="$(realpath "${r2}")"
+            [[ -n "${resolved_r1}" && -n "${resolved_r2}" ]] || {
+                log_error "Resolved read paths are empty for ${sample_id}."
+                return 1
+            }
+            size1="$(stat -c '%s' "${resolved_r1}")"
+            size2="$(stat -c '%s' "${resolved_r2}")"
+            fp1="$(compute_file_fingerprint "${resolved_r1}")"
+            fp2="$(compute_file_fingerprint "${resolved_r2}")"
+            printf '%s\tpaired\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tsize-mtime-ns\t%s\t%s\n' \
+                "${sample_id}" "${reads_source}" "${r1}" "${resolved_r1}" "${r2}" "${resolved_r2}" "${size1}" "${size2}" "${fp1}" "${fp2}" "$(basename "${r1}")" "$(basename "${r2}")"
+        done
+    } >> "${tmp_path}"
+}
+
+validate_sample_manifest() {
+    local manifest_path="$1"
+    local expected_source="$2"
+    local header expected_line
+    expected_line="sample_id	reads_layout	reads_source	read1_path	read1_resolved_path	read2_path	read2_resolved_path	read1_size_bytes	read2_size_bytes	read1_fingerprint	read2_fingerprint	fingerprint_method	input_read1_name	input_read2_name"
+    [[ -s "${manifest_path}" ]] || {
+        log_error "Sample manifest is missing or empty: ${manifest_path}"
+        return 1
+    }
+    header="$(head -n 1 "${manifest_path}")"
+    [[ "${header}" == "${expected_line}" ]] || {
+        log_error "Sample manifest header mismatch in ${manifest_path}."
+        return 1
+    }
+    local row expected_rows=0 sample_id reads_layout reads_source read1_path read1_resolved_path read2_path read2_resolved_path fingerprint_method input_read1_name input_read2_name
+    local -A seen_paths=() seen_samples=() seen_case=()
+    while IFS=$'\t' read -r sample_id reads_layout reads_source read1_path read1_resolved_path read2_path read2_resolved_path _ _ _ _ fingerprint_method input_read1_name input_read2_name; do
+        [[ -n "${sample_id}" ]] || { log_error "Empty sample_id in ${manifest_path}"; return 1; }
+        if ! validate_sample_id "${sample_id}"; then
+            log_error "Invalid sample_id '${sample_id}' in ${manifest_path}."
+            return 1
+        fi
+        [[ "${reads_layout}" == "paired" ]] || { log_error "reads_layout must be paired in ${manifest_path}"; return 1; }
+        [[ "${reads_source}" == "${expected_source}" ]] || { log_error "reads_source mismatch in ${manifest_path}: expected ${expected_source}, found ${reads_source}"; return 1; }
+        [[ "${fingerprint_method}" == "size-mtime-ns" ]] || { log_error "Unsupported fingerprint_method in ${manifest_path}: ${fingerprint_method}"; return 1; }
+        [[ -n "${input_read1_name}" && -n "${input_read2_name}" ]] || { log_error "input names cannot be empty in ${manifest_path}"; return 1; }
+        [[ "${read1_path}" == /* && "${read2_path}" == /* ]] || { log_error "Read paths must be absolute in ${manifest_path}"; return 1; }
+        [[ "${read1_path}" != "${read2_path}" ]] || { log_error "R1 and R2 paths must differ for sample ${sample_id}."; return 1; }
+        [[ -f "${read1_resolved_path}" && -f "${read2_resolved_path}" ]] || { log_error "Resolved read paths must point to regular files for ${sample_id}."; return 1; }
+        [[ -n "${seen_paths[${read1_resolved_path}]:-}" ]] && { log_error "Duplicate read1_resolved_path in ${manifest_path}: ${read1_resolved_path}"; return 1; }
+        [[ -n "${seen_paths[${read2_resolved_path}]:-}" ]] && { log_error "Duplicate read2_resolved_path in ${manifest_path}: ${read2_resolved_path}"; return 1; }
+        seen_paths["${read1_resolved_path}"]=1
+        seen_paths["${read2_resolved_path}"]=1
+        [[ -n "${seen_samples[${sample_id}]:-}" ]] && { log_error "Duplicate sample_id in ${manifest_path}: ${sample_id}"; return 1; }
+        local sample_lower="${sample_id,,}"
+        [[ -n "${seen_case[${sample_lower}]:-}" ]] && { log_error "Sample IDs must also be unique when compared case-insensitively: '${sample_id}' conflicts with '${seen_case[${sample_lower}]}'"; return 1; }
+        seen_samples["${sample_id}"]=1
+        seen_case["${sample_lower}"]="${sample_id}"
+        (( expected_rows += 1 ))
+    done < <(tail -n +2 "${manifest_path}")
+    (( expected_rows > 0 )) || {
+        log_error "Sample manifest contains no rows: ${manifest_path}"
+        return 1
+    }
+    return 0
+}
+
+publish_sample_manifest() {
+    local candidate_path="$1"
+    local target_manifest="$2"
+    local target_metadata="$3"
+    local reads_source="$4"
+    validate_sample_manifest "${candidate_path}" "${reads_source}" || return 1
+    local dir
+    dir="$(dirname "${target_manifest}")"
+    mkdir -p "${dir}"
+    local tmp_manifest
+    tmp_manifest="$(mktemp "${dir}/.$(basename "${target_manifest}").XXXXXX")"
+    cp "${candidate_path}" "${tmp_manifest}"
+    mv -f "${tmp_manifest}" "${target_manifest}"
+    write_sample_manifest_metadata "${target_manifest}" "${target_metadata}" "${reads_source}"
+}
+
+write_sample_manifest_metadata() {
+    local manifest_path="$1"
+    local metadata_path="$2"
+    local reads_source="$3"
+    local parent_manifest=""
+    local parent_fingerprint=""
+    local sample_manifest_fingerprint sample_manifest_location_fingerprint created_at
+    created_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [[ "${reads_source}" == "fastp-clean" ]]; then
+        parent_manifest="${RAW_SAMPLE_MANIFEST}"
+        parent_fingerprint="$(python3 - "$parent_manifest" <<'PY'
+import hashlib, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+if not p.exists():
+    print('missing')
+    raise SystemExit(0)
+text = p.read_text(encoding='utf-8')
+# logical fingerprint based on manifest rows excluding paths and metadata fields
+lines = [ln for ln in text.splitlines() if ln and not ln.startswith('sample_id\t')]
+parts = []
+for ln in lines:
+    fields = ln.split('\t')
+    if len(fields) < 14:
+        continue
+    sample_id, reads_layout, reads_source, _, _, _, _, _, _, read1_fp, read2_fp, fp_method, _, _ = fields[:14]
+    parts.append("\t".join([sample_id, reads_layout, reads_source, read1_fp, read2_fp, fp_method]))
+print(hashlib.sha256(('schema_version=1\n' + '\n'.join(sorted(parts)) + '\n').encode('utf-8')).hexdigest())
+PY
+)"
+    else
+        parent_manifest="null"
+        parent_fingerprint="null"
+    fi
+    sample_manifest_fingerprint="$(python3 - "$manifest_path" <<'PY'
+import hashlib, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+lines = p.read_text(encoding='utf-8').splitlines()
+if not lines: raise SystemExit('missing')
+header = lines[0]
+rows = []
+for line in lines[1:]:
+    if not line.strip():
+        continue
+    fields = line.split('\t')
+    if len(fields) < 14:
+        continue
+    sample_id, reads_layout, reads_source, _, _, _, _, _, _, read1_fp, read2_fp, fp_method, _, _ = fields[:14]
+    rows.append((sample_id, reads_layout, reads_source, read1_fp, read2_fp, fp_method))
+body = '\n'.join('|' .join((sample_id, reads_layout, reads_source, read1_fp, read2_fp, fp_method)) for sample_id, reads_layout, reads_source, read1_fp, read2_fp, fp_method in sorted(rows))
+print(hashlib.sha256(("schema_version=1\n" + body + "\n").encode('utf-8')).hexdigest())
+PY
+)"
+    sample_manifest_location_fingerprint="$(python3 - "$manifest_path" <<'PY'
+import hashlib, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+lines = p.read_text(encoding='utf-8').splitlines()
+if not lines:
+    raise SystemExit('missing')
+result = []
+for line in lines[1:]:
+    if not line.strip():
+        continue
+    fields = line.split('\t')
+    if len(fields) < 14:
+        continue
+    sample_id, _, _, read1_path, read1_resolved_path, read2_path, read2_resolved_path, _, _, _, _, _, input_read1_name, input_read2_name = fields[:14]
+    if len(fields) >= 14:
+        input_read1_name = fields[12]
+        input_read2_name = fields[13]
+    result.append('|'.join([sample_id, read1_path, read1_resolved_path, read2_path, read2_resolved_path, input_read1_name, input_read2_name]))
+print(hashlib.sha256(('location\n' + '\n'.join(sorted(result)) + '\n').encode('utf-8')).hexdigest())
+PY
+)"
+    python3 - "$manifest_path" "$metadata_path" "$reads_source" "$created_at" "$sample_manifest_fingerprint" "$sample_manifest_location_fingerprint" "$parent_manifest" "$parent_fingerprint" <<'PY'
+import json, os, sys
+manifest_path, metadata_path, reads_source, created_at, sample_manifest_fingerprint, sample_manifest_location_fingerprint, parent_manifest, parent_fingerprint = sys.argv[1:9]
+obj = {
+    'schema_version': '1',
+    'created_at': created_at,
+    'reads_layout': 'paired',
+    'reads_source': reads_source,
+    'sample_count': sum(1 for line in open(manifest_path, encoding='utf-8') if line.strip() and not line.startswith('sample_id\t')),
+    'fingerprint_method': 'size-mtime-ns',
+    'sample_manifest_fingerprint': sample_manifest_fingerprint,
+    'sample_manifest_location_fingerprint': sample_manifest_location_fingerprint,
+    'parent_manifest': parent_manifest if parent_manifest != 'null' else None,
+    'parent_manifest_fingerprint': parent_fingerprint if parent_fingerprint != 'null' else None,
+    'generator': 'run_metagenomics_pipeline.sh',
+    'generator_version': os.environ.get('PIPELINE_VERSION', 'unknown')
+}
+with open(metadata_path, 'w', encoding='utf-8') as fh:
+    json.dump(obj, fh, indent=2, sort_keys=True)
+    fh.write('\n')
+PY
+}
+
+load_sample_manifest() {
+    local manifest_path="$1"
+    local expected_source="$2"
+    local sample_name="$3"
+    local r1_name="$4"
+    local r2_name="$5"
+    local -n sample_ref="${sample_name}"
+    local -n r1_ref="${r1_name}"
+    local -n r2_ref="${r2_name}"
+    sample_ref=()
+    r1_ref=()
+    r2_ref=()
+    local line sample_id reads_layout reads_source read1_path read2_path
+    if [[ ! -s "${manifest_path}" ]]; then
+        log_error "Sample manifest not found or empty: ${manifest_path}"
+        return 1
+    fi
+    validate_sample_manifest "${manifest_path}" "${expected_source}" || return 1
+    while IFS=$'\t' read -r sample_id reads_layout reads_source read1_path _ read2_path _ _ _ _ _ _ _ _; do
+        [[ "${sample_id}" == "sample_id" ]] && continue
+        [[ -n "${sample_id}" ]] || continue
+        if ! validate_sample_id "${sample_id}"; then
+            log_error "Manifest contains an invalid sample_id '${sample_id}' in ${manifest_path}."
+            return 1
+        fi
+        sample_ref+=("${sample_id}")
+        r1_ref+=("${read1_path}")
+        r2_ref+=("${read2_path}")
+    done < "${manifest_path}"
+    (( ${#sample_ref[@]} > 0 )) || {
+        log_error "Sample manifest loaded no samples: ${manifest_path}"
+        return 1
+    }
+}
+
 collect_files_by_pattern() {
     local directory="$1"
     local pattern="$2"
@@ -1316,7 +1736,9 @@ stage_rank() {
         mag-filtering) echo 6 ;;
         gtdbtk) echo 7 ;;
         coverm) echo 8 ;;
-        summary) echo 9 ;;
+        taxonomy-summary) echo 9 ;;
+        mag-summary) echo 10 ;;
+        run-overview|summary) echo 11 ;;
         *) return 1 ;;
     esac
 }
@@ -1328,7 +1750,7 @@ stage_in_scope() {
 }
 
 stop_after_reached() {
-    [[ -n "${STOP_AFTER}" && "$1" == "${STOP_AFTER}" ]]
+    [[ -n "${STOP_AFTER}" && ( "$1" == "${STOP_AFTER}" || ( "$1" == run-overview && "${STOP_AFTER}" == summary ) ) ]]
 }
 
 validate_stage_dependencies() {
@@ -1351,15 +1773,17 @@ validate_stage_dependencies() {
                 mag-filtering) [[ "${RUN_MAG_FILTERING}" == true ]] || { log_error "--stop-after mag-filtering requires --mag-filtering."; (( errors += 1 )); } ;;
                 gtdbtk) [[ "${RUN_GTDBTK}" == true ]] || { log_error "--stop-after gtdbtk requires --gtdbtk."; (( errors += 1 )); } ;;
                 coverm) [[ "${RUN_COVERM}" == true ]] || { log_error "--stop-after coverm requires --coverm."; (( errors += 1 )); } ;;
-                summary) [[ "${RUN_SUMMARY}" == true ]] || { log_error "--stop-after summary requires --summary."; (( errors += 1 )); } ;;
+                taxonomy-summary) [[ "${RUN_SUMMARY}" == true && "${RUN_TAXONOMY_SUMMARY}" == true ]] || { log_error "--stop-after taxonomy-summary requires --summary."; (( errors += 1 )); } ;;
+                mag-summary) [[ "${RUN_SUMMARY}" == true && "${RUN_MAG_SUMMARY}" == true ]] || { log_error "--stop-after mag-summary requires --summary."; (( errors += 1 )); } ;;
+                run-overview|summary) [[ "${RUN_SUMMARY}" == true ]] || { log_error "--stop-after ${STOP_AFTER} requires --summary."; (( errors += 1 )); } ;;
             esac
         fi
     fi
 
     if [[ "${RUN_BINNING}" != true ]]; then
         if [[ "${RUN_CHECKM2}" == true || "${RUN_MAG_FILTERING}" == true || \
-              "${RUN_GTDBTK}" == true || "${RUN_COVERM}" == true || "${RUN_SUMMARY}" == true ]]; then
-            log_error "CheckM2, MAG filtering, GTDB-Tk, CoverM, and MAG summary require RUN_BINNING=true; disable dependent stages explicitly."
+              "${RUN_GTDBTK}" == true || "${RUN_COVERM}" == true ]]; then
+            log_error "CheckM2, MAG filtering, GTDB-Tk, and CoverM require RUN_BINNING=true; disable dependent stages explicitly."
             (( errors += 1 ))
         fi
         if [[ "${RUN_REASSEMBLY}" == true ]]; then
@@ -1562,6 +1986,25 @@ append_bins_manifest() {
     done
 }
 
+append_fasta_bins_manifest() {
+    local label="$1" bins_dir="$2" bin target size mtime
+    local -a bins=()
+    mapfile -d '' -t bins < <(find "${bins_dir}" -mindepth 1 -maxdepth 1 \
+        \( -type f -o -type l \) -name '*.fa' -print0 2>/dev/null | sort -z)
+    for bin in "${bins[@]}"; do
+        target="$(realpath "${bin}" 2>/dev/null || printf broken)"
+        if [[ -f "${target}" ]]; then
+            size="$(stat -c '%s' "${target}")"
+            mtime="$(stat -c '%y' "${target}")"
+        else
+            size=missing
+            mtime=missing
+        fi
+        printf '%s=%s|%s|%s|%s\n' "${label}" "$(realpath -m "${bin}")" \
+            "${target}" "${size}" "${mtime}"
+    done
+}
+
 append_vamb_abundance_manifest() {
     local header
     if [[ -s "${VAMB_ABUNDANCE_TSV}" ]]; then
@@ -1580,10 +2023,920 @@ PY_VAMB_MANIFEST
     fi
 }
 
+tsv_value() {
+    local value="${1:-}"
+    value="${value//$'\t'/_}"
+    value="${value//$'\r'/_}"
+    value="${value//$'\n'/_}"
+    printf '%s' "${value}"
+}
+
+inventory_stage_tools() {
+    case "$1" in
+        01_fastp) printf '%s\n' fastp ;;
+        02_megahit) printf '%s\n' megahit ;;
+        03_kraken2) printf '%s\n' kraken2 bracken ;;
+        04_mapping) printf '%s\n' bowtie2 samtools ;;
+        05a_vamb) printf '%s\n' vamb ;;
+        05b_metabinner) printf '%s\n' metabinner ;;
+        05c_comebin) printf '%s\n' comebin ;;
+        06_refinement|07_reassembly) printf '%s\n' metawrap ;;
+        08_checkm2) printf '%s\n' checkm2 ;;
+        10_gtdbtk) printf '%s\n' gtdbtk ;;
+        11_coverm) printf '%s\n' coverm ;;
+    esac
+}
+
+tool_runtime_spec() {
+    local stage="$1" tool="$2"
+    case "${stage}:${tool}" in
+        01_fastp:fastp) printf '%s\t%s\t%s\t%s\n' "${SIF_FASTP}" "${SIF_FASTP_URI}" fastp "" ;;
+        02_megahit:megahit) printf '%s\t%s\t%s\t%s\n' "${SIF_MEGAHIT}" "${SIF_MEGAHIT_URI}" megahit "" ;;
+        03_kraken2:kraken2|03_kraken2:bracken) printf '%s\t%s\t%s\t%s\n' "${SIF_KRAKEN2}" "${SIF_KRAKEN2_URI}" "${tool}" "" ;;
+        04_mapping:bowtie2|04_mapping:samtools) printf '%s\t%s\t%s\t%s\n' "${SIF_MAPPING}" "${SIF_MAPPING_URI}" "${tool}" "" ;;
+        05a_vamb:vamb) printf '%s\t%s\t%s\t%s\n' "${SIF_VAMB}" "${SIF_VAMB_URI}" vamb "${ENV_VAMB}" ;;
+        05b_metabinner:metabinner) printf '%s\t%s\t%s\t%s\n' "${SIF_METABINNER}" "${SIF_METABINNER_URI}" metabinner "${ENV_METABINNER}" ;;
+        05c_comebin:comebin) printf '%s\t%s\t%s\t%s\n' "${SIF_COMEBIN}" "${SIF_COMEBIN_URI}" run_comebin.sh "${ENV_COMEBIN}" ;;
+        06_refinement:metawrap|07_reassembly:metawrap) printf '%s\t%s\t%s\t%s\n' "${SIF_METAWRAP}" "${SIF_METAWRAP_URI}" metawrap "${ENV_METAWRAP}" ;;
+        08_checkm2:checkm2) printf '%s\t%s\t%s\t%s\n' "${SIF_CHECKM2}" "${SIF_CHECKM2_URI}" checkm2 "${ENV_CHECKM2}" ;;
+        10_gtdbtk:gtdbtk) printf '%s\t%s\t%s\t%s\n' "${SIF_GTDBTK}" "${SIF_GTDBTK_URI}" gtdbtk "${ENV_GTDBTK}" ;;
+        11_coverm:coverm) printf '%s\t%s\t%s\t%s\n' "${SIF_COVERM}" "${SIF_COVERM_URI}" coverm "" ;;
+    esac
+}
+
+tool_version_query() {
+    case "$1" in
+        fastp) printf '%s\n' '--version' ;;
+        megahit|kraken2|bowtie2|samtools|vamb|checkm2|gtdbtk|coverm|Rscript) printf '%s\n' '--version' ;;
+        bracken) printf '%s\n' '-v' ;;
+        metabinner) printf '%s\n' '--version' ;;
+        run_comebin.sh) printf '%s\n' '-V' ;;
+        metawrap) printf '%s\n' '--version' ;;
+        *) printf '%s\n' '--version' ;;
+    esac
+}
+
+extract_reported_version() {
+    python3 -c '
+import re, sys
+text = sys.stdin.read()
+version = re.search(r"(?<![A-Za-z0-9])v?([0-9]+(?:\.[0-9A-Za-z][0-9A-Za-z+_-]*)+)", text)
+print(version.group(1) if version else "unknown")
+'
+}
+
+mamba_environment_snapshot() {
+    python3 - "$1" <<'PY'
+import os, sys
+root = os.path.join(sys.argv[1], "conda-meta")
+rows = []
+try:
+    for name in os.listdir(root):
+        if not name.endswith(".json"):
+            continue
+        try:
+            s = os.stat(os.path.join(root, name))
+            rows.append((name.encode().hex(), s.st_size, s.st_mtime_ns, s.st_ctime_ns, s.st_dev, s.st_ino))
+        except OSError:
+            continue
+except OSError:
+    pass
+for row in sorted(rows):
+    print("\t".join(map(str, row)))
+PY
+}
+
+runtime_identity_for_tool() {
+    local stage="$1" tool="$2" spec sif uri executable env_name query command_used
+    local mode="${EXEC_MODE}" runtime_name runtime_uri="not-applicable" runtime_path="unknown"
+    local runtime_size="not-applicable" runtime_mtime="not-applicable"
+    local method="unknown" fingerprint="unknown" version="unknown" version_source="unknown"
+    local status=unknown output="" prefix="" key="" cache_value="" runtime_bin
+    local command_presence="command -v \"\$1\" >/dev/null 2>&1"
+    spec="$(tool_runtime_spec "${stage}" "${tool}")"
+    IFS=$'\t' read -r sif uri executable env_name <<< "${spec}"
+    query="$(tool_version_query "${executable}")"
+    command_used="${executable} ${query}"
+    runtime_name="${env_name:-${CONDA_DEFAULT_ENV:-host}}"
+
+    if [[ "${mode}" == apptainer ]]; then
+        runtime_name="${tool}"
+        runtime_uri="${uri:-unknown}"
+        if [[ ! -f "${sif}" || ! -r "${sif}" ]]; then
+            status=unavailable
+        elif ! runtime_bin="$(command -v apptainer 2>/dev/null || command -v singularity 2>/dev/null)"; then
+            status=unavailable
+        else
+            runtime_path="$(realpath "${sif}")"
+            local sif_stat
+            sif_stat="$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_size}\t{s.st_mtime_ns}\t{s.st_ctime_ns}\t{s.st_dev}\t{s.st_ino}")' "${runtime_path}")"
+            IFS=$'\t' read -r runtime_size runtime_mtime <<< "${sif_stat}"
+            SIF_OBJECT_CACHE["${runtime_path}"]="$(cut -f3- <<< "${sif_stat}")"
+            if [[ -z "${SIF_IDENTITY_CACHE[$runtime_path]:-}" ]]; then
+                SIF_IDENTITY_CACHE["${runtime_path}"]="$(sha256sum "${runtime_path}" | awk '{print tolower($1)}')"
+            fi
+            method=sha256-file
+            fingerprint="${SIF_IDENTITY_CACHE[$runtime_path]}"
+            key="${mode}|${fingerprint}|${tool}|${command_used}"
+            local is_present=false
+            if [[ "${tool}" == metabinner || "${tool}" == comebin ]]; then
+                if "${runtime_bin}" exec --cleanenv "${runtime_path}" bash -c \
+                     "command -v \"${executable}\" >/dev/null 2>&1 || python3 -c \"import ${tool}\" >/dev/null 2>&1"; then
+                    is_present=true
+                fi
+            elif "${runtime_bin}" exec --cleanenv "${runtime_path}" bash -c \
+                     "${command_presence}" bash "${executable}"; then
+                is_present=true
+            fi
+
+            if [[ "${is_present}" != true ]]; then
+                status=unavailable
+            elif [[ -n "${VERSION_CACHE[$key]:-}" ]]; then
+                cache_value="${VERSION_CACHE[$key]}"
+            else
+                output="$("${runtime_bin}" exec --cleanenv "${runtime_path}" "${executable}" "${query}" 2>&1 || true)"
+                version="$(printf '%s' "${output}" | extract_reported_version)"
+                version_source="runtime-command"
+                if [[ "${version}" == unknown && ( "${tool}" == metabinner || "${tool}" == comebin ) ]]; then
+                    local package_names
+                    package_names="$([[ "${tool}" == metabinner ]] && printf 'MetaBinner,metabinner' || printf 'COMEBin,comebin')"
+                    local const_output
+                    const_output="$("${runtime_bin}" exec --cleanenv "${runtime_path}" python3 -c '
+import sys
+for n in sys.argv[1].split(","):
+    try:
+        mod = __import__(n)
+        v = getattr(mod, "__version__", None) or getattr(mod, "VERSION", None)
+        if v:
+            print(str(v))
+            sys.exit(0)
+    except Exception:
+        pass
+    try:
+        import importlib.metadata as m
+        v = m.version(n)
+        if v:
+            print(str(v))
+            sys.exit(0)
+    except Exception:
+        pass
+print("unknown")
+' "${package_names}" 2>/dev/null || true)"
+                    version="$(printf '%s' "${const_output}" | extract_reported_version)"
+                    [[ "${version}" != unknown ]] && command_used="python3 -c import ${tool}"
+                fi
+                if [[ "${version}" == unknown ]]; then
+                    version_source="unknown"
+                    local label_json
+                    label_json="$("${runtime_bin}" inspect --json "${runtime_path}" 2>/dev/null || true)"
+                    local label_identity
+                    label_identity="$(printf '%s' "${label_json}" | python3 -c '
+import json,sys
+try:
+ d=json.load(sys.stdin)
+ labels=d.get("data",{}).get("attributes",{}).get("labels",{})
+ v=next((str(labels[k]) for k in ("org.opencontainers.image.version","VERSION","version") if labels.get(k)), "")
+ c=next((str(labels[k]) for k in ("org.opencontainers.image.revision","org.opencontainers.image.vcs-ref","VCS_REF","COMMIT","GIT_COMMIT") if labels.get(k)), "")
+ print(v + "\timage-label" if v else (c + "\tcommit" if c else "unknown\tunknown"))
+except Exception: print("unknown\tunknown")
+')"
+                    IFS=$'\t' read -r version version_source <<< "${label_identity}"
+                    if [[ "${version}" != unknown ]]; then
+                        command_used="${runtime_bin} inspect --json"
+                    elif [[ "${tool}" == metabinner || "${tool}" == comebin ]]; then
+                        local commit_val
+                        commit_val="$("${runtime_bin}" exec --cleanenv "${runtime_path}" sh -c 'cat /.commit /commit 2>/dev/null | head -n1' 2>/dev/null || true)"
+                        commit_val="$(tr -d " \r\n\t" <<< "${commit_val}")"
+                        if [[ -n "${commit_val}" && "${commit_val}" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
+                            version="${commit_val}"
+                            version_source="commit"
+                            command_used="cat /.commit"
+                        fi
+                    fi
+                fi
+                [[ "${version}" == unknown ]] && version_source="unknown"
+                cache_value="${version}|${version_source}"
+                VERSION_CACHE["$key"]="${cache_value}"
+            fi
+            if [[ "${status}" != unavailable ]]; then
+                IFS='|' read -r version version_source <<< "${cache_value}"
+                status=available
+                [[ "${version}" == unknown ]] && status=unknown
+            fi
+        fi
+    else
+        if [[ -n "${env_name}" ]]; then
+            runtime_name="${env_name}"
+            if ! command -v mamba >/dev/null 2>&1; then
+                status=unavailable
+            else
+                prefix="$(mamba run -n "${env_name}" python -c 'import sys; print(sys.prefix)' 2>/dev/null || true)"
+                [[ -n "${prefix}" && -d "${prefix}" ]] || status=unavailable
+            fi
+        else
+            prefix="${CONDA_PREFIX:-}"
+            command -v "${executable}" >/dev/null 2>&1 || status=unavailable
+        fi
+        if [[ "${status}" != unavailable ]]; then
+            [[ -z "${prefix}" ]] || runtime_path="$(realpath "${prefix}")"
+            if [[ -n "${prefix}" && -d "${prefix}/conda-meta" ]]; then
+                if [[ -z "${MAMBA_IDENTITY_CACHE[$runtime_path]:-}" ]]; then
+                    MAMBA_IDENTITY_CACHE["${runtime_path}"]="$(python3 - "${runtime_path}" <<'PY'
+import hashlib, json, os, sys
+root = os.path.join(sys.argv[1], "conda-meta")
+rows = []
+invalid = False
+for name in os.listdir(root):
+    if not name.endswith(".json"):
+        continue
+    try:
+        with open(os.path.join(root, name), encoding="utf-8") as stream:
+            p = json.load(stream)
+        channel = str(p.get("channel") or "")
+        if channel and "://" in channel:
+            from urllib.parse import urlsplit
+            u = urlsplit(channel)
+            channel = (u.hostname or "") + u.path.rstrip("/")
+        if not channel and p.get("channel_url"):
+            from urllib.parse import urlsplit
+            u = urlsplit(str(p["channel_url"]))
+            channel = (u.hostname or "") + (u.path.rstrip("/").rsplit("/", 1)[-1] if u.path else "")
+        channel = channel.split("?", 1)[0].split("#", 1)[0]
+        rows.append("\t".join(str(p.get(k) or "") for k in ("name", "version", "build")) + "\t" + channel)
+    except (OSError, ValueError, TypeError):
+        invalid = True
+        continue
+payload = ("\n".join(sorted(rows, key=lambda x: x.encode("utf-8"))) + "\n").encode()
+print(hashlib.sha256(payload).hexdigest() if rows and not invalid else "unknown")
+PY
+)"
+                fi
+                fingerprint="${MAMBA_IDENTITY_CACHE[$runtime_path]}"
+                method=conda-meta-v1
+                [[ "${fingerprint}" != unknown ]] || method=unknown
+                if [[ -z "${MAMBA_OBJECT_CACHE[$runtime_path]:-}" ]]; then
+                    MAMBA_OBJECT_CACHE["${runtime_path}"]="$(mamba_environment_snapshot "${runtime_path}")"
+                fi
+            fi
+            if [[ -n "${prefix}" || -z "${env_name}" ]]; then
+                key="${mode}|${fingerprint}|${tool}|${command_used}"
+                local is_present=false
+                if [[ -n "${env_name}" ]]; then
+                    if [[ "${tool}" == metabinner || "${tool}" == comebin ]]; then
+                        if mamba run -n "${env_name}" bash -c \
+                             "command -v \"${executable}\" >/dev/null 2>&1 || python -c \"import ${tool}\" >/dev/null 2>&1"; then
+                            is_present=true
+                        fi
+                    elif mamba run -n "${env_name}" bash -c "${command_presence}" bash "${executable}"; then
+                        is_present=true
+                    fi
+                else
+                    if command -v "${executable}" >/dev/null 2>&1; then
+                        is_present=true
+                    fi
+                fi
+
+                if [[ "${is_present}" != true ]]; then
+                    status=unavailable
+                elif [[ -n "${VERSION_CACHE[$key]:-}" ]]; then
+                    cache_value="${VERSION_CACHE[$key]}"
+                else
+                    if [[ -n "${env_name}" ]]; then
+                        output="$(mamba run -n "${env_name}" "${executable}" "${query}" 2>&1 || true)"
+                    else
+                        output="$("${executable}" "${query}" 2>&1 || true)"
+                    fi
+                    version="$(printf '%s' "${output}" | extract_reported_version)"
+                    version_source="runtime-command"
+                    if [[ "${version}" == unknown && ( "${tool}" == metabinner || "${tool}" == comebin ) ]]; then
+                        local package_names
+                        package_names="$([[ "${tool}" == metabinner ]] && printf 'MetaBinner,metabinner' || printf 'COMEBin,comebin')"
+                        local py_query='
+import sys
+for n in sys.argv[1].split(","):
+    try:
+        mod = __import__(n)
+        v = getattr(mod, "__version__", None) or getattr(mod, "VERSION", None)
+        if v:
+            print(str(v))
+            sys.exit(0)
+    except Exception:
+        pass
+    try:
+        import importlib.metadata as m
+        v = m.version(n)
+        if v:
+            print(str(v))
+            sys.exit(0)
+    except Exception:
+        pass
+print("unknown")
+'
+                        if [[ -n "${env_name}" ]]; then
+                            output="$(mamba run -n "${env_name}" python -c "${py_query}" "${package_names}" 2>/dev/null || true)"
+                        else
+                            output="$(python3 -c "${py_query}" "${package_names}" 2>/dev/null || true)"
+                        fi
+                        version="$(printf '%s' "${output}" | extract_reported_version)"
+                        [[ "${version}" != unknown ]] && command_used="python -c import ${tool}"
+                    fi
+                    if [[ "${version}" == unknown && ( "${tool}" == metabinner || "${tool}" == comebin ) && -n "${prefix}" ]]; then
+                        local commit_val
+                        commit_val="$(python3 - "${prefix}" "${tool}" <<'PY_COMMIT'
+import glob, json, os, sys
+prefix, tool = sys.argv[1], sys.argv[2].lower()
+found = ""
+for f in glob.glob(os.path.join(prefix, "conda-meta", f"*{tool}*.json")):
+    try:
+        with open(f, encoding="utf-8") as stream:
+            d = json.load(stream)
+            c = d.get("commit") or d.get("git_url") or ""
+            if c:
+                found = str(c).split("#")[-1].split("/")[-1]
+                break
+    except Exception:
+        pass
+print(found if len(found) in (7, 40) else "")
+PY_COMMIT
+)"
+                        if [[ -n "${commit_val}" ]]; then
+                            version="${commit_val}"
+                            version_source="commit"
+                            command_used="conda-meta git revision"
+                        fi
+                    fi
+                    [[ "${version}" == unknown ]] && version_source="unknown"
+                    cache_value="${version}|${version_source}"
+                    VERSION_CACHE["$key"]="${cache_value}"
+                fi
+                if [[ "${status}" != unavailable ]]; then
+                    IFS='|' read -r version version_source <<< "${cache_value}"
+                    status=available
+                    [[ "${version}" == unknown ]] && status=unknown
+                fi
+            fi
+            [[ "${runtime_path}" == unknown ]] && runtime_path=unknown
+        fi
+    fi
+
+    if [[ "${status}" == unavailable ]]; then
+        version=unavailable
+        version_source="unknown"
+    fi
+    local identity_key="${stage}|${tool}"
+    ID_VERSION["${identity_key}"]="$(tsv_value "${version}")"
+    ID_VERSION_SOURCE["${identity_key}"]="${version_source}"
+    ID_EXECUTION_MODE["${identity_key}"]="${mode}"
+    ID_RUNTIME_NAME["${identity_key}"]="$(tsv_value "${runtime_name}")"
+    ID_RUNTIME_URI["${identity_key}"]="$(tsv_value "${runtime_uri}")"
+    ID_RUNTIME_PATH["${identity_key}"]="$(tsv_value "${runtime_path}")"
+    ID_RUNTIME_SIZE["${identity_key}"]="${runtime_size}"
+    ID_RUNTIME_MTIME["${identity_key}"]="${runtime_mtime}"
+    ID_RUNTIME_METHOD["${identity_key}"]="${method}"
+    ID_RUNTIME_FINGERPRINT["${identity_key}"]="${fingerprint}"
+    ID_COMMAND["${identity_key}"]="$(tsv_value "${command_used}")"
+    ID_STATUS["${identity_key}"]="${status}"
+}
+
+database_keyfile_rows() {
+    local kind="$1" root="$2" output warning
+    output="$(python3 - "${kind}" "${root}" <<'PY'
+import os, sys
+kind, root = sys.argv[1:]
+candidates = {
+ "kraken2-bracken": [
+  "hash.k2d", "opts.k2d", "taxo.k2d", "seqid2taxid.map",
+  "taxonomy/nodes.dmp", "taxonomy/names.dmp", "taxonomy/merged.dmp",
+  "taxonomy/delnodes.dmp", "database.kraken",
+ ]
+}
+paths = set(candidates.get(kind, []))
+if kind == "kraken2-bracken":
+    try:
+        paths.update(n for n in os.listdir(root) if n.endswith(".kmer_distrib") or n.endswith(".kraken"))
+    except OSError:
+        pass
+elif kind == "gtdbtk":
+    paths.update([
+      "VERSION", "release.txt", "gtdbtk.package_version",
+      "metadata/metadata.tsv", "metadata/metadata.txt",
+      "metadata/genome_metadata.tsv", "metadata/taxonomy.tsv",
+      "taxonomy/gtdb_taxonomy.tsv",
+    ])
+rows = []
+present = set()
+for rel in paths:
+    path = os.path.join(root, rel)
+    try:
+        st = os.stat(path)
+        if os.path.isfile(path):
+            rows.append((rel, st.st_size, st.st_mtime_ns))
+            present.add(rel)
+    except OSError:
+        continue
+for rel, size, mtime in sorted(rows, key=lambda x: x[0].encode("utf-8")):
+    print(f"{rel}\t{size}\t{mtime}")
+missing = sorted(set(candidates.get(kind, [])) - present)
+if missing:
+    print("#WARN\toptional keyfiles omitted: " + ", ".join(missing))
+PY
+)"
+    warning="$(sed -n 's/^#WARN	//p' <<< "${output}")"
+    [[ -z "${warning}" ]] || log_warn "[Inventory] ${kind} database: ${warning}."
+    sed '/^#WARN	/d' <<< "${output}"
+}
+
+resolve_database_identity() {
+    local stage="$1" kind="$2" path="$3"
+    local key="${stage}|${kind}" resolved version=unknown version_source=unknown method=unknown fingerprint=unknown
+    local size=0 mtime=0 status=unavailable rows="" release_file="" first_row
+    [[ -n "${path}" && -e "${path}" ]] || {
+        ID_DATABASE_PATH["$key"]="$(realpath -m "${path:-unknown}")"
+        ID_DATABASE_RELEASE["$key"]=unknown
+        ID_DATABASE_VERSION_SOURCE["$key"]=unknown
+        ID_DATABASE_SIZE["$key"]=not-applicable
+        ID_DATABASE_MTIME["$key"]=not-applicable
+        ID_DATABASE_METHOD["$key"]=unknown
+        ID_DATABASE_FINGERPRINT["$key"]=unknown
+        ID_DATABASE_STATUS["$key"]=unavailable
+        return 0
+    }
+    resolved="$(realpath "${path}")"
+    if [[ "${kind}" == checkm2 ]]; then
+        method=sha256-file
+    else
+        method=metadata-keyfiles-v1
+    fi
+    local cache_key="${kind}|${resolved}|${method}"
+    if [[ -n "${DB_IDENTITY_CACHE[$cache_key]:-}" ]]; then
+        IFS='|' read -r version version_source size mtime method fingerprint status <<< "${DB_IDENTITY_CACHE[$cache_key]}"
+    elif [[ -f "${resolved}" && "${kind}" == checkm2 ]]; then
+        local stat_fields
+        stat_fields="$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_size}\t{s.st_mtime_ns}")' "${resolved}")"
+        DB_SNAPSHOT["$cache_key"]="${stat_fields}"
+        IFS=$'\t' read -r size mtime <<< "${stat_fields}"
+        fingerprint="$(sha256sum "${resolved}" | awk '{print tolower($1)}')"
+        method=sha256-file
+        status=available
+        DB_IDENTITY_CACHE["$cache_key"]="${version}|${version_source}|${size}|${mtime}|${method}|${fingerprint}|${status}"
+    elif [[ -d "${resolved}" && ( "${kind}" == kraken2-bracken || "${kind}" == gtdbtk ) ]]; then
+        rows="$(database_keyfile_rows "${kind}" "${resolved}")"
+        DB_SNAPSHOT["$cache_key"]="${rows}"
+        if [[ -n "${rows}" ]]; then
+            size=0
+            mtime=0
+            while IFS=$'\t' read -r _relative _size _mtime; do
+                size=$((size + _size))
+                (( _mtime > mtime )) && mtime="${_mtime}"
+            done <<< "${rows}"
+            fingerprint="$(printf '%s\n' "${rows}" | sha256sum | awk '{print tolower($1)}')"
+            method=metadata-keyfiles-v1
+            status=available
+            local metadata_name
+            for metadata_name in VERSION release.txt gtdbtk.package_version; do
+                if [[ -f "${resolved}/${metadata_name}" ]]; then
+                    release_file="${resolved}/${metadata_name}"
+                    break
+                fi
+            done
+            if [[ -n "${release_file}" ]]; then
+                first_row="$(head -n 1 "${release_file}" | tr -d '\r\n')"
+                if [[ -n "${first_row}" ]]; then
+                    version="$(tsv_value "${first_row}")"
+                    version_source=metadata
+                fi
+            fi
+            DB_IDENTITY_CACHE["$cache_key"]="${version}|${version_source}|${size}|${mtime}|${method}|${fingerprint}|${status}"
+        else
+            status=unknown
+            method=unknown
+            fingerprint=unknown
+            log_warn "[Inventory] No trusted keyfiles found for ${kind} database at ${resolved}."
+            DB_IDENTITY_CACHE["$cache_key"]="${version}|${version_source}|${size}|${mtime}|${method}|${fingerprint}|${status}"
+        fi
+    else
+        status=unknown
+        method=unknown
+        fingerprint=unknown
+        DB_IDENTITY_CACHE["$cache_key"]="${version}|${version_source}|${size}|${mtime}|${method}|${fingerprint}|${status}"
+    fi
+    ID_DATABASE_PATH["$key"]="$(tsv_value "${resolved}")"
+    ID_DATABASE_RELEASE["$key"]="$(tsv_value "${version}")"
+    ID_DATABASE_VERSION_SOURCE["$key"]="${version_source}"
+    ID_DATABASE_SIZE["$key"]="${size}"
+    ID_DATABASE_MTIME["$key"]="${mtime}"
+    ID_DATABASE_METHOD["$key"]="${method}"
+    ID_DATABASE_FINGERPRINT["$key"]="${fingerprint}"
+    ID_DATABASE_STATUS["$key"]="${status}"
+}
+
+resolve_all_current_identities() {
+    local stage tool
+    local -a tools=()
+    for stage in "${STAGE_IDS[@]}"; do
+        if ! stage_is_active "${stage}" || ! stage_in_scope "$(get_stage_public_name "${stage}")"; then
+            continue
+        fi
+        mapfile -t tools < <(inventory_stage_tools "${stage}")
+        for tool in "${tools[@]}"; do
+            runtime_identity_for_tool "${stage}" "${tool}"
+        done
+        case "${stage}" in
+            03_kraken2) resolve_database_identity "${stage}" kraken2-bracken "${KRAKEN2_DB}" ;;
+            08_checkm2) resolve_database_identity "${stage}" checkm2 "${CHECKM2_DB}" ;;
+            10_gtdbtk) resolve_database_identity "${stage}" gtdbtk "${GTDBTK_DATA_PATH}" ;;
+        esac
+    done
+}
+
+append_checkpoint_identity() {
+    local stage="$1" tool key tools_joined="" source_joined="" mode="" name="" uri=""
+    local path="" size="" mtime="" method="" fingerprint="" database_key=""
+    local -a tools=()
+    mapfile -t tools < <(inventory_stage_tools "${stage}")
+    for tool in "${tools[@]}"; do
+        key="${stage}|${tool}"
+        [[ -n "${ID_STATUS[$key]:-}" ]] || continue
+        [[ -n "${tools_joined}" ]] && tools_joined+=","
+        [[ -n "${source_joined}" ]] && source_joined+=","
+        tools_joined+="${tool}=${ID_VERSION[$key]}"
+        source_joined+="${tool}=${ID_VERSION_SOURCE[$key]}"
+        mode="${ID_EXECUTION_MODE[$key]}"
+        name="${ID_RUNTIME_NAME[$key]}"
+        uri="${ID_RUNTIME_URI[$key]}"
+        path="${ID_RUNTIME_PATH[$key]}"
+        size="${ID_RUNTIME_SIZE[$key]}"
+        mtime="${ID_RUNTIME_MTIME[$key]}"
+        method="${ID_RUNTIME_METHOD[$key]}"
+        fingerprint="${ID_RUNTIME_FINGERPRINT[$key]}"
+        printf 'resource_%s_version=%s\nresource_%s_version_source=%s\nresource_%s_runtime_fingerprint_method=%s\nresource_%s_runtime_fingerprint=%s\n' \
+            "${tool}" "${ID_VERSION[$key]}" "${tool}" "${ID_VERSION_SOURCE[$key]}" \
+            "${tool}" "${method}" "${tool}" "${fingerprint}"
+        printf 'resource_%s_command_used=%s\n' "${tool}" "${ID_COMMAND[$key]}"
+    done
+    [[ -z "${tools_joined}" ]] || printf 'effective_tool_version=%s\ntool_version_source=%s\nexecution_mode=%s\nruntime_name=%s\nruntime_uri=%s\nruntime_path=%s\nruntime_size_bytes=%s\nruntime_mtime_ns=%s\nruntime_fingerprint_method=%s\nruntime_fingerprint=%s\n' \
+        "${tools_joined}" "${source_joined}" "${mode}" "${name}" "${uri}" "${path}" "${size}" "${mtime}" "${method}" "${fingerprint}"
+    case "${stage}" in
+        03_kraken2) database_key="${stage}|kraken2-bracken" ;;
+        08_checkm2) database_key="${stage}|checkm2" ;;
+        10_gtdbtk) database_key="${stage}|gtdbtk" ;;
+    esac
+    if [[ -n "${database_key}" && -n "${ID_DATABASE_STATUS[$database_key]:-}" ]]; then
+        printf 'database_release_or_version=%s\ndatabase_version_source=%s\ndatabase_path=%s\ndatabase_fingerprint_method=%s\ndatabase_fingerprint=%s\n' \
+            "${ID_DATABASE_RELEASE[$database_key]}" "${ID_DATABASE_VERSION_SOURCE[$database_key]}" \
+            "${ID_DATABASE_PATH[$database_key]}" "${ID_DATABASE_METHOD[$database_key]}" \
+            "${ID_DATABASE_FINGERPRINT[$database_key]}"
+    fi
+}
+
+build_inventory_rows() {
+    local stage tool key role dbkey producer_file producer_version producer_method producer_fingerprint row
+    local producer_name producer_uri producer_path producer_size producer_mtime producer_mode producer_command
+    local producer_release producer_dbpath producer_dbmethod producer_dbfingerprint producer_dbsize producer_dbmtime
+    SOFTWARE_INVENTORY_ROWS=()
+    DATABASE_INVENTORY_ROWS=()
+    INVENTORY_UNKNOWN_COUNT=0
+    INVENTORY_UNAVAILABLE_COUNT=0
+    for stage in "${STAGE_IDS[@]}"; do
+        if ! stage_is_active "${stage}" || ! stage_in_scope "$(get_stage_public_name "${stage}")"; then
+            continue
+        fi
+        case "${STAGE_ACTION[$stage]}" in
+            run|force|restart) role="current-runtime" ;;
+            reuse) role="current-runtime" ;;
+            *) continue ;;
+        esac
+        while IFS= read -r tool; do
+            [[ -n "${tool}" ]] || continue
+            key="${stage}|${tool}"
+            [[ -n "${ID_STATUS[$key]:-}" ]] || continue
+            row="$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+                "${stage}" "${tool}" "${role}" "${ID_VERSION[$key]}" "${ID_VERSION_SOURCE[$key]}" \
+                "${ID_EXECUTION_MODE[$key]}" "${ID_RUNTIME_NAME[$key]}" "${ID_RUNTIME_URI[$key]}" \
+                "${ID_RUNTIME_PATH[$key]}" "${ID_RUNTIME_SIZE[$key]}" "${ID_RUNTIME_MTIME[$key]}" \
+                "${ID_RUNTIME_METHOD[$key]}" "${ID_RUNTIME_FINGERPRINT[$key]}" "${ID_COMMAND[$key]}")"
+            SOFTWARE_INVENTORY_ROWS+=("${row}"$'\t'"${ID_STATUS[$key]}")
+            if [[ "${ID_STATUS[$key]}" == unknown ]]; then
+                INVENTORY_UNKNOWN_COUNT=$((INVENTORY_UNKNOWN_COUNT + 1))
+            elif [[ "${ID_STATUS[$key]}" == unavailable ]]; then
+                INVENTORY_UNAVAILABLE_COUNT=$((INVENTORY_UNAVAILABLE_COUNT + 1))
+            fi
+        done < <(inventory_stage_tools "${stage}")
+        if [[ "${STAGE_ACTION[$stage]}" == reuse ]]; then
+            producer_file="${CHECKPOINT_DIR}/${stage}.config"
+            producer_mode="$(awk -F= '$1=="engine" {sub(/^[^=]*=/,""); print; exit}' "${producer_file}" 2>/dev/null)"
+            [[ "${producer_mode}" == apptainer || "${producer_mode}" == mamba ]] || producer_mode="${EXEC_MODE}"
+            producer_name="$(awk -F= '$1=="runtime_name" {sub(/^[^=]*=/,""); print; exit}' "${producer_file}" 2>/dev/null)"
+            producer_uri="$(awk -F= '$1=="runtime_uri" {sub(/^[^=]*=/,""); print; exit}' "${producer_file}" 2>/dev/null)"
+            producer_path="$(awk -F= '$1=="runtime_path" {sub(/^[^=]*=/,""); print; exit}' "${producer_file}" 2>/dev/null)"
+            producer_size="$(awk -F= '$1=="runtime_size_bytes" {sub(/^[^=]*=/,""); print; exit}' "${producer_file}" 2>/dev/null)"
+            producer_mtime="$(awk -F= '$1=="runtime_mtime_ns" {sub(/^[^=]*=/,""); print; exit}' "${producer_file}" 2>/dev/null)"
+            [[ -n "${producer_name}" ]] || producer_name=unknown
+            [[ -n "${producer_uri}" ]] || producer_uri=unknown
+            [[ -n "${producer_path}" ]] || producer_path=unknown
+            [[ -n "${producer_size}" ]] || producer_size=unknown
+            [[ -n "${producer_mtime}" ]] || producer_mtime=unknown
+            while IFS= read -r tool; do
+                [[ -n "${tool}" ]] || continue
+                producer_version="$(awk -F= -v key="resource_${tool}_version" '$1==key {sub(/^[^=]*=/,""); print; exit}' "${producer_file}" 2>/dev/null)"
+                producer_method="$(awk -F= -v key="resource_${tool}_runtime_fingerprint_method" '$1==key {sub(/^[^=]*=/,""); print; exit}' "${producer_file}" 2>/dev/null)"
+                producer_fingerprint="$(awk -F= -v key="resource_${tool}_runtime_fingerprint" '$1==key {sub(/^[^=]*=/,""); print; exit}' "${producer_file}" 2>/dev/null)"
+                producer_command="$(awk -F= -v key="resource_${tool}_command_used" '$1==key {sub(/^[^=]*=/,""); print; exit}' "${producer_file}" 2>/dev/null)"
+                [[ -n "${producer_version}" ]] || producer_version=unknown
+                [[ -n "${producer_method}" ]] || producer_method=unknown
+                [[ -n "${producer_fingerprint}" ]] || producer_fingerprint=unknown
+                [[ -n "${producer_command}" ]] || producer_command=unknown
+                producer_version="$(tsv_value "${producer_version}")"
+                producer_command="$(tsv_value "${producer_command}")"
+                SOFTWARE_INVENTORY_ROWS+=("$(printf '%s\t%s\tproducer\t%s\tcheckpoint-manifest\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\treused' \
+                    "${stage}" "${tool}" "${producer_version}" "${producer_mode}" \
+                    "$(tsv_value "${producer_name}")" "$(tsv_value "${producer_uri}")" "$(tsv_value "${producer_path}")" "${producer_size}" \
+                    "${producer_mtime}" "${producer_method}" "${producer_fingerprint}" "${producer_command}")")
+                if [[ "${producer_version}" == unknown || "${producer_method}" == unknown || "${producer_fingerprint}" == unknown ]]; then
+                    INVENTORY_UNKNOWN_COUNT=$((INVENTORY_UNKNOWN_COUNT + 1))
+                fi
+            done < <(inventory_stage_tools "${stage}")
+        fi
+        case "${stage}" in
+            03_kraken2) dbkey="${stage}|kraken2-bracken" ;;
+            08_checkm2) dbkey="${stage}|checkm2" ;;
+            10_gtdbtk) dbkey="${stage}|gtdbtk" ;;
+            *) dbkey="" ;;
+        esac
+        if [[ -n "${dbkey}" && -n "${ID_DATABASE_STATUS[$dbkey]:-}" ]]; then
+            DATABASE_INVENTORY_ROWS+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' \
+                "${stage}" "${dbkey#*|}" "${role}" "${ID_DATABASE_PATH[$dbkey]}" \
+                "${ID_DATABASE_RELEASE[$dbkey]}" "${ID_DATABASE_VERSION_SOURCE[$dbkey]}" \
+                "${ID_DATABASE_SIZE[$dbkey]}" "${ID_DATABASE_MTIME[$dbkey]}" \
+                "${ID_DATABASE_METHOD[$dbkey]}" "${ID_DATABASE_FINGERPRINT[$dbkey]}" \
+                "${ID_DATABASE_STATUS[$dbkey]}")")
+            if [[ "${ID_DATABASE_STATUS[$dbkey]}" == unknown ]]; then
+                INVENTORY_UNKNOWN_COUNT=$((INVENTORY_UNKNOWN_COUNT + 1))
+            elif [[ "${ID_DATABASE_STATUS[$dbkey]}" == unavailable ]]; then
+                INVENTORY_UNAVAILABLE_COUNT=$((INVENTORY_UNAVAILABLE_COUNT + 1))
+            fi
+            if [[ "${STAGE_ACTION[$stage]}" == reuse ]]; then
+                producer_file="${CHECKPOINT_DIR}/${stage}.config"
+                producer_release="$(awk -F= '$1=="database_release_or_version" {sub(/^[^=]*=/,""); print; exit}' "${producer_file}" 2>/dev/null)"
+                producer_dbpath="$(awk -F= '$1=="database_path" {sub(/^[^=]*=/,""); print; exit}' "${producer_file}" 2>/dev/null)"
+                producer_dbmethod="$(awk -F= '$1=="database_fingerprint_method" {sub(/^[^=]*=/,""); print; exit}' "${producer_file}" 2>/dev/null)"
+                producer_dbfingerprint="$(awk -F= '$1=="database_fingerprint" {sub(/^[^=]*=/,""); print; exit}' "${producer_file}" 2>/dev/null)"
+                [[ -n "${producer_release}" ]] || producer_release=unknown
+                [[ -n "${producer_dbpath}" ]] || producer_dbpath=unknown
+                [[ -n "${producer_dbmethod}" ]] || producer_dbmethod=unknown
+                [[ -n "${producer_dbfingerprint}" ]] || producer_dbfingerprint=unknown
+                producer_release="$(tsv_value "${producer_release}")"
+                producer_dbpath="$(tsv_value "${producer_dbpath}")"
+                producer_dbsize=unknown
+                producer_dbmtime=unknown
+                DATABASE_INVENTORY_ROWS+=("$(printf '%s\t%s\tproducer\t%s\t%s\tcheckpoint-manifest\t%s\t%s\t%s\t%s\treused' \
+                    "${stage}" "${dbkey#*|}" "${producer_dbpath}" "${producer_release}" \
+                    "${producer_dbsize}" "${producer_dbmtime}" "${producer_dbmethod}" "${producer_dbfingerprint}")")
+                if [[ "${producer_release}" == unknown || "${producer_dbmethod}" == unknown || "${producer_dbfingerprint}" == unknown ]]; then
+                    INVENTORY_UNKNOWN_COUNT=$((INVENTORY_UNKNOWN_COUNT + 1))
+                fi
+            fi
+        fi
+    done
+}
+
+validate_current_identity_plan() {
+    local stage tool key dbkey failures=0
+    for stage in "${STAGE_IDS[@]}"; do
+        if ! stage_is_active "${stage}" || ! stage_in_scope "$(get_stage_public_name "${stage}")"; then
+            continue
+        fi
+        stage_action_requires_execution "${stage}" || continue
+        while IFS= read -r tool; do
+            [[ -n "${tool}" ]] || continue
+            key="${stage}|${tool}"
+            if [[ "${ID_STATUS[$key]:-unavailable}" == unavailable ]]; then
+                log_error "Required runtime for ${stage}/${tool} is unavailable."
+                (( failures += 1 ))
+            elif [[ "${ID_VERSION[$key]:-unknown}" == unknown && \
+                    "${ID_RUNTIME_FINGERPRINT[$key]:-unknown}" == unknown ]]; then
+                log_error "Runtime identity for ${stage}/${tool} has neither a known version nor a fingerprint."
+                (( failures += 1 ))
+            fi
+        done < <(inventory_stage_tools "${stage}")
+        case "${stage}" in
+            03_kraken2) dbkey="${stage}|kraken2-bracken" ;;
+            08_checkm2) dbkey="${stage}|checkm2" ;;
+            10_gtdbtk) dbkey="${stage}|gtdbtk" ;;
+            *) dbkey="" ;;
+        esac
+        if [[ -n "${dbkey}" && "${ID_DATABASE_STATUS[$dbkey]:-unavailable}" == unavailable ]]; then
+            log_error "Required database for ${stage} is unavailable: ${ID_DATABASE_PATH[$dbkey]:-unknown}"
+            (( failures += 1 ))
+        fi
+    done
+    (( failures == 0 ))
+}
+
+software_inventory_header() {
+    printf 'stage_id\ttool\trole\tversion\tversion_source\texecution_mode\truntime_name\truntime_uri\truntime_path\truntime_size_bytes\truntime_mtime_ns\truntime_fingerprint_method\truntime_fingerprint\tcommand_used\tstatus\n'
+}
+
+database_inventory_header() {
+    printf 'stage_id\tdatabase\trole\tpath\trelease_or_version\tversion_source\tsize_bytes\tmtime_ns\tfingerprint_method\tfingerprint\tstatus\n'
+}
+
+validate_inventory_file() {
+    local file="$1" kind="$2" header expected
+    if [[ "${kind}" == software ]]; then
+        expected="$(software_inventory_header)"
+        awk -F'\t' 'NR>1 && NF!=15 {exit 1}' "${file}" || return 1
+        awk -F'\t' 'NR>1 && ($3 !~ /^(producer|current-runtime)$/ || $5 !~ /^(runtime-command|checkpoint-manifest|image-label|commit|unknown)$/ || $6 !~ /^(apptainer|mamba)$/ || $12 !~ /^(sha256-file|conda-meta-v1|unknown)$/ || $15 !~ /^(available|unknown|unavailable|reused)$/) {exit 1}' "${file}" || return 1
+        awk -F'\t' 'NR>1 {k=$1 FS $2 FS $3; if(seen[k]++) exit 1}' "${file}" || return 1
+    else
+        expected="$(database_inventory_header)"
+        awk -F'\t' 'NR>1 && NF!=11 {exit 1}' "${file}" || return 1
+        awk -F'\t' 'NR>1 && ($2 !~ /^(kraken2-bracken|checkm2|gtdbtk)$/ || $3 !~ /^(producer|current-runtime)$/ || $6 !~ /^(metadata|checkpoint-manifest|unknown)$/ || $9 !~ /^(sha256-file|metadata-keyfiles-v1|unknown)$/ || $11 !~ /^(available|unknown|unavailable|reused)$/) {exit 1}' "${file}" || return 1
+        awk -F'\t' 'NR>1 {k=$1 FS $2 FS $3; if(seen[k]++) exit 1}' "${file}" || return 1
+    fi
+    IFS= read -r header < "${file}"
+    [[ "${header}" == "${expected%$'\n'}" ]]
+}
+
+publish_inventory_generation() {
+    local logs root build previous public target temp outdir_abs
+    logs="$(realpath -m "${LOGS_DIR}")"
+    outdir_abs="$(realpath -m "${OUTDIR}")"
+    [[ "${logs}" == "${outdir_abs}/logs" || "${logs}" == "${outdir_abs}/logs/"* ]] || {
+        log_error "Inventory logs path resolves outside OUTDIR: ${logs}"
+        return 1
+    }
+    root="$(realpath -m "${logs}/inventory")"
+    [[ "${root}" == "${logs}/inventory" || "${root}" == "${logs}/inventory/"* || \
+       "${root}" == "${logs}/"* ]] || {
+        log_error "Inventory directory resolves outside logs: ${root}"
+        return 1
+    }
+    build="${root}/.build.$$"
+    previous="${root}/.previous.$$"
+    if [[ "${DRY_RUN}" == true ]]; then
+        log_info "Software inventory      : ${logs}/software_versions.tsv (would write)"
+        log_info "Database inventory      : ${logs}/database_versions.tsv (would write)"
+        log_info "Software entries        : ${#SOFTWARE_INVENTORY_ROWS[@]}"
+        log_info "Database entries        : ${#DATABASE_INVENTORY_ROWS[@]}"
+        log_info "Unknown identities      : ${INVENTORY_UNKNOWN_COUNT}"
+        log_info "Unavailable resources   : ${INVENTORY_UNAVAILABLE_COUNT}"
+        local _inv_row
+        for _inv_row in "${SOFTWARE_INVENTORY_ROWS[@]}"; do
+            log_info "  [Software] ${_inv_row}"
+        done
+        for _inv_row in "${DATABASE_INVENTORY_ROWS[@]}"; do
+            log_info "  [Database] ${_inv_row}"
+        done
+        return 0
+    fi
+    mkdir -p "${root}"
+    [[ ! -e "${build}" && ! -e "${previous}" ]] || {
+        log_error "Inventory generation path already exists for PID $$."
+        return 1
+    }
+    mkdir "${build}"
+    {
+        software_inventory_header
+        (( ${#SOFTWARE_INVENTORY_ROWS[@]} == 0 )) || printf '%s\n' "${SOFTWARE_INVENTORY_ROWS[@]}"
+    } > "${build}/software_versions.tsv"
+    {
+        database_inventory_header
+        (( ${#DATABASE_INVENTORY_ROWS[@]} == 0 )) || printf '%s\n' "${DATABASE_INVENTORY_ROWS[@]}"
+    } > "${build}/database_versions.tsv"
+    if ! validate_inventory_file "${build}/software_versions.tsv" software || \
+       ! validate_inventory_file "${build}/database_versions.tsv" database; then
+        rm -rf -- "${build}"
+        log_error "Refusing to publish an invalid inventory generation."
+        return 1
+    fi
+    if [[ -e "${root}/current" ]]; then
+        mv -- "${root}/current" "${previous}" || return 1
+    fi
+    if ! mv -- "${build}" "${root}/current"; then
+        [[ -e "${previous}" ]] && mv -- "${previous}" "${root}/current"
+        return 1
+    fi
+    for public in software_versions.tsv database_versions.tsv; do
+        target="inventory/current/${public}"
+        temp="${logs}/.${public}.$$"
+        rm -f -- "${temp}"
+        ln -s "${target}" "${temp}" || {
+            [[ -e "${previous}" ]] && { rm -rf -- "${root}/current"; mv -- "${previous}" "${root}/current"; }
+            return 1
+        }
+        mv -Tf -- "${temp}" "${logs}/${public}" || {
+            rm -f -- "${temp}"
+            [[ -e "${previous}" ]] && { rm -rf -- "${root}/current"; mv -- "${previous}" "${root}/current"; }
+            return 1
+        }
+        [[ "$(realpath -m "${logs}/${public}")" == "${root}/current/${public}" ]] || {
+            log_error "Public inventory link escapes logs directory: ${logs}/${public}"
+            return 1
+        }
+    done
+    if ! validate_inventory_file "${root}/current/software_versions.tsv" software || \
+       ! validate_inventory_file "${root}/current/database_versions.tsv" database; then
+        log_error "Post-publication validation failed for inventory generation."
+        if [[ -e "${previous}" ]]; then
+            rm -rf -- "${root}/current"
+            mv -- "${previous}" "${root}/current"
+            for public in software_versions.tsv database_versions.tsv; do
+                target="inventory/current/${public}"
+                temp="${logs}/.${public}.$$"
+                rm -f -- "${temp}"
+                ln -s "${target}" "${temp}" && mv -Tf -- "${temp}" "${logs}/${public}" || true
+            done
+        fi
+        return 1
+    fi
+    [[ -e "${previous}" ]] && rm -rf -- "${previous}"
+    log_info "Software inventory      : ${logs}/software_versions.tsv"
+    log_info "Database inventory      : ${logs}/database_versions.tsv"
+    log_info "Software entries        : ${#SOFTWARE_INVENTORY_ROWS[@]}"
+    log_info "Database entries        : ${#DATABASE_INVENTORY_ROWS[@]}"
+    log_info "Unknown identities      : ${INVENTORY_UNKNOWN_COUNT}"
+    log_info "Unavailable resources   : ${INVENTORY_UNAVAILABLE_COUNT}"
+}
+
+assert_runtime_identity_frozen() {
+    local stage="$1" tool spec sif uri executable env_name path stat_fields size mtime object key
+    local -a tools=()
+    mapfile -t tools < <(inventory_stage_tools "${stage}")
+    for tool in "${tools[@]}"; do
+        key="${stage}|${tool}"
+        [[ "${ID_STATUS[$key]:-unavailable}" == unavailable ]] && continue
+        if [[ "${EXEC_MODE}" == mamba ]]; then
+            path="${ID_RUNTIME_PATH[$key]:-unknown}"
+            [[ "${path}" == unknown ]] && continue
+            [[ -d "${path}" ]] || {
+                log_error "Mamba runtime prefix disappeared after planning for ${stage}/${tool}."
+                return 1
+            }
+            object="$(mamba_environment_snapshot "${path}")"
+            if [[ "${object}" != "${MAMBA_OBJECT_CACHE[$path]:-}" ]]; then
+                log_error "Mamba environment changed after the plan was frozen for ${stage}/${tool}."
+                return 1
+            fi
+            continue
+        fi
+        spec="$(tool_runtime_spec "${stage}" "${tool}")"
+        IFS=$'\t' read -r sif uri executable env_name <<< "${spec}"
+        [[ -f "${sif}" && -r "${sif}" ]] || {
+            log_error "Runtime image became unavailable after planning for ${stage}/${tool}."
+            return 1
+        }
+        path="$(realpath "${sif}")"
+        stat_fields="$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_size}\t{s.st_mtime_ns}\t{s.st_ctime_ns}\t{s.st_dev}\t{s.st_ino}")' "${path}")"
+        IFS=$'\t' read -r size mtime <<< "${stat_fields}"
+        object="$(cut -f3- <<< "${stat_fields}")"
+        if [[ "${path}" != "${ID_RUNTIME_PATH[$key]}" || \
+              "${size}" != "${ID_RUNTIME_SIZE[$key]}" || \
+              "${mtime}" != "${ID_RUNTIME_MTIME[$key]}" || \
+              "${object}" != "${SIF_OBJECT_CACHE[$path]:-}" ]]; then
+            log_error "Runtime image identity changed after the plan was frozen for ${stage}/${tool}; refusing to replan."
+            return 1
+        fi
+    done
+}
+
+assert_database_identity_frozen() {
+    local stage="$1" kind="" path="" key="" resolved="" cache_key="" snapshot="" current=""
+    case "${stage}" in
+        03_kraken2) kind=kraken2-bracken; path="${KRAKEN2_DB}" ;;
+        08_checkm2) kind=checkm2; path="${CHECKM2_DB}" ;;
+        10_gtdbtk) kind=gtdbtk; path="${GTDBTK_DATA_PATH}" ;;
+        *) return 0 ;;
+    esac
+    key="${stage}|${kind}"
+    [[ "${ID_DATABASE_STATUS[$key]:-unavailable}" == unavailable ]] && return 0
+    [[ -e "${path}" ]] || {
+        log_error "Database became unavailable after planning for ${stage}."
+        return 1
+    }
+    resolved="$(realpath "${path}")"
+    [[ "${resolved}" == "${ID_DATABASE_PATH[$key]}" ]] || {
+        log_error "Database path changed after the plan was frozen for ${stage}."
+        return 1
+    }
+    cache_key="${kind}|${resolved}"
+    snapshot="${DB_SNAPSHOT[$cache_key]:-}"
+    if [[ "${kind}" == checkm2 ]]; then
+        current="$(python3 -c 'import os,sys; s=os.stat(sys.argv[1]); print(f"{s.st_size}\t{s.st_mtime_ns}")' "${resolved}")"
+    elif [[ -d "${resolved}" ]]; then
+        current="$(database_keyfile_rows "${kind}" "${resolved}")"
+    fi
+    if [[ "${current}" != "${snapshot}" ]]; then
+        log_error "Database identity changed after the plan was frozen for ${stage}; refusing to replan."
+        return 1
+    fi
+}
+
 checkpoint_config_manifest() {
     local step="$1"
     {
         printf 'step=%s\nengine=%s\n' "${step}" "${EXEC_MODE}"
+        append_checkpoint_identity "${step}"
         case "${step}" in
             01_fastp|02_megahit|03_kraken2|04_mapping|07_reassembly|11_coverm)
                 append_reads_manifest "${step}" ;;
@@ -1602,11 +2955,7 @@ checkpoint_config_manifest() {
             03_kraken2)
                 printf 'db=%s\nthreads=%s\nread_len=%s\ntax_level=%s\nthreshold=%s\nimage=%s\n' \
                     "$(realpath -m "${KRAKEN2_DB}")" "${THREADS}" "${BRACKEN_READ_LEN}" \
-                    "${BRACKEN_TAX_LEVEL}" "${BRACKEN_THRESHOLD}" "${SIF_KRAKEN2_URI}"
-                local db_file
-                while IFS= read -r -d '' db_file; do
-                    append_file_fingerprint kraken_db "${db_file}"
-                done < <(find "${KRAKEN2_DB}" -maxdepth 2 -type f -print0 2>/dev/null | sort -z) ;;
+                    "${BRACKEN_TAX_LEVEL}" "${BRACKEN_THRESHOLD}" "${SIF_KRAKEN2_URI}" ;;
             04_mapping)
                 printf 'enabled=%s\ncontigs=%s\nthreads=%s\nimage=%s\n' \
                     "${RUN_MAPPING}" "${CONTIGS}" "${THREADS}" "${SIF_MAPPING_URI}"
@@ -1632,9 +2981,7 @@ checkpoint_config_manifest() {
                 append_file_fingerprint contigs "${CONTIGS}"
                 append_file_fingerprint depth "${DEPTH_FILE}"
                 append_file_fingerprint abundance_tsv "${VAMB_ABUNDANCE_TSV}"
-                if [[ "${EXEC_MODE}" == apptainer ]]; then
-                    append_file_fingerprint vamb_image "${SIF_VAMB}"
-                else
+                if [[ "${EXEC_MODE}" != apptainer ]]; then
                     printf 'mamba_environment=%s\n' "${ENV_VAMB}"
                 fi
                 append_vamb_abundance_manifest
@@ -1668,9 +3015,7 @@ checkpoint_config_manifest() {
                     "${EXEC_MODE}" "${SIF_COMEBIN_URI}" \
                     "-a ${CONTIGS} -o ${comebin_output_dir} -p ${comebin_bam_dir} -s ${COMEBIN_SEED} -t ${THREADS} -d ${COMEBIN_DEVICE}; wrapper defaults: -n 6 -w same_as_-t -m 100 -E 1e-5 -l 0.07_if_N50_gt_10000_else_0.15 -e 2048 -c 2048 -b 1024"
                 append_file_fingerprint contigs "${CONTIGS}"
-                if [[ "${EXEC_MODE}" == apptainer ]]; then
-                    append_file_fingerprint comebin_image "${SIF_COMEBIN}"
-                else
+                if [[ "${EXEC_MODE}" != apptainer ]]; then
                     printf 'mamba_environment=%s\n' "${ENV_COMEBIN}"
                 fi
                 append_assembly_manifest
@@ -1714,24 +3059,76 @@ checkpoint_config_manifest() {
                     "${SELECTED_BINNERS}" "${REFINEMENT_MODE}" "${RUN_REFINEMENT_EFFECTIVE}" \
                     "${BINS_SOURCE}" "${BINS_SOURCE_RESOLVED}" "$(realpath -m "${BINS_FOR_QC}")" \
                     "$(realpath -m "${CHECKM2_DB}")" "${THREADS}" "${SIF_CHECKM2_URI}"
-                append_bins_manifest "${BINS_FOR_QC}"
-                append_file_fingerprint checkm2_db "${CHECKM2_DB}" ;;
+                append_bins_manifest "${BINS_FOR_QC}" ;;
             09_filter_mags)
-                printf 'enabled=%s\nbins=%s\ncheckm_report=%s\ncompleteness=%s\ncontamination=%s\nmeta_completeness=%s\nmeta_contamination=%s\n' \
-                    "${RUN_MAG_FILTERING}" \
-                    "${BINS_FOR_QC}" "${CHECKM2_DIR}/quality_report.tsv" "${COMPLETENESS}" "${CONTAMINATION}" \
-                    "${METAWRAP_COMPLETENESS}" "${METAWRAP_CONTAMINATION}" ;;
+                printf 'enabled=%s\nmin_completeness=%s\nmax_contamination=%s\ncomparison_completeness=>=\ncomparison_contamination=<=\n' \
+                    "${RUN_MAG_FILTERING}" "${MIN_COMPLETENESS}" "${MAX_CONTAMINATION}"
+                printf 'checkm2_report_fingerprint=%s\ninput_bins_fingerprint=%s\nretained_mags_fingerprint=%s\nfilter_manifest_fingerprint=%s\n' \
+                    "$(sha256sum "${CHECKM2_DIR}/quality_report.tsv" 2>/dev/null | awk '{print $1}')" \
+                    "$(append_fasta_bins_manifest input_bin "${BINS_FOR_QC}" | sha256sum | awk '{print $1}')" \
+                    "$(append_fasta_bins_manifest retained_mag "${MAGS_DIR}" | sha256sum | awk '{print $1}')" \
+                    "$(sha256sum "${MAG_FILTER_MANIFEST}" 2>/dev/null | awk '{print $1}')" ;;
             10_gtdbtk)
                 printf 'enabled=%s\nmags=%s\ndata=%s\nthreads=%s\nimage=%s\n' \
-                    "${RUN_GTDBTK}" "${HQ_BINS_DIR}" "${GTDBTK_DATA_PATH}" "${THREADS}" "${SIF_GTDBTK_URI}"
-                append_file_fingerprint gtdbtk_data "${GTDBTK_DATA_PATH}" ;;
+                    "${RUN_GTDBTK}" "${HQ_BINS_DIR}" "${GTDBTK_DATA_PATH}" "${THREADS}" "${SIF_GTDBTK_URI}" ;;
             11_coverm)
                 printf 'enabled=%s\nmags=%s\nmethods=%s\nmin_covered_fraction=%s\nthreads=%s\nimage=%s\n' \
                     "${RUN_COVERM}" "${HQ_BINS_DIR}" "${COVERM_METHODS}" "${COVERM_MIN_COVERED_FRACTION}" "${THREADS}" "${SIF_COVERM_URI}" ;;
-            12_summary)
-                printf 'mags=%s\ncheckm2_enabled=%s\ncheckm2=%s\ngtdbtk_enabled=%s\ncoverm_enabled=%s\ncompleteness=%s\ncontamination=%s\ncoverm_methods=%s\nimage=%s\n' \
-                    "${HQ_BINS_DIR}" "${RUN_CHECKM2}" "${CHECKM2_DIR}/quality_report.tsv" "${RUN_GTDBTK}" \
-                    "${RUN_COVERM}" "${COMPLETENESS}" "${CONTAMINATION}" "${COVERM_METHODS}" "${SIF_R_URI}" ;;
+            12a_taxonomy_summary)
+                printf 'schema_version=1\n'
+                printf 'generator_version=%s\n' "$(sha256sum "${SUMMARY_GENERATOR}" 2>/dev/null | awk '{print $1}')"
+                printf 'sample_manifest_fingerprint=%s\n' "$(sha256sum "${SAMPLE_MANIFEST_ACTIVE:-${FASTP_CLEAN_SAMPLE_MANIFEST:-${RAW_SAMPLE_MANIFEST}}}" 2>/dev/null | awk '{print $1}')"
+                printf 'kraken2_enabled=%s\n' "${RUN_KRAKEN2}"
+                printf 'bracken_enabled=%s\n' "${RUN_BRACKEN:-true}"
+                printf 'bracken_read_len=%s\n' "${BRACKEN_READ_LEN}"
+                printf 'bracken_tax_level=%s\n' "${BRACKEN_TAX_LEVEL}"
+                printf 'bracken_threshold=%s\n' "${BRACKEN_THRESHOLD}"
+                if [[ "${RUN_KRAKEN2}" == true ]]; then
+                    local sample
+                    for sample in "${ACTIVE_SAMPLE_IDS[@]}"; do
+                        append_file_fingerprint "kraken_report_${sample}" "${KRAKEN2_DIR}/kraken_report_${sample}.txt"
+                        if [[ "${RUN_BRACKEN:-true}" == true ]]; then
+                            append_file_fingerprint "bracken_${sample}" "${KRAKEN2_DIR}/bracken_${sample}.txt"
+                        fi
+                    done
+                fi ;;
+            12b_mag_summary)
+                printf 'schema_version=1\n'
+                printf 'generator_version=%s\n' "$(sha256sum "${SUMMARY_GENERATOR}" 2>/dev/null | awk '{print $1}')"
+                printf 'checkm2_enabled=%s\n' "${RUN_CHECKM2}"
+                printf 'filtering_enabled=%s\n' "${RUN_MAG_FILTERING}"
+                printf 'gtdbtk_enabled=%s\n' "${RUN_GTDBTK}"
+                printf 'coverm_enabled=%s\n' "${RUN_COVERM}"
+                printf 'min_completeness=%s\nmax_contamination=%s\n' "${MIN_COMPLETENESS}" "${MAX_CONTAMINATION}"
+                printf 'coverm_methods=%s\n' "${COVERM_METHODS}"
+                if [[ "${RUN_CHECKM2}" == true ]]; then
+                    append_file_fingerprint checkm2_report "${CHECKM2_DIR}/quality_report.tsv"
+                fi
+                if [[ "${RUN_MAG_FILTERING}" == true ]]; then
+                    append_file_fingerprint mag_filter_manifest "${MAG_FILTER_MANIFEST}"
+                    append_fasta_bins_manifest retained_mag "${MAGS_DIR}"
+                fi
+                if [[ "${RUN_GTDBTK}" == true ]]; then
+                    append_file_fingerprint gtdbtk_bac "${GTDBTK_DIR}/gtdbtk.bac120.summary.tsv"
+                    append_file_fingerprint gtdbtk_ar "${GTDBTK_DIR}/gtdbtk.ar53.summary.tsv"
+                fi
+                if [[ "${RUN_COVERM}" == true ]]; then
+                    local sample
+                    for sample in "${ACTIVE_SAMPLE_IDS[@]}"; do
+                        append_file_fingerprint "coverm_abundance_${sample}" "${ABUNDANCE_DIR}/abundance_${sample}.tsv"
+                    done
+                    printf 'sample_manifest_fingerprint=%s\n' "$(sha256sum "${SAMPLE_MANIFEST_ACTIVE:-${FASTP_CLEAN_SAMPLE_MANIFEST:-${RAW_SAMPLE_MANIFEST}}}" 2>/dev/null | awk '{print $1}')"
+                fi ;;
+            12c_run_overview)
+                printf 'schema_version=1\n'
+                printf 'generator_version=%s\n' "$(sha256sum "${SUMMARY_GENERATOR}" 2>/dev/null | awk '{print $1}')"
+                append_file_fingerprint resume_plan "${RESUME_PLAN_FILE}"
+                append_file_fingerprint run_status "${RUN_STATUS_FILE}"
+                append_file_fingerprint software_inventory "${LOGS_DIR}/software_versions.tsv"
+                append_file_fingerprint database_inventory "${LOGS_DIR}/database_versions.tsv"
+                printf 'profile=%s\nthreads=%s\n' "${REQUESTED_PROFILE}" "${THREADS}"
+                printf 'taxonomy_summary_status=%s\n' "$([[ -s "${SUMMARY_DIR}/taxonomy_summary.tsv" ]] && echo available || echo "${STAGE_FINAL_STATUS[12a_taxonomy_summary]:-not-applicable}")"
+                printf 'mag_summary_status=%s\n' "$([[ -s "${SUMMARY_DIR}/mag_summary.tsv" ]] && echo available || echo "${STAGE_FINAL_STATUS[12b_mag_summary]:-not-applicable}")" ;;
         esac
     }
 }
@@ -1796,7 +3193,8 @@ validate_step_products() {
                 return 1
             fi ;;
         09_filter_mags)
-            require_files_matching "${MAGS_DIR}" "*.fa" "retained MAG FASTA" ;;
+            require_files_matching "${MAGS_DIR}" "*.fa" "retained MAG FASTA" &&
+                require_nonempty_file "${MAG_FILTER_MANIFEST}" "MAG filtering manifest" ;;
         10_gtdbtk)
             for path in "${GTDBTK_DIR}/gtdbtk.bac120.summary.tsv" "${GTDBTK_DIR}/gtdbtk.ar53.summary.tsv"; do
                 if [[ -s "${path}" ]] && awk 'NR > 1 && NF { found=1 } END { exit !found }' "${path}"; then
@@ -1816,10 +3214,25 @@ validate_step_products() {
             for sample in "${samples[@]}"; do
                 require_nonempty_file "${ABUNDANCE_DIR}/abundance_${sample}.tsv" "CoverM abundance for ${sample}" || return 1
             done ;;
-        12_summary)
-            require_nonempty_file "${SUMMARY_DIR}/final_summary.tsv" "final summary" || return 1
-            if ! awk 'NR > 1 && NF { found=1 } END { exit !found }' "${SUMMARY_DIR}/final_summary.tsv"; then
-                log_error "[Validation] final_summary.tsv has no data rows."
+        12a_taxonomy_summary)
+            require_nonempty_file "${SUMMARY_DIR}/taxonomy_summary.tsv" "taxonomy summary" || return 1
+            require_nonempty_file "${SUMMARY_DIR}/taxonomy_summary.meta.json" "taxonomy metadata" || return 1
+            if ! awk 'NR > 1 && NF { found=1 } END { exit !found }' "${SUMMARY_DIR}/taxonomy_summary.tsv"; then
+                log_error "[Validation] taxonomy_summary.tsv has no data rows."
+                return 1
+            fi ;;
+        12b_mag_summary)
+            require_nonempty_file "${SUMMARY_DIR}/mag_summary.tsv" "MAG summary" || return 1
+            require_nonempty_file "${SUMMARY_DIR}/mag_summary.meta.json" "MAG metadata" || return 1
+            if ! awk 'NR > 1 && NF { found=1 } END { exit !found }' "${SUMMARY_DIR}/mag_summary.tsv"; then
+                log_error "[Validation] mag_summary.tsv has no data rows."
+                return 1
+            fi ;;
+        12c_run_overview)
+            require_nonempty_file "${SUMMARY_DIR}/run_overview.tsv" "run overview" || return 1
+            require_nonempty_file "${SUMMARY_DIR}/run_overview.meta.json" "run overview metadata" || return 1
+            if ! awk 'NR > 1 && NF { found=1 } END { exit !found }' "${SUMMARY_DIR}/run_overview.tsv"; then
+                log_error "[Validation] run_overview.tsv has no data rows."
                 return 1
             fi ;;
         *)
@@ -1840,10 +3253,12 @@ describe_step_validations() {
         06_refinement) log_info "[Validation] Would require valid refined bins in ${REFINED_BINS_DIR}." ;;
         07_reassembly) log_info "[Validation] Would require at least one non-empty reassembled *.fa bin." ;;
         08_checkm2) log_info "[Validation] Would require a non-empty quality_report.tsv with at least one data row." ;;
-        09_filter_mags) log_info "[Validation] Would require at least one non-empty retained MAG FASTA." ;;
+        09_filter_mags) log_info "[Validation] Would require retained MAG FASTAs and ${MAG_FILTER_MANIFEST}." ;;
         10_gtdbtk) log_info "[Validation] Would require a non-empty GTDB-Tk summary containing a data row." ;;
         11_coverm) log_info "[Validation] Would require a non-empty abundance TSV for every sample." ;;
-        12_summary) log_info "[Validation] Would require a non-empty final_summary.tsv with at least one data row." ;;
+        12a_taxonomy_summary) log_info "[Validation] Would require a non-empty taxonomy_summary.tsv and metadata." ;;
+        12b_mag_summary) log_info "[Validation] Would require a non-empty mag_summary.tsv and metadata." ;;
+        12c_run_overview) log_info "[Validation] Would require a non-empty run_overview.tsv and metadata." ;;
         *) log_error "[Validation] Unknown pipeline step: $1"; return 1 ;;
     esac
 }
@@ -1867,7 +3282,9 @@ checkpoint_stage_enabled() {
         09_filter_mags) [[ "${RUN_MAG_FILTERING}" == true ]] ;;
         10_gtdbtk) [[ "${RUN_GTDBTK}" == true ]] ;;
         11_coverm) [[ "${RUN_COVERM}" == true ]] ;;
-        12_summary) [[ "${RUN_SUMMARY}" == true ]] ;;
+        12a_taxonomy_summary) [[ "${RUN_SUMMARY}" == true && "${RUN_TAXONOMY_SUMMARY}" == true && "${RUN_KRAKEN2}" == true ]] ;;
+        12b_mag_summary) [[ "${RUN_SUMMARY}" == true && "${RUN_MAG_SUMMARY}" == true && ( "${RUN_CHECKM2}" == true || "${RUN_MAG_FILTERING}" == true || "${RUN_GTDBTK}" == true || "${RUN_COVERM}" == true ) ]] ;;
+        12c_run_overview) [[ "${RUN_SUMMARY}" == true && "${RUN_RUN_OVERVIEW}" == true ]] ;;
         *) return 1 ;;
     esac
 }
@@ -1910,6 +3327,8 @@ is_done() {
         fi
         return 1
     fi
+    assert_runtime_identity_frozen "${step}" || exit 1
+    assert_database_identity_frozen "${step}" || exit 1
     if [[ -z "${STAGE_FROZEN_EXTERNAL[$step]:-}" || \
           "$(stage_external_fingerprint "${step}")" != "${STAGE_FROZEN_EXTERNAL[$step]}" ]]; then
         log_error "External inputs changed after the resume plan was frozen for ${step}; aborting without replanning."
@@ -1924,7 +3343,8 @@ is_done() {
     recorded_config="$(cat "${CHECKPOINT_DIR}/${step}.config")"
     comparable_current="$(comparable_checkpoint_manifest "${step}" "${current_config}")"
     comparable_recorded="$(comparable_checkpoint_manifest "${step}" "${recorded_config}")"
-    if [[ "${comparable_recorded}" != "${comparable_current}" ]]; then
+    if [[ "${comparable_recorded}" != "${comparable_current}" ]] || \
+       ! checkpoint_identity_compatible "${step}" "${current_config}" "${recorded_config}"; then
         log_error "Checkpoint for ${step} no longer matches the frozen resume plan."
         exit 1
     fi
@@ -1940,14 +3360,115 @@ is_done() {
 
 comparable_checkpoint_manifest() {
     local step="$1" manifest="$2"
+    printf '%s\n' "${manifest}" | sed \
+        -e '/^effective_tool_version=/d' \
+        -e '/^tool_version_source=/d' \
+        -e '/^execution_mode=/d' \
+        -e '/^runtime_name=/d' \
+        -e '/^runtime_uri=/d' \
+        -e '/^runtime_path=/d' \
+        -e '/^runtime_size_bytes=/d' \
+        -e '/^runtime_mtime_ns=/d' \
+        -e '/^runtime_fingerprint_method=/d' \
+        -e '/^runtime_fingerprint=/d' \
+        -e '/^database_release_or_version=/d' \
+        -e '/^database_version_source=/d' \
+        -e '/^database_path=/d' \
+        -e '/^database_fingerprint_method=/d' \
+        -e '/^database_fingerprint=/d' \
+        -e '/^resource_[^=]*=/d' \
+        -e '/^image=/d' \
+        -e '/^image_uri=/d' \
+        -e '/^[[:alnum:]_]*_image=/d' \
+        -e '/^vamb_version=/d' \
+        -e '/^vamb_runtime=/d' \
+        -e '/^comebin_version=/d' \
+        -e '/^runtime=/d' \
+        -e '/^mamba_environment=/d' \
+        -e '/^db=/d' \
+        -e '/^data=/d' \
+        -e '/^kraken_db=/d' \
+        -e '/^checkm2_db=/d' \
+        -e '/^gtdbtk_data=/d' \
+        -e '/^refinement_mode=/d' \
+        -e '/^selected_binners=/d' \
+        -e '/^bins_source_requested=/d'
+}
+
+checkpoint_identity_compatible() {
+    local step="$1" current="$2" recorded="$3" tool key previous_version previous_method previous_fingerprint
+    local current_release previous_release current_method current_fingerprint previous_mode
+    local -a tools=()
+    if ! grep -q '^resource_[^=]*_version=' <<< "${recorded}"; then
+        log_warn "[Checkpoint] ${step} predates functional identity metadata; reusing under the non-destructive migration policy."
+        return 0
+    fi
+    previous_mode="$(awk -F= '$1=="execution_mode" {sub(/^[^=]*=/,""); print; exit}' <<< "${recorded}")"
+    [[ -z "${previous_mode}" || "${previous_mode}" == "${EXEC_MODE}" ]] || return 1
+    mapfile -t tools < <(inventory_stage_tools "${step}")
+    for tool in "${tools[@]}"; do
+        key="${step}|${tool}"
+        previous_version="$(awk -F= -v key="resource_${tool}_version" '$1==key {sub(/^[^=]*=/,""); print; exit}' <<< "${recorded}")"
+        previous_method="$(awk -F= -v key="resource_${tool}_runtime_fingerprint_method" '$1==key {sub(/^[^=]*=/,""); print; exit}' <<< "${recorded}")"
+        previous_fingerprint="$(awk -F= -v key="resource_${tool}_runtime_fingerprint" '$1==key {sub(/^[^=]*=/,""); print; exit}' <<< "${recorded}")"
+        if [[ "${ID_STATUS[$key]:-unknown}" == unavailable ]]; then
+            if [[ "${previous_fingerprint:-unknown}" == unknown && "${previous_version:-unknown}" == unknown ]]; then
+                log_warn "[Checkpoint] ${step}/${tool} checkpoint has neither known version nor fingerprint."
+                return 1
+            fi
+            continue
+        fi
+        current_method="${ID_RUNTIME_METHOD[$key]:-unknown}"
+        current_fingerprint="${ID_RUNTIME_FINGERPRINT[$key]:-unknown}"
+        if [[ -n "${previous_fingerprint}" && "${previous_fingerprint}" != unknown && \
+              "${current_fingerprint}" != unknown ]]; then
+            [[ "${previous_method}" == "${current_method}" && \
+               "${previous_fingerprint}" == "${current_fingerprint}" ]] || return 1
+        elif [[ -n "${previous_version}" && "${previous_version}" != unknown && \
+                "${ID_VERSION[$key]:-unknown}" != unknown ]]; then
+            [[ "${previous_version}" == "${ID_VERSION[$key]}" ]] || return 1
+        else
+            log_warn "[Checkpoint] ${step}/${tool} has no comparable known runtime identity."
+            return 1
+        fi
+        if [[ -n "${previous_version}" && "${previous_version}" != unknown && \
+              "${ID_VERSION[$key]:-unknown}" != unknown && \
+              "${previous_version}" != "${ID_VERSION[$key]}" ]]; then
+            return 1
+        fi
+    done
     case "${step}" in
-        06_refinement)
-            printf '%s\n' "${manifest}" | sed '/^refinement_mode=/d' ;;
-        08_checkm2)
-            printf '%s\n' "${manifest}" | sed -e '/^selected_binners=/d' \
-                -e '/^refinement_mode=/d' -e '/^bins_source_requested=/d' ;;
-        *) printf '%s\n' "${manifest}" ;;
+        03_kraken2) key="${step}|kraken2-bracken" ;;
+        08_checkm2) key="${step}|checkm2" ;;
+        10_gtdbtk) key="${step}|gtdbtk" ;;
+        *) return 0 ;;
     esac
+    previous_fingerprint="$(awk -F= '$1=="database_fingerprint" {sub(/^[^=]*=/,""); print; exit}' <<< "${recorded}")"
+    previous_method="$(awk -F= '$1=="database_fingerprint_method" {sub(/^[^=]*=/,""); print; exit}' <<< "${recorded}")"
+    previous_release="$(awk -F= '$1=="database_release_or_version" {sub(/^[^=]*=/,""); print; exit}' <<< "${recorded}")"
+    if [[ "${ID_DATABASE_STATUS[$key]:-unknown}" == unavailable ]]; then
+        if [[ "${previous_fingerprint:-unknown}" == unknown && "${previous_release:-unknown}" == unknown ]]; then
+            log_warn "[Checkpoint] ${step} database checkpoint has neither known release nor fingerprint."
+            return 1
+        fi
+        return 0
+    fi
+    current_fingerprint="${ID_DATABASE_FINGERPRINT[$key]:-unknown}"
+    current_method="${ID_DATABASE_METHOD[$key]:-unknown}"
+    current_release="${ID_DATABASE_RELEASE[$key]:-unknown}"
+    if [[ -n "${previous_fingerprint}" && "${previous_fingerprint}" != unknown && \
+          "${current_fingerprint}" != unknown ]]; then
+        [[ "${previous_method}" == "${current_method}" && \
+           "${previous_fingerprint}" == "${current_fingerprint}" ]] || return 1
+    elif [[ -n "${previous_release}" && "${previous_release}" != unknown && \
+            "${current_release}" != unknown ]]; then
+        [[ "${previous_release}" == "${current_release}" ]] || return 1
+    else
+        log_warn "[Checkpoint] ${step} has no comparable known database identity."
+        return 1
+    fi
+    [[ "${previous_release}" == unknown || "${current_release}" == unknown || \
+       "${previous_release}" == "${current_release}" ]]
 }
 
 stage_external_fingerprint() {
@@ -1989,15 +3510,9 @@ stage_external_fingerprint() {
                 [[ -n "${BAM_DIR_ACTIVE}" ]] && paths+=("${BAM_DIR_ACTIVE}")
                 [[ -n "${BAM_MANIFEST_INPUT}" ]] && paths+=("${BAM_MANIFEST_ACTIVE}")
             fi ;;
-        08_checkm2) [[ -n "${CHECKM2_DB}" ]] && paths+=("${CHECKM2_DB}") ;;
-        10_gtdbtk) [[ -n "${GTDBTK_DATA_PATH}" ]] && paths+=("${GTDBTK_DATA_PATH}") ;;
     esac
     if [[ "${step}" == 04_mapping && -n "${CONTIGS}" ]]; then
         paths+=("${CONTIGS}")
-    fi
-    if [[ "${step}" == 03_kraken2 && -d "${KRAKEN2_DB}" ]]; then
-        while IFS= read -r -d '' path; do paths+=("${path}"); done \
-            < <(find "${KRAKEN2_DB}" -maxdepth 2 -type f -print0 | sort -z)
     fi
     for path in "${paths[@]}"; do
         if [[ -e "${path}" ]]; then
@@ -2057,6 +3572,10 @@ apply_restart_cleanup() {
 run_stage() {
     local id="$1" function_name="$2" action="${STAGE_ACTION[$1]:-disabled}"
     stage_is_active "${id}" || return 0
+    if stage_action_requires_execution "${id}"; then
+        assert_runtime_identity_frozen "${id}" || return 1
+        assert_database_identity_frozen "${id}" || return 1
+    fi
     CURRENT_STAGE="${id}"
     STAGE_START_TIME["${id}"]="$(date -Is)"
     STAGE_FINAL_STATUS["${id}"]=not-reached
@@ -2090,6 +3609,42 @@ pipeline_error() {
             update_run_status "${id}" not-reached || true
         fi
     done
+    if [[ -x "${SUMMARY_GENERATOR:-}" && "${DRY_RUN:-false}" != true && -d "${OUTDIR:-}" ]]; then
+        local tax_stat="not-applicable" mag_stat="not-applicable"
+        [[ -s "${SUMMARY_DIR:-}/taxonomy_summary.tsv" ]] && tax_stat="available"
+        [[ -s "${SUMMARY_DIR:-}/mag_summary.tsv" ]] && mag_stat="available"
+        python3 "${SUMMARY_GENERATOR}" overview \
+            --outdir "${SUMMARY_DIR:-${OUTDIR}/12_summary}" \
+            --pipeline-outdir "${OUTDIR}" \
+            --pipeline-version "${PIPELINE_VERSION:-2.0.0}" \
+            --run-id "${RUN_ID:-run_${$}}" \
+            --profile "${REQUESTED_PROFILE:-custom}" \
+            --execution-mode "${EXEC_MODE:-apptainer}" \
+            --resume-plan "${OUTDIR}/resume_plan.tsv" \
+            --run-status "${OUTDIR}/run_status.tsv" \
+            --sample-manifest "${SAMPLE_MANIFEST_ACTIVE:-}" \
+            --reads-source "${ACTIVE_READS_SOURCE:-raw}" \
+            --assembly-path "${CONTIGS:-}" \
+            --assembly-source "$([[ -n "${ASSEMBLY_IN:-}" ]] && echo external || echo megahit)" \
+            --bins-source-requested "${BINS_SOURCE:-}" \
+            --bins-source-resolved "${BINS_SOURCE_RESOLVED:-}" \
+            --external-bins-fingerprint "${EXTERNAL_BINS_FINGERPRINT:-}" \
+            --threads "${THREADS:-1}" \
+            --min-completeness "${MIN_COMPLETENESS:-70}" \
+            --max-contamination "${MAX_CONTAMINATION:-10}" \
+            --comebin-device "${COMEBIN_DEVICE:-cpu}" \
+            --enabled-stages "${STAGE_IDS[*]:-}" \
+            --refinement-mode "${REFINEMENT_MODE:-auto}" \
+            --reassembly-enabled "${RUN_REASSEMBLY:-false}" \
+            --checkpoint-dir "${CHECKPOINT_DIR:-${OUTDIR}/.checkpoints}" \
+            --taxonomy-summary-status "${tax_stat}" \
+            --mag-summary-status "${mag_stat}" \
+            --software-inventory "${LOGS_DIR:-${OUTDIR}/logs}/software_versions.tsv" \
+            --database-inventory "${LOGS_DIR:-${OUTDIR}/logs}/database_versions.tsv" \
+            --log-reference "${LOGS_DIR:-${OUTDIR}/logs}" \
+            --final-status "failed" \
+            --errors-count 1 >/dev/null 2>&1 || true
+    fi
     printf '[FATAL] Pipeline failed with exit code %s at line %s. Check logs in %s/logs/.\n' \
         "${status}" "${line}" "${OUTDIR}" >&2
     exit "${status}"
@@ -2132,7 +3687,8 @@ pipeline_exit() {
 trap 'pipeline_exit "$?"' EXIT
 
 mark_done() {
-    local step="$1"
+    local step="$1" tool key
+    local -a stage_tools=()
 
     if [[ "${DRY_RUN}" == true ]]; then
         describe_step_validations "${step}"
@@ -2142,6 +3698,17 @@ mark_done() {
     fi
 
     validate_step_products "${step}" || return 1
+
+    mapfile -t stage_tools < <(inventory_stage_tools "${step}")
+    for tool in "${stage_tools[@]}"; do
+        key="${step}|${tool}"
+        if [[ "${ID_VERSION[$key]:-unknown}" == unknown && \
+              "${ID_RUNTIME_FINGERPRINT[$key]:-unknown}" == unknown ]]; then
+            log_error "[Checkpoint] Refusing to write checkpoint for ${step}: ${tool} has neither a reliable version nor a functional fingerprint."
+            return 1
+        fi
+    done
+
     checkpoint_config_manifest "${step}" > "${CHECKPOINT_DIR}/${step}.config"
     touch "${CHECKPOINT_DIR}/${step}.done"
     STAGE_CHECKPOINT_WRITTEN["${step}"]=true
@@ -2163,9 +3730,14 @@ VAMB_FINAL_BINS_DIR="${VAMB_DIR}/final_bins"
 METABINNER_FINAL_BINS_DIR="${METABINNER_DIR}/final_bins"
 COMEBIN_FINAL_BINS_DIR="${COMEBIN_DIR}/final_bins"
 REFINED_BINS_DIR="${REFINEMENT_DIR}/metawrap_${METAWRAP_COMPLETENESS}_${METAWRAP_CONTAMINATION}_bins"
+EXTERNAL_BINS_CACHE_ROOT="${OUTDIR}/00_inputs/external_bins"
+EXTERNAL_BINS_CURRENT="${EXTERNAL_BINS_CACHE_ROOT}/current"
+EXTERNAL_FINAL_BINS_DIR="${EXTERNAL_BINS_CURRENT}/final_bins"
+EXTERNAL_BINS_MANIFEST="${EXTERNAL_BINS_CURRENT}/external_bins_manifest.tsv"
 REASSEMBLY_DIR="${OUTDIR}/07_reassembly"
 CHECKM2_DIR="${OUTDIR}/08_checkm2"
 MAGS_DIR="${OUTDIR}/09_mags"
+MAG_FILTER_MANIFEST="${MAGS_DIR}/mag_filter_manifest.tsv"
 GTDBTK_DIR="${OUTDIR}/10_gtdbtk"
 ABUNDANCE_DIR="${OUTDIR}/11_abundance"
 SUMMARY_DIR="${OUTDIR}/12_summary"
@@ -2181,9 +3753,19 @@ SORTED_BAMS=()
 ACTIVE_BAMS=()
 ACTIVE_BAM_INDEXES=()
 ACTIVE_BAM_SAMPLE_IDS=()
+INPUT_SAMPLE_IDS=()
+INPUT_R1_FILES=()
+INPUT_R2_FILES=()
 DEPTH_FILE=""
 BINS_FOR_QC=""
 BINS_FOR_REASSEMBLY=""
+SAMPLE_MANIFESTS_DIR="${OUTDIR}/00_inputs/manifests"
+RAW_SAMPLE_MANIFEST="${SAMPLE_MANIFESTS_DIR}/raw_samples.tsv"
+RAW_SAMPLE_METADATA="${SAMPLE_MANIFESTS_DIR}/raw_samples.meta.json"
+EXTERNAL_CLEAN_SAMPLE_MANIFEST="${SAMPLE_MANIFESTS_DIR}/external_clean_samples.tsv"
+EXTERNAL_CLEAN_SAMPLE_METADATA="${SAMPLE_MANIFESTS_DIR}/external_clean_samples.meta.json"
+FASTP_CLEAN_SAMPLE_MANIFEST="${QC_DIR}/fastp_clean_samples.tsv"
+FASTP_CLEAN_SAMPLE_METADATA="${QC_DIR}/fastp_clean_samples.meta.json"
 HQ_BINS_DIR=""
 BINNING_RESOLUTION_ERRORS=0
 # Resource detection state (populated by detect_resources)
@@ -2191,7 +3773,8 @@ _PHYS_CORES=0
 _PHYS_MEM_GB=0
 
 STAGE_IDS=(01_fastp 03_kraken2 02_megahit 04_mapping 05a_vamb 05b_metabinner 05c_comebin
-           06_refinement 07_reassembly 08_checkm2 09_filter_mags 10_gtdbtk 11_coverm 12_summary)
+           06_refinement 07_reassembly 08_checkm2 09_filter_mags 10_gtdbtk 11_coverm
+           12a_taxonomy_summary 12b_mag_summary 12c_run_overview)
 
 resolve_stage_id() {
     case "$1" in
@@ -2208,9 +3791,14 @@ resolve_stage_id() {
         mag-filtering) printf '%s\n' 09_filter_mags ;;
         gtdbtk) printf '%s\n' 10_gtdbtk ;;
         coverm) printf '%s\n' 11_coverm ;;
-        summary) printf '%s\n' 12_summary ;;
+        taxonomy-summary) printf '%s\n' 12a_taxonomy_summary ;;
+        mag-summary) printf '%s\n' 12b_mag_summary ;;
+        run-overview) printf '%s\n' 12c_run_overview ;;
+        summary)
+            log_error "The monolithic 'summary' stage has been replaced by 'taxonomy-summary', 'mag-summary', and 'run-overview'. Please specify one of these canonical stage names."
+            return 1 ;;
         *)
-            log_error "Unknown stage '$1'. Allowed stages: fastp, kraken2, megahit, mapping, vamb, metabinner, comebin, refinement, reassembly, checkm2, mag-filtering, gtdbtk, coverm, summary."
+            log_error "Unknown stage '$1'. Allowed stages: fastp, kraken2, megahit, mapping, vamb, metabinner, comebin, refinement, reassembly, checkm2, mag-filtering, gtdbtk, coverm, taxonomy-summary, mag-summary, run-overview."
             return 1 ;;
     esac
 }
@@ -2230,6 +3818,9 @@ get_stage_public_name() {
         09_filter_mags) printf '%s\n' mag-filtering ;;
         10_gtdbtk) printf '%s\n' gtdbtk ;;
         11_coverm) printf '%s\n' coverm ;;
+        12a_taxonomy_summary) printf '%s\n' taxonomy-summary ;;
+        12b_mag_summary) printf '%s\n' mag-summary ;;
+        12c_run_overview) printf '%s\n' run-overview ;;
         12_summary) printf '%s\n' summary ;;
         *) return 1 ;;
     esac
@@ -2250,7 +3841,10 @@ get_stage_display_name() {
         09_filter_mags) printf '%s\n' "MAG quality filtering" ;;
         10_gtdbtk) printf '%s\n' "Taxonomic classification with GTDB-Tk" ;;
         11_coverm) printf '%s\n' "MAG abundance estimation with CoverM" ;;
-        12_summary) printf '%s\n' "Final summary" ;;
+        12a_taxonomy_summary) printf '%s\n' "Read-based taxonomic summary" ;;
+        12b_mag_summary) printf '%s\n' "MAG quality, taxonomy, and abundance summary" ;;
+        12c_run_overview) printf '%s\n' "Pipeline run overview and execution metrics" ;;
+        12_summary) printf '%s\n' "Legacy summary" ;;
         *) return 1 ;;
     esac
 }
@@ -2984,7 +4578,17 @@ classify_stages() {
             09_filter_mags) [[ "${RUN_MAG_FILTERING}" == true ]] && state=active ;;
             10_gtdbtk) [[ "${RUN_GTDBTK}" == true ]] && state=active ;;
             11_coverm) [[ "${RUN_COVERM}" == true ]] && state=active ;;
-            12_summary) [[ "${RUN_SUMMARY}" == true ]] && state=active ;;
+            12a_taxonomy_summary)
+                if [[ "${RUN_SUMMARY}" != true || "${RUN_TAXONOMY_SUMMARY}" != true ]]; then state=disabled
+                elif [[ "${RUN_KRAKEN2}" == true ]]; then state=active
+                else state=not-applicable; fi ;;
+            12b_mag_summary)
+                if [[ "${RUN_SUMMARY}" != true || "${RUN_MAG_SUMMARY}" != true ]]; then state=disabled
+                elif [[ "${RUN_CHECKM2}" == true || "${RUN_MAG_FILTERING}" == true || "${RUN_GTDBTK}" == true || "${RUN_COVERM}" == true ]]; then state=active
+                else state=not-applicable; fi ;;
+            12c_run_overview)
+                if [[ "${RUN_SUMMARY}" != true || "${RUN_RUN_OVERVIEW}" != true ]]; then state=disabled
+                else state=active; fi ;;
         esac
         STAGE_STATE["${id}"]="${state}"
         STAGE_ACTION["${id}"]="${state}"
@@ -3045,10 +4649,19 @@ build_effective_dependency_graph() {
     [[ "${RUN_CHECKM2}" == true ]] && [[ "${RUN_MAG_FILTERING}" == true ]] && _graph_add_edge 08_checkm2 09_filter_mags
     [[ "${RUN_MAG_FILTERING}" == true && "${RUN_GTDBTK}" == true ]] && _graph_add_edge 09_filter_mags 10_gtdbtk
     [[ "${RUN_MAG_FILTERING}" == true && "${RUN_COVERM}" == true ]] && _graph_add_edge 09_filter_mags 11_coverm
-    if [[ "${RUN_MAG_FILTERING}" == true && "${RUN_SUMMARY}" == true ]]; then _graph_add_edge 09_filter_mags 12_summary; fi
-    if [[ "${RUN_CHECKM2}" == true && "${RUN_SUMMARY}" == true ]]; then _graph_add_edge 08_checkm2 12_summary; fi
-    if [[ "${RUN_GTDBTK}" == true && "${RUN_SUMMARY}" == true ]]; then _graph_add_edge 10_gtdbtk 12_summary; fi
-    if [[ "${RUN_COVERM}" == true && "${RUN_SUMMARY}" == true ]]; then _graph_add_edge 11_coverm 12_summary; fi
+    if [[ "${RUN_KRAKEN2}" == true && "${RUN_SUMMARY}" == true && "${RUN_TAXONOMY_SUMMARY}" == true ]]; then
+        _graph_add_edge 03_kraken2 12a_taxonomy_summary
+    fi
+    if [[ "${RUN_SUMMARY}" == true && "${RUN_MAG_SUMMARY}" == true ]]; then
+        [[ "${RUN_CHECKM2}" == true ]] && _graph_add_edge 08_checkm2 12b_mag_summary
+        [[ "${RUN_MAG_FILTERING}" == true ]] && _graph_add_edge 09_filter_mags 12b_mag_summary
+        [[ "${RUN_GTDBTK}" == true ]] && _graph_add_edge 10_gtdbtk 12b_mag_summary
+        [[ "${RUN_COVERM}" == true ]] && _graph_add_edge 11_coverm 12b_mag_summary
+    fi
+    if [[ "${RUN_SUMMARY}" == true && "${RUN_RUN_OVERVIEW}" == true ]]; then
+        stage_is_active 12a_taxonomy_summary && _graph_add_edge 12a_taxonomy_summary 12c_run_overview
+        stage_is_active 12b_mag_summary && _graph_add_edge 12b_mag_summary 12c_run_overview
+    fi
 }
 
 get_direct_dependents() {
@@ -3105,8 +4718,10 @@ configure_stage_actions() {
     local -a roots=() queue=()
     local -A visited=() unique_roots=()
 
+    check_legacy_summary_checkpoint
     classify_stages
     build_effective_dependency_graph
+    resolve_all_current_identities
     if [[ "${RESTART_REQUESTED}" == true ]]; then
         root="$(resolve_stage_id "${RESTART_FROM_NAME}")" || return 1
         stage_is_active "${root}" || {
@@ -3159,7 +4774,7 @@ configure_stage_actions() {
         done
     fi
 
-    local id checkpoint manifest current recorded
+    local id checkpoint manifest current recorded previous_min previous_max change_reason
     for id in "${STAGE_IDS[@]}"; do
         stage_is_active "${id}" || continue
         STAGE_FROZEN_EXTERNAL["${id}"]="$(stage_external_fingerprint "${id}")"
@@ -3176,9 +4791,28 @@ configure_stage_actions() {
         current="$(checkpoint_config_manifest "${id}")"
         recorded="$(cat "${manifest}")"
         if [[ "$(comparable_checkpoint_manifest "${id}" "${current}")" != \
-              "$(comparable_checkpoint_manifest "${id}" "${recorded}")" ]]; then
+              "$(comparable_checkpoint_manifest "${id}" "${recorded}")" ]] || \
+           ! checkpoint_identity_compatible "${id}" "${current}" "${recorded}"; then
             STAGE_ACTION["${id}"]=run
-            STAGE_REASON["${id}"]="checkpoint manifest changed"
+            if [[ "${id}" == 09_filter_mags ]]; then
+                previous_min="$(awk -F= '$1 == "min_completeness" {print substr($0, index($0, "=") + 1); exit}' <<< "${recorded}")"
+                previous_max="$(awk -F= '$1 == "max_contamination" {print substr($0, index($0, "=") + 1); exit}' <<< "${recorded}")"
+                change_reason="quality thresholds changed:"
+                if [[ "${previous_min}" != "${MIN_COMPLETENESS}" ]]; then
+                    change_reason+=" min_completeness ${previous_min} -> ${MIN_COMPLETENESS};"
+                fi
+                if [[ "${previous_max}" != "${MAX_CONTAMINATION}" ]]; then
+                    change_reason+=" max_contamination ${previous_max} -> ${MAX_CONTAMINATION};"
+                fi
+                if [[ "${previous_min}" != "${MIN_COMPLETENESS}" || \
+                      "${previous_max}" != "${MAX_CONTAMINATION}" ]]; then
+                    STAGE_REASON["${id}"]="${change_reason%;}"
+                else
+                    STAGE_REASON["${id}"]="checkpoint manifest changed"
+                fi
+            else
+                STAGE_REASON["${id}"]="checkpoint manifest changed"
+            fi
         elif ! validate_step_products "${id}" >/dev/null 2>&1; then
             STAGE_ACTION["${id}"]=run
             STAGE_REASON["${id}"]="checkpoint products are invalid"
@@ -3189,6 +4823,7 @@ configure_stage_actions() {
         STAGE_FROZEN_EXTERNAL["${id}"]="$(stage_external_fingerprint "${id}")"
     done
     propagate_rebuild_actions
+    validate_current_identity_plan || return 1
 }
 
 write_resume_plan() {
@@ -3287,11 +4922,24 @@ clean_stage_outputs() {
         09_filter_mags) paths=("${MAGS_DIR}") ;;
         10_gtdbtk) paths=("${GTDBTK_DIR}") ;;
         11_coverm) paths=("${ABUNDANCE_DIR}") ;;
-        12_summary) paths=("${SUMMARY_DIR}") ;;
+        12a_taxonomy_summary) paths=("${SUMMARY_DIR}/taxonomy_summary.tsv" "${SUMMARY_DIR}/taxonomy_summary.meta.json") ;;
+        12b_mag_summary) paths=("${SUMMARY_DIR}/mag_summary.tsv" "${SUMMARY_DIR}/mag_summary.meta.json") ;;
+        12c_run_overview) paths=("${SUMMARY_DIR}/run_overview.tsv" "${SUMMARY_DIR}/run_overview.meta.json") ;;
+        12_summary) paths=("${SUMMARY_DIR}/final_summary.tsv") ;;
         *) log_error "Cannot clean unknown stage ID: ${id}"; return 1 ;;
     esac
     for path in "${paths[@]}"; do
         assert_path_within_outdir "${path}" || return 1
+        local protected_path
+        protected_path="$(realpath -m "${path}")"
+        case "${protected_path}" in
+            "$(realpath -m "${LOGS_DIR}/inventory")"|\
+            "$(realpath -m "${LOGS_DIR}/inventory")"/*|\
+            "$(realpath -m "${LOGS_DIR}/software_versions.tsv")"|\
+            "$(realpath -m "${LOGS_DIR}/database_versions.tsv")")
+                log_error "Refusing to clean protected inventory path: ${path}"
+                return 1 ;;
+        esac
         if [[ "${id}" == 05a_vamb ]]; then
             local external_input external_input_abs output_abs
             for external_input in "${ASSEMBLY_IN}" "${JGI_DEPTH_FILE_ACTIVE}"; do
@@ -3354,6 +5002,58 @@ get_binner_bins_dir() {
     esac
 }
 
+prepare_external_bins_cache() {
+    local source_dir="$1" outdir_real="" external_real="" fingerprint=""
+    local -a external_bins=()
+    local entry="" name=""
+
+    if [[ -z "${source_dir}" ]]; then
+        log_error "--bins-dir requires a directory value."
+        return 1
+    fi
+    if [[ ! -d "${source_dir}" ]]; then
+        log_error "External bins directory not found: ${source_dir}"
+        return 1
+    fi
+
+    outdir_real="$(realpath -m "${OUTDIR}")"
+    external_real="$(realpath -- "${source_dir}")"
+
+    if [[ "${external_real}" == "/" ]]; then
+        log_error "External bins directory cannot be the filesystem root."
+        return 1
+    fi
+    if [[ "${external_real}" == "${outdir_real}" || "${external_real}" == "${outdir_real}/"* || "${outdir_real}" == "${external_real}" || "${outdir_real}" == "${external_real}/"* ]]; then
+        log_error "External bins directory cannot be OUTDIR or be inside/outside of each other in a way that cycles inputs and outputs: ${source_dir}"
+        return 1
+    fi
+
+    mkdir -p "${EXTERNAL_BINS_CURRENT}"
+    rm -rf -- "${EXTERNAL_FINAL_BINS_DIR}"
+    mkdir -p "${EXTERNAL_FINAL_BINS_DIR}"
+
+    mapfile -d '' -t external_bins < <(find "${external_real}" -mindepth 1 -maxdepth 1 -type f \( -name '*.fa' -o -name '*.fna' -o -name '*.fasta' \) -print0 | sort -z)
+    if (( ${#external_bins[@]} == 0 )); then
+        log_error "External bins directory contains no final bin FASTA files: ${source_dir}"
+        return 1
+    fi
+
+    for entry in "${external_bins[@]}"; do
+        name="$(basename "${entry}")"
+        name="${name%.*}.fa"
+        cp -a -- "${entry}" "${EXTERNAL_FINAL_BINS_DIR}/${name}"
+    done
+
+    validate_bins_dir "${EXTERNAL_FINAL_BINS_DIR}" "external final bins" || return 1
+
+    fingerprint="$(find "${EXTERNAL_FINAL_BINS_DIR}" -mindepth 1 -maxdepth 1 -type f -printf '%f\t%s\n' | sort | sha256sum | awk '{print $1}')"
+    printf '%s\t%s\t%s\n' "${external_real}" "${fingerprint}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${EXTERNAL_BINS_MANIFEST}"
+    BINS_FOR_QC="${EXTERNAL_FINAL_BINS_DIR}"
+    BINS_FOR_REASSEMBLY="${EXTERNAL_FINAL_BINS_DIR}"
+    BINS_SOURCE_RESOLVED="external"
+    return 0
+}
+
 resolve_binning_configuration() {
     local errors=0 method token canonical=""
     local input="${SELECTED_BINNERS}"
@@ -3365,9 +5065,26 @@ resolve_binning_configuration() {
         *) log_error "Invalid REFINEMENT_MODE '${REFINEMENT_MODE}' (expected auto, always, or never)."; errors=$((errors + 1)) ;;
     esac
     case "${BINS_SOURCE}" in
-        auto|vamb|metabinner|comebin|refined) ;;
-        *) log_error "Invalid BINS_SOURCE '${BINS_SOURCE}' (expected auto, vamb, metabinner, comebin, or refined)."; errors=$((errors + 1)) ;;
+        auto|vamb|metabinner|comebin|refined|external) ;;
+        *) log_error "Invalid BINS_SOURCE '${BINS_SOURCE}' (expected auto, vamb, metabinner, comebin, refined, or external)."; errors=$((errors + 1)) ;;
     esac
+
+    if [[ -n "${BINS_DIR_INPUT}" ]]; then
+        if [[ "${RUN_BINNING}" == true ]]; then
+            log_error "External bins supplied with --bins-dir cannot be combined with internal binning in this version. Use --no-binning, or remove --bins-dir."
+            errors=$((errors + 1))
+        fi
+        if [[ "${BINS_SOURCE}" != auto && "${BINS_SOURCE}" != external ]]; then
+            log_error "External bins supplied with --bins-dir require --bins-source auto or external."
+            errors=$((errors + 1))
+        fi
+        if (( errors == 0 )); then
+            BINS_SOURCE="external"
+            prepare_external_bins_cache "${BINS_DIR_INPUT}" || return 1
+        fi
+        BINNING_RESOLUTION_ERRORS="${errors}"
+        return $(( errors == 0 ))
+    fi
 
     SELECTED_BINNER_ARRAY=()
     if [[ -n "${input}" ]]; then
@@ -3401,6 +5118,10 @@ resolve_binning_configuration() {
     BINS_FOR_QC=""
     BINS_FOR_REASSEMBLY=""
 
+    if [[ "${BINS_SOURCE}" == external && -z "${BINS_DIR_INPUT}" ]]; then
+        log_error "--bins-source external requires --bins-dir DIR."
+        errors=$((errors + 1))
+    fi
     if [[ "${RUN_BINNING}" != true ]]; then
         if [[ "${BINS_SOURCE}" != auto ]]; then
             log_error "A non-auto --bins-source requires RUN_BINNING=true; external bins are not supported."
@@ -3487,13 +5208,14 @@ resolve_binning_configuration() {
 }
 
 resolve_active_reads() {
-    local source_dir="" source_kind="" r1 sample r2
-    local -a source_r1=()
-    local -a source_r2=()
+    local source_dir="" source_kind="" current_manifest="" current_metadata="" r1 sample r2
     local -A seen_samples=()
     ACTIVE_R1_FILES=()
     ACTIVE_R2_FILES=()
     ACTIVE_SAMPLE_IDS=()
+    INPUT_SAMPLE_IDS=()
+    INPUT_R1_FILES=()
+    INPUT_R2_FILES=()
 
     if [[ -n "${RAW_READS_DIR}" && -n "${CLEAN_READS_DIR}" ]]; then
         log_error "--reads-dir and --clean-reads-dir are mutually exclusive."
@@ -3505,20 +5227,25 @@ resolve_active_reads() {
     fi
 
     if [[ -n "${CLEAN_READS_DIR}" ]]; then
-        source_dir="${CLEAN_READS_DIR}"
+        source_dir="$(realpath -m "${CLEAN_READS_DIR}")"
         source_kind="external-clean"
-        ACTIVE_READS_DIR="$(realpath -m "${CLEAN_READS_DIR}")"
+        ACTIVE_READS_DIR="${source_dir}"
+        ACTIVE_READS_SOURCE="external-clean"
+        current_manifest="${EXTERNAL_CLEAN_SAMPLE_MANIFEST}"
+        current_metadata="${EXTERNAL_CLEAN_SAMPLE_METADATA}"
     elif [[ -n "${RAW_READS_DIR}" ]]; then
+        source_dir="$(realpath -m "${RAW_READS_DIR}")"
+        source_kind="raw"
+        RAW_READS_DIR="${source_dir}"
+        READS_DIR="${source_dir}"
         if [[ "${RUN_FASTP}" == true ]]; then
-            source_dir="${RAW_READS_DIR}"
-            source_kind="raw"
-            ACTIVE_READS_DIR="$(realpath -m "${QC_DIR}/trimmed")"
             ACTIVE_READS_SOURCE="fastp-clean"
+            ACTIVE_READS_DIR="$(realpath -m "${QC_DIR}/trimmed")"
         else
-            source_dir="${RAW_READS_DIR}"
-            source_kind="raw"
-            ACTIVE_READS_DIR="$(realpath -m "${RAW_READS_DIR}")"
             ACTIVE_READS_SOURCE="raw"
+            ACTIVE_READS_DIR="${source_dir}"
+            current_manifest="${RAW_SAMPLE_MANIFEST}"
+            current_metadata="${RAW_SAMPLE_METADATA}"
         fi
     elif [[ "${NEEDS_READS}" == true ]]; then
         log_error "An active stage requires reads; provide --reads-dir or --clean-reads-dir."
@@ -3529,69 +5256,59 @@ resolve_active_reads() {
         return 0
     fi
 
-    if [[ "${source_kind}" == external-clean ]]; then
-        ACTIVE_READS_SOURCE="external-clean"
-    fi
     if [[ ! -d "${source_dir}" ]]; then
         log_error "Read directory does not exist: ${source_dir}"
         return 1
     fi
-    source_dir="$(realpath "${source_dir}")"
-    if [[ "${source_kind}" == raw ]]; then
-        RAW_READS_DIR="${source_dir}"
-        READS_DIR="${source_dir}"
-    else
-        CLEAN_READS_DIR="${source_dir}"
-        ACTIVE_READS_DIR="${source_dir}"
-    fi
-    collect_files_by_suffix "${source_dir}" "${READ_SUFFIX_R1}" source_r1
-    collect_files_by_suffix "${source_dir}" "${READ_SUFFIX_R2}" source_r2
-    if [[ ${#source_r1[@]} -eq 0 ]]; then
-        log_error "No reads matching *${READ_SUFFIX_R1} found in ${source_dir}."
-        return 1
-    fi
-    if [[ ${#source_r1[@]} -ne ${#source_r2[@]} ]]; then
-        log_error "R1/R2 read counts differ in ${source_dir}: ${#source_r1[@]} R1, ${#source_r2[@]} R2."
-        return 1
+
+    if [[ "${RUN_FASTP}" == true && "${ACTIVE_READS_SOURCE}" == fastp-clean ]]; then
+        if [[ -s "${RAW_SAMPLE_MANIFEST}" && -f "${RAW_SAMPLE_MANIFEST}" ]]; then
+            load_sample_manifest "${RAW_SAMPLE_MANIFEST}" "raw" INPUT_SAMPLE_IDS INPUT_R1_FILES INPUT_R2_FILES || return 1
+        else
+            local candidate_tmp
+            candidate_tmp="$(mktemp "${TMPDIR:-/tmp}/.raw_sample_manifest.XXXXXX")"
+            build_sample_manifest_candidate "${source_dir}" "raw" "${candidate_tmp}" || return 1
+            if [[ "${DRY_RUN}" == true ]]; then
+                validate_sample_manifest "${candidate_tmp}" "raw" || {
+                    rm -f "${candidate_tmp}"
+                    return 1
+                }
+                rm -f "${candidate_tmp}"
+                log_info "[DRY-RUN] Candidate raw sample manifest validated for ${RAW_READS_DIR}."
+                return 0
+            fi
+            publish_sample_manifest "${candidate_tmp}" "${RAW_SAMPLE_MANIFEST}" "${RAW_SAMPLE_METADATA}" "raw" || return 1
+            rm -f "${candidate_tmp}"
+            load_sample_manifest "${RAW_SAMPLE_MANIFEST}" "raw" INPUT_SAMPLE_IDS INPUT_R1_FILES INPUT_R2_FILES || return 1
+        fi
+        ACTIVE_READS_DIR="$(realpath -m "${QC_DIR}/trimmed")"
+        return 0
     fi
 
-    for r1 in "${source_r1[@]}"; do
-        sample="$(basename "${r1}" "${READ_SUFFIX_R1}")"
-        if [[ -z "${sample}" ]]; then
-            log_error "Read file has an empty sample identifier: ${r1}"
-            return 1
+    if [[ -s "${current_manifest:-}" ]]; then
+        load_sample_manifest "${current_manifest}" "${source_kind}" ACTIVE_SAMPLE_IDS ACTIVE_R1_FILES ACTIVE_R2_FILES || return 1
+    else
+        local candidate_tmp
+        candidate_tmp="$(mktemp "${TMPDIR:-/tmp}/.${source_kind}_sample_manifest.XXXXXX")"
+        build_sample_manifest_candidate "${source_dir}" "${source_kind}" "${candidate_tmp}" || return 1
+        if [[ "${DRY_RUN}" == true ]]; then
+            validate_sample_manifest "${candidate_tmp}" "${source_kind}" || {
+                rm -f "${candidate_tmp}"
+                return 1
+            }
+            rm -f "${candidate_tmp}"
+            log_info "[DRY-RUN] Candidate ${source_kind} sample manifest validated for ${source_dir}."
+            return 0
         fi
-        if [[ -n "${seen_samples[$sample]:-}" ]]; then
-            log_error "Duplicate sample identifier: ${sample}"
-            return 1
-        fi
-        seen_samples["${sample}"]=1
-        r2="${source_dir}/${sample}${READ_SUFFIX_R2}"
-        if [[ ! -s "${r1}" ]]; then
-            log_error "R1 read is missing or empty: ${r1}"
-            return 1
-        fi
-        if [[ ! -s "${r2}" ]]; then
-            log_error "Matching R2 read is missing or empty: ${r2}"
-            return 1
-        fi
-        ACTIVE_SAMPLE_IDS+=("${sample}")
-        if [[ "${ACTIVE_READS_SOURCE}" == fastp-clean ]]; then
-            ACTIVE_R1_FILES+=("${ACTIVE_READS_DIR}/${sample}${READ_SUFFIX_R1}")
-            ACTIVE_R2_FILES+=("${ACTIVE_READS_DIR}/${sample}${READ_SUFFIX_R2}")
-        else
-            ACTIVE_R1_FILES+=("$(realpath -m "${r1}")")
-            ACTIVE_R2_FILES+=("$(realpath -m "${r2}")")
-        fi
-    done
-    if (( ${#ACTIVE_R1_FILES[@]} != ${#ACTIVE_R2_FILES[@]} )); then
-        log_error "R1/R2 read counts do not match."
+        publish_sample_manifest "${candidate_tmp}" "${current_manifest}" "${current_metadata}" "${source_kind}" || return 1
+        rm -f "${candidate_tmp}"
+        load_sample_manifest "${current_manifest}" "${source_kind}" ACTIVE_SAMPLE_IDS ACTIVE_R1_FILES ACTIVE_R2_FILES || return 1
+    fi
+    if (( ${#ACTIVE_R1_FILES[@]} != ${#ACTIVE_SAMPLE_IDS[@]} || ${#ACTIVE_R2_FILES[@]} != ${#ACTIVE_SAMPLE_IDS[@]} )); then
+        log_error "Manifest-loaded read arrays cannot be reconciled with sample IDs."
         return 1
     fi
-    if (( ${#ACTIVE_R1_FILES[@]} != ${#ACTIVE_SAMPLE_IDS[@]} )); then
-        log_error "Read pair counts do not match."
-        return 1
-    fi
+    return 0
 }
 
 # ── Resource Detection ────────────────────────────────────────────────────────
@@ -3661,6 +5378,12 @@ preflight_check() {
     log_info "Running pre-flight validation..."
     local errors="${BINNING_RESOLUTION_ERRORS}"
     local need_tools=false
+    if ! validate_percentage_threshold MIN_COMPLETENESS "${MIN_COMPLETENESS}"; then
+        errors=$((errors + 1))
+    fi
+    if ! validate_percentage_threshold MAX_CONTAMINATION "${MAX_CONTAMINATION}"; then
+        errors=$((errors + 1))
+    fi
     if ! resolve_coverage_inputs; then errors=$((errors + 1)); fi
     calculate_stage_needs
     if ! validate_stage_dependencies; then
@@ -3824,7 +5547,7 @@ preflight_check() {
                 checkm2) if [[ "${RUN_CHECKM2}" == true ]] && stage_action_requires_execution 08_checkm2; then need_tools=true; fi ;;
                 gtdbtk) if [[ "${RUN_GTDBTK}" == true ]] && stage_action_requires_execution 10_gtdbtk; then need_tools=true; fi ;;
                 coverm) if [[ "${RUN_COVERM}" == true ]] && stage_action_requires_execution 11_coverm; then need_tools=true; fi ;;
-                summary) if [[ "${RUN_SUMMARY}" == true ]] && stage_action_requires_execution 12_summary; then need_tools=true; fi ;;
+                summary|taxonomy-summary|mag-summary|run-overview) ;;
             esac
         fi
     done
@@ -3840,7 +5563,6 @@ preflight_check() {
         if [[ "${RUN_FASTP}" == true ]] && stage_action_requires_execution 01_fastp; then required_bins+=(fastp); fi
         if [[ "${RUN_MEGAHIT}" == true ]] && stage_action_requires_execution 02_megahit; then required_bins+=(megahit); fi
         if [[ "${RUN_KRAKEN2}" == true ]] && stage_action_requires_execution 03_kraken2; then required_bins+=(kraken2 bracken); fi
-        if [[ "${RUN_SUMMARY}" == true ]] && stage_action_requires_execution 12_summary; then required_bins+=(Rscript); fi
         for tool in "${required_bins[@]}"; do
             if ! command -v "${tool}" &>/dev/null; then
                 log_error "Required binary not found in PATH: ${tool}"
@@ -3912,6 +5634,12 @@ preflight_check() {
     log_info "Refinement mode: ${REFINEMENT_MODE}; effective: ${RUN_REFINEMENT_EFFECTIVE}."
     log_info "Bins source requested: ${BINS_SOURCE}; resolved: ${BINS_SOURCE_RESOLVED:-<none>}."
     log_info "Bins directory for QC: ${BINS_FOR_QC:-<none>}."
+    log_info "Minimum completeness  : ${MIN_COMPLETENESS}"
+    log_info "Maximum contamination : ${MAX_CONTAMINATION}"
+    log_info "Thresholds used       : ${MAG_FILTERING_APPLICABLE}"
+    if [[ "${MAG_FILTERING_APPLICABLE}" == true ]]; then
+        log_info "Retention rule        : completeness >= ${MIN_COMPLETENESS} AND contamination <= ${MAX_CONTAMINATION}"
+    fi
     log_info "Derived requirements: NEEDS_READS=${NEEDS_READS}, NEEDS_ASSEMBLY=${NEEDS_ASSEMBLY}, NEEDS_MAGS=${NEEDS_MAGS}."
     if [[ "${RUN_KRAKEN2}" == true ]]; then
         if [[ "${NEEDS_ASSEMBLY}" == true ]]; then
@@ -3926,7 +5654,7 @@ preflight_check() {
     fi
     local -a stage_status=()
     local stage_name stage_flag
-    for stage_name in fastp kraken2 megahit mapping binning refinement reassembly checkm2 mag-filtering gtdbtk coverm summary; do
+    for stage_name in fastp kraken2 megahit mapping binning refinement reassembly checkm2 mag-filtering gtdbtk coverm taxonomy-summary mag-summary run-overview; do
         case "${stage_name}" in
             fastp) stage_flag="${RUN_FASTP}" ;;
             kraken2) stage_flag="${RUN_KRAKEN2}" ;;
@@ -3939,7 +5667,9 @@ preflight_check() {
             mag-filtering) stage_flag="${RUN_MAG_FILTERING}" ;;
             gtdbtk) stage_flag="${RUN_GTDBTK}" ;;
             coverm) stage_flag="${RUN_COVERM}" ;;
-            summary) stage_flag="${RUN_SUMMARY}" ;;
+            taxonomy-summary) stage_flag=false; [[ "${RUN_SUMMARY}" == true && "${RUN_TAXONOMY_SUMMARY}" == true && "${RUN_KRAKEN2}" == true ]] && stage_flag=true ;;
+            mag-summary) stage_flag=false; [[ "${RUN_SUMMARY}" == true && "${RUN_MAG_SUMMARY}" == true && ( "${RUN_CHECKM2}" == true || "${RUN_MAG_FILTERING}" == true || "${RUN_GTDBTK}" == true || "${RUN_COVERM}" == true ) ]] && stage_flag=true ;;
+            run-overview) stage_flag=false; [[ "${RUN_SUMMARY}" == true && "${RUN_RUN_OVERVIEW}" == true ]] && stage_flag=true ;;
         esac
         if [[ "${stage_flag}" == true ]]; then
             stage_status+=("[RUN] ${stage_name}")
@@ -3984,49 +5714,44 @@ step_01_fastp() {
 
     if is_done "01_fastp"; then
         log_info "[Step 01] Checkpoint found — repopulating CLEAN arrays from existing trimmed files."
-        collect_files_by_suffix "${QC_DIR}/trimmed" "${READ_SUFFIX_R1}" CLEAN_R1_FILES
-        CLEAN_R2_FILES=()
-        for r1 in "${CLEAN_R1_FILES[@]}"; do
-            CLEAN_R2_FILES+=("${r1/${READ_SUFFIX_R1}/${READ_SUFFIX_R2}}")
-        done
-        ACTIVE_R1_FILES=("${CLEAN_R1_FILES[@]}")
-        ACTIVE_R2_FILES=("${CLEAN_R2_FILES[@]}")
-        log_info "[Step 01] Repopulated ${#CLEAN_R1_FILES[@]} sample(s) from checkpoint."
+        if [[ -s "${FASTP_CLEAN_SAMPLE_MANIFEST}" ]]; then
+            ACTIVE_READS_SOURCE="fastp-clean"
+            load_sample_manifest "${FASTP_CLEAN_SAMPLE_MANIFEST}" "fastp-clean" ACTIVE_SAMPLE_IDS ACTIVE_R1_FILES ACTIVE_R2_FILES || return 1
+        else
+            collect_files_by_suffix "${QC_DIR}/trimmed" "${READ_SUFFIX_R1}" CLEAN_R1_FILES
+            CLEAN_R2_FILES=()
+            for r1 in "${CLEAN_R1_FILES[@]}"; do
+                CLEAN_R2_FILES+=("${r1/${READ_SUFFIX_R1}/${READ_SUFFIX_R2}}")
+            done
+            ACTIVE_R1_FILES=("${CLEAN_R1_FILES[@]}")
+            ACTIVE_R2_FILES=("${CLEAN_R2_FILES[@]}")
+        fi
+        log_info "[Step 01] Repopulated ${#ACTIVE_R1_FILES[@]} sample(s) from checkpoint."
         return 0
     fi
 
     mkdir -p "${QC_DIR}/trimmed" "${QC_DIR}/reports/html" "${QC_DIR}/reports/json"
-
-    local fastp_threads=$(( THREADS > 16 ? 16 : THREADS ))
-
-    local raw_r1_files=()
-    collect_files_by_suffix "${RAW_READS_DIR}" "${READ_SUFFIX_R1}" raw_r1_files
-
-    if [[ ${#raw_r1_files[@]} -eq 0 ]]; then
-        log_error "[Step 01] No R1 read files found in ${RAW_READS_DIR} with suffix ${READ_SUFFIX_R1}"
-        exit 1
+    if [[ ${#INPUT_SAMPLE_IDS[@]} -eq 0 ]]; then
+        load_sample_manifest "${RAW_SAMPLE_MANIFEST}" "raw" INPUT_SAMPLE_IDS INPUT_R1_FILES INPUT_R2_FILES || {
+            discover_paired_reads "${RAW_READS_DIR}" INPUT_SAMPLE_IDS INPUT_R1_FILES INPUT_R2_FILES || exit 1
+        }
     fi
 
+    local fastp_threads=$(( THREADS > 16 ? 16 : THREADS ))
     CLEAN_R1_FILES=()
     CLEAN_R2_FILES=()
+    ACTIVE_SAMPLE_IDS=()
+    for i in "${!INPUT_SAMPLE_IDS[@]}"; do
+        local sample="${INPUT_SAMPLE_IDS[$i]}"
+        local r1="${INPUT_R1_FILES[$i]}"
+        local r2="${INPUT_R2_FILES[$i]}"
+        local out_r1="${QC_DIR}/trimmed/${sample}${READ_SUFFIX_R1}"
+        local out_r2="${QC_DIR}/trimmed/${sample}${READ_SUFFIX_R2}"
+        local html_report="${QC_DIR}/reports/html/${sample}.html"
+        local json_report="${QC_DIR}/reports/json/${sample}.json"
+        local step_log="${LOGS_DIR}/step_01_fastp_${sample}.log"
 
-    for r1 in "${raw_r1_files[@]}"; do
-        local base
-        base=$(basename "${r1}" "${READ_SUFFIX_R1}")
-        local r2="${RAW_READS_DIR}/${base}${READ_SUFFIX_R2}"
-
-        if [[ ! -f "${r2}" ]]; then
-            log_error "[Step 01] R2 file not found for sample ${base}: ${r2}"
-            exit 1
-        fi
-
-        local out_r1="${QC_DIR}/trimmed/${base}${READ_SUFFIX_R1}"
-        local out_r2="${QC_DIR}/trimmed/${base}${READ_SUFFIX_R2}"
-        local html_report="${QC_DIR}/reports/html/${base}.html"
-        local json_report="${QC_DIR}/reports/json/${base}.json"
-        local step_log="${LOGS_DIR}/step_01_fastp_${base}.log"
-
-        log_info "[Step 01] Processing sample: ${base}"
+        log_info "[Step 01] Processing sample: ${sample}"
         run_tool "01" "${SIF_FASTP}" "${SIF_FASTP_URI}" fastp \
             -i "${r1}" \
             -I "${r2}" \
@@ -4046,10 +5771,23 @@ step_01_fastp() {
 
         CLEAN_R1_FILES+=("${out_r1}")
         CLEAN_R2_FILES+=("${out_r2}")
+        ACTIVE_SAMPLE_IDS+=("${sample}")
     done
 
     ACTIVE_R1_FILES=("${CLEAN_R1_FILES[@]}")
     ACTIVE_R2_FILES=("${CLEAN_R2_FILES[@]}")
+    ACTIVE_READS_SOURCE="fastp-clean"
+    ACTIVE_READS_DIR="$(realpath -m "${QC_DIR}/trimmed")"
+    if [[ "${DRY_RUN}" == true ]]; then
+        log_info "[DRY-RUN] Would write fastp-clean sample manifest to ${FASTP_CLEAN_SAMPLE_MANIFEST}."
+        return 0
+    fi
+    local candidate_manifest
+    candidate_manifest="$(mktemp "${QC_DIR}/.fastp_clean_samples.XXXXXX")"
+    build_sample_manifest_candidate "${QC_DIR}/trimmed" "fastp-clean" "${candidate_manifest}" || exit 1
+    publish_sample_manifest "${candidate_manifest}" "${FASTP_CLEAN_SAMPLE_MANIFEST}" "${FASTP_CLEAN_SAMPLE_METADATA}" "fastp-clean" || exit 1
+    rm -f "${candidate_manifest}"
+    load_sample_manifest "${FASTP_CLEAN_SAMPLE_MANIFEST}" "fastp-clean" ACTIVE_SAMPLE_IDS ACTIVE_R1_FILES ACTIVE_R2_FILES || exit 1
     mark_done "01_fastp"
 }
 
@@ -4802,7 +6540,7 @@ step_09_filter_mags() {
         log_info "[SKIP] MAG filtering stage disabled."
         return 0
     fi
-    log_step "09" "Filter — HQ/MQ MAG selection (Completeness >= ${COMPLETENESS}%, Contamination <= ${CONTAMINATION}%)"
+    log_step "09" "MAG filtering (completeness >= ${MIN_COMPLETENESS}%, contamination <= ${MAX_CONTAMINATION}%)"
 
     if is_done "09_filter_mags"; then
         log_info "[Step 09] Checkpoint found — skipping MAG filtering."
@@ -4821,37 +6559,118 @@ step_09_filter_mags() {
 
     mkdir -p "${MAGS_DIR}"
 
-    local passing_bins=()
+    local retained_count
+    if ! retained_count="$(python3 - "${CHECKM2_DIR}/quality_report.tsv" \
+            "${BINS_FOR_QC}" "${MAGS_DIR}" "${MAG_FILTER_MANIFEST}" \
+            "${MIN_COMPLETENESS}" "${MAX_CONTAMINATION}" <<'PY_MAG_FILTER'
+import csv
+import logging
+import os
+import shutil
+import sys
+from decimal import Decimal, InvalidOperation
 
-    # Read quality_report.tsv: skip header, apply float comparison
-    while IFS=$'\t' read -r bin_name completeness contamination rest; do
-        # Skip header line
-        [[ "${bin_name}" == "Name" ]] && continue
-        [[ -z "${bin_name}" ]] && continue
+report, input_dir, output_dir, manifest_path, min_text, max_text = sys.argv[1:]
+logging.basicConfig(level=logging.INFO, format="[MAG filtering] %(message)s")
+min_completeness = Decimal(min_text)
+max_contamination = Decimal(max_text)
+required = ("Name", "Completeness", "Contamination")
+records = []
 
-        # Use awk for float comparison
-        local passes
-        passes=$(awk -v comp="${completeness}" -v cont="${contamination}" \
-                     -v min_comp="${COMPLETENESS}" -v max_cont="${CONTAMINATION}" \
-                     'BEGIN { if (comp+0 >= min_comp+0 && cont+0 <= max_cont+0) print "yes"; else print "no" }')
+try:
+    with open(report, newline="", encoding="utf-8-sig") as stream:
+        reader = csv.DictReader(stream, delimiter="\t", strict=True)
+        if reader.fieldnames is None or len(set(reader.fieldnames)) != len(reader.fieldnames):
+            raise ValueError("CheckM2 quality report has a missing or duplicate header.")
+        if any(name not in reader.fieldnames for name in required):
+            raise ValueError("CheckM2 quality report must contain Name, Completeness, and Contamination columns.")
+        for line_number, row in enumerate(reader, start=2):
+            if None in row:
+                raise ValueError(f"CheckM2 quality report has an inconsistent row at line {line_number}.")
+            mag_id = (row.get("Name") or "").strip()
+            comp_text = (row.get("Completeness") or "").strip()
+            cont_text = (row.get("Contamination") or "").strip()
+            completeness = None
+            contamination = None
+            reason = ""
+            try:
+                if not comp_text:
+                    reason = "missing_completeness"
+                elif not cont_text:
+                    reason = "missing_contamination"
+                else:
+                    completeness = Decimal(comp_text)
+                    contamination = Decimal(cont_text)
+                    if (not completeness.is_finite() or not contamination.is_finite() or
+                            completeness < 0 or completeness > 100 or
+                            contamination < 0 or contamination > 100):
+                        reason = "invalid_quality_values"
+            except InvalidOperation:
+                reason = "invalid_quality_values"
 
-        if [[ "${passes}" == "yes" ]]; then
-            local bin_file="${BINS_FOR_QC}/${bin_name}.fa"
-            if [[ -f "${bin_file}" ]]; then
-                passing_bins+=("${bin_name}")
-                cp "${bin_file}" "${MAGS_DIR}/${bin_name}.fa"
-                log_info "[Step 09] Passing MAG: ${bin_name} (Completeness=${completeness}%, Contamination=${contamination}%)"
-            else
-                log_warn "[Step 09] Bin file not found, skipping: ${bin_file}"
-            fi
-        fi
-    done < "${CHECKM2_DIR}/quality_report.tsv"
+            if not reason:
+                if completeness < min_completeness:
+                    reason = "below_min_completeness"
+                elif contamination > max_contamination:
+                    reason = "above_max_contamination"
+                else:
+                    reason = "retained"
 
-    if [[ ${#passing_bins[@]} -eq 0 ]]; then
-        log_error "[Step 09] Zero MAGs were retained (Completeness >= ${COMPLETENESS}%, Contamination <= ${CONTAMINATION}%). No successful filter checkpoint will be written."
+            source_path = os.path.join(input_dir, mag_id)
+            if not source_path.endswith(".fa"):
+                source_path += ".fa"
+            retained = reason == "retained" and os.path.isfile(source_path)
+            if reason == "retained" and not retained:
+                reason = "missing_mag_file"
+            output_path = os.path.join(output_dir, os.path.basename(source_path)) if retained else ""
+            records.append({
+                "mag_id": mag_id,
+                "completeness": comp_text,
+                "contamination": cont_text,
+                "min_completeness": min_text,
+                "max_contamination": max_text,
+                "retained": "true" if retained else "false",
+                "reason": reason,
+                "source_path": source_path,
+                "output_path": output_path,
+            })
+except (OSError, csv.Error, ValueError) as error:
+    raise SystemExit(f"Invalid CheckM2 quality report: {error}")
+
+if not records:
+    raise SystemExit("Invalid CheckM2 quality report: no data rows.")
+
+os.makedirs(output_dir, exist_ok=True)
+for entry in os.scandir(output_dir):
+    if entry.name.endswith(".fa") and (entry.is_file(follow_symlinks=False) or entry.is_symlink()):
+        os.unlink(entry.path)
+retained_count = 0
+for record in records:
+    if record["retained"] == "true":
+        shutil.copy2(record["source_path"], record["output_path"])
+        retained_count += 1
+    elif record["reason"] in ("missing_completeness", "missing_contamination", "invalid_quality_values", "missing_mag_file"):
+        logging.warning("%s excluded: %s", record["mag_id"], record["reason"])
+
+with open(manifest_path, "w", newline="", encoding="utf-8") as stream:
+    writer = csv.DictWriter(stream, fieldnames=(
+        "mag_id", "completeness", "contamination", "min_completeness",
+        "max_contamination", "retained", "reason", "source_path", "output_path",
+    ), delimiter="\t", lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(records)
+print(retained_count)
+PY_MAG_FILTER
+    )"; then
+        log_error "[Step 09] MAG filtering failed because the CheckM2 report structure or output operation is invalid."
+        exit 1
+    fi
+
+    if [[ "${retained_count}" -eq 0 ]]; then
+        log_error "[Step 09] Zero MAGs were retained (completeness >= ${MIN_COMPLETENESS}%, contamination <= ${MAX_CONTAMINATION}%). No successful filter checkpoint will be written."
         exit 1
     else
-        log_info "[Step 09] ${#passing_bins[@]} MAG(s) passed quality filters. Written to: ${MAGS_DIR}"
+        log_info "[Step 09] ${retained_count} MAG(s) retained. Manifest: ${MAG_FILTER_MANIFEST}"
     fi
 
     HQ_BINS_DIR="${MAGS_DIR}"
@@ -4986,213 +6805,191 @@ step_11_coverm() {
     mark_done "11_coverm"
 }
 
-# ── Step 12: R Summary Table ───────────────────────────────────────────────────
-step_12_summary_r() {
-    if [[ "${RUN_SUMMARY}" != true ]]; then
-        log_info "[SKIP] Summary stage disabled."
-        return 0
+check_legacy_summary_checkpoint() {
+    if [[ -f "${CHECKPOINT_DIR}/12_summary.done" || -f "${CHECKPOINT_DIR}/12_summary.config" ]]; then
+        log_info "[Migration] Legacy monolithic 12_summary checkpoint detected. Marking as legacy; new summaries (12a_taxonomy_summary, 12b_mag_summary, 12c_run_overview) will be built independently without reusing the legacy checkpoint."
+        touch "${CHECKPOINT_DIR}/12_summary.legacy" 2>/dev/null || true
     fi
-    log_step "12" "Summary — R left-join TSV (base R)"
+}
 
-    local mags_dir="${HQ_BINS_DIR}"
-    local checkm2_tsv="${CHECKM2_DIR}/quality_report.tsv"
-    local gtdbtk_bac="${GTDBTK_DIR}/gtdbtk.bac120.summary.tsv"
-    local gtdbtk_ar="${GTDBTK_DIR}/gtdbtk.ar53.summary.tsv"
-    local abundance_dir="${ABUNDANCE_DIR}"
-    [[ "${RUN_CHECKM2}" == true ]] || checkm2_tsv=""
-    if [[ "${RUN_GTDBTK}" != true ]]; then
-        gtdbtk_bac=""
-        gtdbtk_ar=""
-    fi
-    [[ "${RUN_COVERM}" == true ]] || abundance_dir=""
-    local out_tsv="${SUMMARY_DIR}/final_summary.tsv"
-    local -a mag_files=()
-    local -a abundance_files=()
-    if [[ -z "${mags_dir}" || ! -d "${mags_dir}" ]]; then
-        log_warn "[Step 12] No MAG directory is available; omitting the summary."
-        invalidate_checkpoint "12_summary" "no MAG directory is available"
+# ── Step 12a: Taxonomy Summary ────────────────────────────────────────────────
+step_12a_taxonomy_summary() {
+    if [[ "${RUN_SUMMARY}" != true || "${RUN_TAXONOMY_SUMMARY}" != true ]]; then
+        log_info "[SKIP] Taxonomy summary disabled."
         return 0
     fi
-    collect_files_by_pattern "${mags_dir}" "*.fa" mag_files
-    local -a nonempty_mag_files=()
-    local path
-    for path in "${mag_files[@]}"; do
-        if [[ -s "${path}" ]]; then
-            nonempty_mag_files+=("${path}")
-        fi
-    done
-    if [[ ${#nonempty_mag_files[@]} -eq 0 ]] && [[ "${DRY_RUN}" != true ]]; then
-        log_warn "[Step 12] No non-empty MAG FASTA files found in ${mags_dir}; omitting the summary."
-        invalidate_checkpoint "12_summary" "no non-empty MAG FASTA files are available"
+    if [[ "${RUN_KRAKEN2}" != true ]]; then
+        log_info "[SKIP] Taxonomy summary not-applicable (Kraken2 disabled)."
         return 0
-    elif [[ ${#nonempty_mag_files[@]} -eq 0 ]]; then
-        log_info "[Step 12] Dry-run: will check for MAGs before generating the summary."
     fi
-    if [[ "${RUN_COVERM}" == true ]]; then
-        collect_files_by_pattern "${abundance_dir}" "abundance_*.tsv" abundance_files
-    fi
-    if [[ "${RUN_CHECKM2}" == true && -f "${checkm2_tsv}" && -s "${checkm2_tsv}" ]]; then
-        log_info "[Step 12] CheckM2 source available."
-    else
-        log_info "[Step 12] CheckM2 source unavailable; summary will use MAG IDs and any other available sources."
-    fi
-    if [[ "${RUN_GTDBTK}" == true ]] && \
-       { [[ -s "${gtdbtk_bac}" ]] || [[ -s "${gtdbtk_ar}" ]]; }; then
-        log_info "[Step 12] GTDB-Tk source available."
-    else
-        log_info "[Step 12] GTDB-Tk source unavailable."
-    fi
-    local nonempty_abundance=0
-    for path in "${abundance_files[@]}"; do
-        if [[ -s "${path}" ]]; then
-            (( nonempty_abundance += 1 ))
-        fi
-    done
-    if [[ "${nonempty_abundance}" -gt 0 ]]; then
-        log_info "[Step 12] CoverM source available (${nonempty_abundance} abundance table(s))."
-    else
-        log_info "[Step 12] CoverM source unavailable."
-    fi
+    log_step "12a" "Summary — Read-based taxonomy summary (Kraken2/Bracken)"
 
-    if is_done "12_summary"; then
-        log_info "[Step 12] Checkpoint found — skipping summary."
+    if is_done "12a_taxonomy_summary"; then
+        log_info "[Step 12a] Checkpoint found — skipping taxonomy summary."
         return 0
     fi
 
     mkdir -p "${SUMMARY_DIR}"
-    log_info "[Step 12] Running R summary script..."
-    local visible_summary_step
-    visible_summary_step="$(visible_stage_number 12)"
-
-    run_tool "12" "${SIF_R}" "${SIF_R_URI}" Rscript - <<RSCRIPT
-###############################################################################
-# Final summary — base R only, no external packages
-###############################################################################
-
-mag_dir      <- "${mags_dir}"
-checkm2_tsv  <- "${checkm2_tsv}"
-gtdbtk_bac   <- "${gtdbtk_bac}"
-gtdbtk_ar    <- "${gtdbtk_ar}"
-abundance_dir <- "${abundance_dir}"
-out_tsv      <- "${out_tsv}"
-
-normalize_bin_id <- function(x) {
-    sub("[.](fa|fasta|fna)$", "", basename(x), ignore.case = TRUE)
-}
-
-mag_files <- list.files(mag_dir, pattern = "[.]fa$", full.names = TRUE)
-mag_file_info <- file.info(mag_files)
-mag_files <- mag_files[mag_file_info[["size"]] > 0]
-summary_df <- data.frame(Bin_ID = normalize_bin_id(mag_files),
-                         stringsAsFactors = FALSE)
-cat(sprintf("[Step ${visible_summary_step}] MAG list base: %d MAG(s) from %s\n",
-            nrow(summary_df), mag_dir))
-
-merge_source <- function(base, source, label) {
-    if (is.null(source) || nrow(source) == 0) {
-        cat(sprintf("[Step ${visible_summary_step}] %s source unavailable; remaining fields will be NA.\n", label))
-        return(base)
-    }
-    source <- source[!is.na(source[["Bin_ID"]]) & nzchar(source[["Bin_ID"]]), , drop = FALSE]
-    if (nrow(source) == 0) {
-        cat(sprintf("[Step 12] %s contains no usable bin IDs; omitting it.\n", label))
-        return(merge(base, source, by = "Bin_ID", all.x = TRUE, sort = FALSE))
-    }
-    source[["Bin_ID"]] <- normalize_bin_id(source[["Bin_ID"]])
-    cat(sprintf("[Step ${visible_summary_step}] Incorporating %s: %d row(s).\n", label, nrow(source)))
-    merge(base, source, by = "Bin_ID", all.x = TRUE, sort = FALSE)
-}
-
-read_optional_tsv <- function(path, label) {
-    if (!file.exists(path) || file.info(path)[["size"]] == 0) {
-        cat(sprintf("[Step ${visible_summary_step}] %s file missing or empty; omitting it.\n", label))
-        return(NULL)
-    }
-    tryCatch(
-        read.table(path, sep = "\t", header = TRUE, stringsAsFactors = FALSE,
-                   check.names = FALSE, quote = "", comment.char = ""),
-        error = function(e) {
-            cat(sprintf("[Step ${visible_summary_step}] WARN: Could not read %s: %s\n", label, conditionMessage(e)))
-            NULL
-        }
+    local -a cmd=(
+        python3 "${SUMMARY_GENERATOR}" taxonomy
+        --outdir "${SUMMARY_DIR}"
+        --pipeline-version "${PIPELINE_VERSION:-2.0.0}"
+        --sample-manifest "${SAMPLE_MANIFEST_ACTIVE:-${FASTP_CLEAN_SAMPLE_MANIFEST:-${RAW_SAMPLE_MANIFEST}}}"
+        --kraken2-dir "${KRAKEN2_DIR}"
+        --kraken2-enabled
+        --bracken-level "${BRACKEN_TAX_LEVEL:-S}"
     )
-}
-
-checkm2_added <- FALSE
-checkm2_df <- read_optional_tsv(checkm2_tsv, "CheckM2")
-if (!is.null(checkm2_df) && nrow(checkm2_df) > 0 && ncol(checkm2_df) > 0) {
-    colnames(checkm2_df)[1] <- "Bin_ID"
-    if (!"Completeness" %in% colnames(checkm2_df)) checkm2_df[["Completeness"]] <- NA_real_
-    if (!"Contamination" %in% colnames(checkm2_df)) checkm2_df[["Contamination"]] <- NA_real_
-    summary_df <- merge_source(summary_df, checkm2_df, "CheckM2")
-    checkm2_added <- TRUE
-}
-if (!checkm2_added) {
-    summary_df[["Completeness"]] <- NA_real_
-    summary_df[["Contamination"]] <- NA_real_
-}
-
-gtdbtk_df <- NULL
-for (path in c(gtdbtk_bac, gtdbtk_ar)) {
-    label <- basename(path)
-    df <- read_optional_tsv(path, label)
-    if (!is.null(df) && nrow(df) > 0) {
-        if ("user_genome" %in% colnames(df)) {
-            colnames(df)[colnames(df) == "user_genome"] <- "Bin_ID"
-            gtdbtk_df <- if (is.null(gtdbtk_df)) df else {
-                all_cols <- union(colnames(gtdbtk_df), colnames(df))
-                for (column in setdiff(all_cols, colnames(gtdbtk_df))) gtdbtk_df[[column]] <- NA
-                for (column in setdiff(all_cols, colnames(df))) df[[column]] <- NA
-                rbind(gtdbtk_df[, all_cols, drop = FALSE], df[, all_cols, drop = FALSE])
-            }
-        } else {
-            cat(sprintf("[Step ${visible_summary_step}] WARN: %s has no user_genome column; omitting it.\n", label))
-        }
-    }
-}
-if (is.null(gtdbtk_df)) {
-    cat("[Step 12] GTDB-Tk source unavailable; adding NA classification.\n")
-    summary_df[["GTDB_classification"]] <- NA_character_
-} else {
-    summary_df <- merge_source(summary_df, gtdbtk_df, "GTDB-Tk")
-}
-
-abund_files <- if (nzchar(abundance_dir)) {
-    list.files(abundance_dir, pattern = "^abundance_.*[.]tsv$", full.names = TRUE)
-} else {
-    character()
-}
-abund_file_info <- file.info(abund_files)
-abund_files <- abund_files[abund_file_info[["size"]] > 0]
-for (f in abund_files) {
-    sample_name <- sub("^abundance_|[.]tsv$", "", basename(f))
-    df <- read_optional_tsv(f, paste0("CoverM ", sample_name))
-    if (is.null(df) || nrow(df) == 0 || ncol(df) == 0) next
-    colnames(df)[1] <- "Bin_ID"
-    df[["Bin_ID"]] <- normalize_bin_id(df[["Bin_ID"]])
-    if (ncol(df) >= 2) {
-        for (j in seq(2, ncol(df))) {
-            colnames(df)[j] <- paste0(sample_name, "__", gsub(" ", "_", colnames(df)[j]))
-        }
-    }
-    summary_df <- merge_source(summary_df, df, paste0("CoverM ", sample_name))
-}
-
-cat(sprintf("[Step ${visible_summary_step}] Final summary: %d bins x %d columns\n",
-            nrow(summary_df), ncol(summary_df)))
-
-write.table(summary_df, file = out_tsv, sep = "\t",
-            row.names = FALSE, quote = FALSE, na = "NA")
-
-cat(sprintf("[Step ${visible_summary_step}] Summary written to: %s\n", out_tsv))
-RSCRIPT
-
-    if [[ ! -f "${out_tsv}" ]]; then
-        log_error "[Step 12] Summary TSV not created: ${out_tsv}"
-        exit 1
+    if [[ "${RUN_BRACKEN:-true}" == true ]]; then
+        cmd+=(--bracken-enabled)
+    fi
+    if [[ "${DRY_RUN}" == true ]]; then
+        cmd+=(--dry-run)
+        "${cmd[@]}" || true
+        return 0
     fi
 
-    mark_done "12_summary"
+    local exit_code=0
+    "${cmd[@]}" || exit_code=$?
+
+    if [[ "${exit_code}" -eq 0 ]]; then
+        mark_done "12a_taxonomy_summary"
+    elif [[ "${exit_code}" -eq 4 ]]; then
+        log_info "[Step 12a] Taxonomy summary determined as not-applicable."
+    else
+        log_error "[Step 12a] Failed to generate taxonomy summary (exit code ${exit_code})."
+        exit 1
+    fi
+}
+
+# ── Step 12b: MAG Summary ─────────────────────────────────────────────────────
+step_12b_mag_summary() {
+    if [[ "${RUN_SUMMARY}" != true || "${RUN_MAG_SUMMARY}" != true ]]; then
+        log_info "[SKIP] MAG summary disabled."
+        return 0
+    fi
+    if [[ "${RUN_CHECKM2}" != true && "${RUN_MAG_FILTERING}" != true && \
+          "${RUN_GTDBTK}" != true && "${RUN_COVERM}" != true ]]; then
+        log_info "[SKIP] MAG summary not-applicable (no MAG stages active)."
+        return 0
+    fi
+    log_step "12b" "Summary — MAG quality, taxonomy, and abundance summary"
+
+    if is_done "12b_mag_summary"; then
+        log_info "[Step 12b] Checkpoint found — skipping MAG summary."
+        return 0
+    fi
+
+    mkdir -p "${SUMMARY_DIR}"
+    local -a cmd=(
+        python3 "${SUMMARY_GENERATOR}" mag
+        --outdir "${SUMMARY_DIR}"
+        --pipeline-version "${PIPELINE_VERSION:-2.0.0}"
+        --bins-dir "${HQ_BINS_DIR:-${MAGS_DIR}}"
+        --min-completeness "${MIN_COMPLETENESS}"
+        --max-contamination "${MAX_CONTAMINATION}"
+    )
+    if [[ "${RUN_CHECKM2}" == true ]]; then
+        cmd+=(--checkm2-enabled --checkm2-report "${CHECKM2_DIR}/quality_report.tsv")
+    fi
+    if [[ "${RUN_MAG_FILTERING}" == true ]]; then
+        cmd+=(--filtering-enabled --filter-manifest "${MAG_FILTER_MANIFEST}")
+    fi
+    if [[ "${RUN_GTDBTK}" == true ]]; then
+        cmd+=(--gtdbtk-enabled --gtdbtk-dir "${GTDBTK_DIR}")
+    fi
+    if [[ "${RUN_COVERM}" == true ]]; then
+        cmd+=(
+            --coverm-enabled
+            --coverm-dir "${ABUNDANCE_DIR}"
+            --sample-manifest "${SAMPLE_MANIFEST_ACTIVE:-${FASTP_CLEAN_SAMPLE_MANIFEST:-${RAW_SAMPLE_MANIFEST}}}"
+            --coverm-methods "${COVERM_METHODS:-relative_abundance}"
+        )
+    fi
+    if [[ "${DRY_RUN}" == true ]]; then
+        cmd+=(--dry-run)
+        "${cmd[@]}" || true
+        return 0
+    fi
+
+    local exit_code=0
+    "${cmd[@]}" || exit_code=$?
+
+    if [[ "${exit_code}" -eq 0 ]]; then
+        mark_done "12b_mag_summary"
+    elif [[ "${exit_code}" -eq 4 ]]; then
+        log_info "[Step 12b] MAG summary determined as not-applicable."
+    else
+        log_error "[Step 12b] Failed to generate MAG summary (exit code ${exit_code})."
+        exit 1
+    fi
+}
+
+# ── Step 12c: Run Overview ────────────────────────────────────────────────────
+step_12c_run_overview() {
+    if [[ "${RUN_SUMMARY}" != true || "${RUN_RUN_OVERVIEW}" != true ]]; then
+        log_info "[SKIP] Run overview disabled."
+        return 0
+    fi
+    log_step "12c" "Summary — Pipeline run overview and execution metrics"
+
+    if is_done "12c_run_overview"; then
+        log_info "[Step 12c] Checkpoint found — skipping run overview."
+        return 0
+    fi
+
+    mkdir -p "${SUMMARY_DIR}"
+    local tax_stat="not-applicable"
+    local mag_stat="not-applicable"
+    [[ -s "${SUMMARY_DIR}/taxonomy_summary.tsv" ]] && tax_stat="available"
+    [[ -s "${SUMMARY_DIR}/mag_summary.tsv" ]] && mag_stat="available"
+
+    local -a cmd=(
+        python3 "${SUMMARY_GENERATOR}" overview
+        --outdir "${SUMMARY_DIR}"
+        --pipeline-outdir "${OUTDIR}"
+        --pipeline-version "${PIPELINE_VERSION:-2.0.0}"
+        --run-id "${RUN_ID:-run_${$}}"
+        --profile "${REQUESTED_PROFILE:-custom}"
+        --execution-mode "${EXEC_MODE}"
+        --resume-plan "${OUTDIR}/resume_plan.tsv"
+        --run-status "${OUTDIR}/run_status.tsv"
+        --sample-manifest "${SAMPLE_MANIFEST_ACTIVE:-${FASTP_CLEAN_SAMPLE_MANIFEST:-${RAW_SAMPLE_MANIFEST}}}"
+        --reads-source "${ACTIVE_READS_SOURCE:-raw}"
+        --assembly-path "${CONTIGS:-}"
+        --assembly-source "$([[ -n "${ASSEMBLY_IN}" ]] && echo external || echo megahit)"
+        --bins-source-requested "${BINS_SOURCE:-}"
+        --bins-source-resolved "${BINS_SOURCE_RESOLVED:-}"
+        --external-bins-fingerprint "${EXTERNAL_BINS_FINGERPRINT:-}"
+        --threads "${THREADS}"
+        --min-completeness "${MIN_COMPLETENESS}"
+        --max-contamination "${MAX_CONTAMINATION}"
+        --comebin-device "${COMEBIN_DEVICE:-cpu}"
+        --enabled-stages "${STAGE_IDS[*]}"
+        --refinement-mode "${REFINEMENT_MODE:-auto}"
+        --reassembly-enabled "${RUN_REASSEMBLY}"
+        --checkpoint-dir "${CHECKPOINT_DIR}"
+        --taxonomy-summary-status "${tax_stat}"
+        --mag-summary-status "${mag_stat}"
+        --software-inventory "${LOGS_DIR}/software_versions.tsv"
+        --database-inventory "${LOGS_DIR}/database_versions.tsv"
+        --log-reference "${LOGS_DIR}"
+        --final-status "completed"
+    )
+    if [[ "${DRY_RUN}" == true ]]; then
+        cmd+=(--dry-run)
+        "${cmd[@]}" || true
+        return 0
+    fi
+
+    local exit_code=0
+    "${cmd[@]}" || exit_code=$?
+
+    if [[ "${exit_code}" -eq 0 ]]; then
+        mark_done "12c_run_overview"
+    else
+        log_error "[Step 12c] Failed to generate run overview (exit code ${exit_code})."
+        exit 1
+    fi
 }
 
 ###############################################################################
@@ -5201,6 +6998,10 @@ RSCRIPT
 
 main() {
     resolve_binning_configuration || true
+    MAG_FILTERING_APPLICABLE=false
+    if [[ "${RUN_MAG_FILTERING}" == true ]] && stage_in_scope mag-filtering; then
+        MAG_FILTERING_APPLICABLE=true
+    fi
     # Auto-detect / validate compute resources before printing the banner
     detect_resources
 
@@ -5225,8 +7026,12 @@ main() {
     echo -e "${CYAN}${BOLD}║${NC}  KRAKEN2_DB             : ${KRAKEN2_DB}"
     echo -e "${CYAN}${BOLD}║${NC}  CHECKM2_DB             : ${CHECKM2_DB}"
     echo -e "${CYAN}${BOLD}║${NC}  GTDBTK_DATA_PATH       : ${GTDBTK_DATA_PATH}"
-    echo -e "${CYAN}${BOLD}║${NC}  COMPLETENESS threshold : >= ${COMPLETENESS}%"
-    echo -e "${CYAN}${BOLD}║${NC}  CONTAMINATION threshold: <= ${CONTAMINATION}%"
+    echo -e "${CYAN}${BOLD}║${NC}  Minimum completeness   : ${MIN_COMPLETENESS}"
+    echo -e "${CYAN}${BOLD}║${NC}  Maximum contamination  : ${MAX_CONTAMINATION}"
+    echo -e "${CYAN}${BOLD}║${NC}  Thresholds used        : ${MAG_FILTERING_APPLICABLE}"
+    if [[ "${MAG_FILTERING_APPLICABLE}" == true ]]; then
+        echo -e "${CYAN}${BOLD}║${NC}  Retention rule         : completeness >= ${MIN_COMPLETENESS} AND contamination <= ${MAX_CONTAMINATION}"
+    fi
     echo -e "${CYAN}${BOLD}║${NC}  RUN_FASTP              : ${RUN_FASTP}"
     echo -e "${CYAN}${BOLD}║${NC}  RUN_MEGAHIT            : ${RUN_MEGAHIT}"
     echo -e "${CYAN}${BOLD}║${NC}  RUN_KRAKEN2            : ${RUN_KRAKEN2}"
@@ -5253,6 +7058,7 @@ main() {
 
     # Pre-flight check
     preflight_check
+    build_inventory_rows
     if [[ "${DRY_RUN}" != true ]]; then
         mkdir -p "${OUTDIR}" "${LOGS_DIR}" "${TMPSCRIPTS_DIR}" "${CHECKPOINT_DIR}"
         [[ "${RUN_FASTP}" == true ]] && mkdir -p "${QC_DIR}"
@@ -5274,6 +7080,7 @@ main() {
         [[ "${RUN_SUMMARY}" == true ]] && mkdir -p "${SUMMARY_DIR}"
         persist_external_bam_manifest
     fi
+    publish_inventory_generation
     apply_restart_cleanup
 
     if [[ "${DRY_RUN}" == true ]]; then
@@ -5296,7 +7103,9 @@ main() {
                 09_filter_mags) internal_number=09 ;;
                 10_gtdbtk) internal_number=10 ;;
                 11_coverm) internal_number=11 ;;
-                12_summary) internal_number=12 ;;
+                12a_taxonomy_summary) internal_number=12a ;;
+                12b_mag_summary) internal_number=12b ;;
+                12c_run_overview) internal_number=12c ;;
             esac
             log_step "${internal_number}" "[${planned_action}] ${display}"
             if [[ "${planned_action}" != reuse && "${planned_action}" != restart ]]; then
@@ -5339,8 +7148,14 @@ main() {
         run_stage 11_coverm step_11_coverm
         if stop_after_reached coverm; then log_info "Stopping successfully after CoverM."; break; fi
 
-        run_stage 12_summary step_12_summary_r
-        if stop_after_reached summary; then log_info "Stopping successfully after summary."; break; fi
+        run_stage 12a_taxonomy_summary step_12a_taxonomy_summary
+        if stop_after_reached taxonomy-summary; then log_info "Stopping successfully after taxonomy summary."; break; fi
+
+        run_stage 12b_mag_summary step_12b_mag_summary
+        if stop_after_reached mag-summary; then log_info "Stopping successfully after MAG summary."; break; fi
+
+        run_stage 12c_run_overview step_12c_run_overview
+        if stop_after_reached run-overview || stop_after_reached summary; then log_info "Stopping successfully after run overview."; break; fi
         break
     done
 
@@ -5357,12 +7172,56 @@ main() {
     echo "MetaBinner bins: $(find "${METABINNER_FINAL_BINS_DIR}" -maxdepth 1 -name '*.fa' 2>/dev/null | wc -l)"
     echo "COMEBin bins   : $(find "${COMEBIN_FINAL_BINS_DIR}" -maxdepth 1 -name '*.fa' 2>/dev/null | wc -l)"
     echo "Refined bins   : $(find "${REFINEMENT_DIR}" -name '*.fa' 2>/dev/null | wc -l)"
-    echo "MAGs (HQ/MQ)   : $(find "${MAGS_DIR}" -name '*.fa' 2>/dev/null | wc -l)"
-    if [[ -s "${SUMMARY_DIR}/final_summary.tsv" ]]; then
-        echo "Final summary  : ${SUMMARY_DIR}/final_summary.tsv"
+    echo "Retained MAGs  : $(find "${MAGS_DIR}" -maxdepth 1 -name '*.fa' 2>/dev/null | wc -l)"
+    
+    local tax_status="not-applicable" mag_status="not-applicable" ov_status="pending"
+    local tax_path="not-applicable" mag_path="not-applicable" ov_path="not-applicable"
+
+    if [[ -s "${SUMMARY_DIR}/taxonomy_summary.tsv" ]]; then
+        tax_status="available"
+        tax_path="${SUMMARY_DIR}/taxonomy_summary.tsv"
+    elif [[ "${STAGE_STATE[12a_taxonomy_summary]:-}" == "not-applicable" || "${RUN_TAXONOMY_SUMMARY}" != true || "${RUN_SUMMARY}" != true ]]; then
+        tax_status="not-applicable"
+        tax_path="not-applicable"
+    elif [[ "${STAGE_FINAL_STATUS[12a_taxonomy_summary]:-}" == "failed" ]]; then
+        tax_status="failed"
+        tax_path="not-applicable"
     else
-        echo "Final summary  : not generated (disabled or no MAGs available)"
+        tax_status="pending"
+        tax_path="not-applicable"
     fi
+
+    if [[ -s "${SUMMARY_DIR}/mag_summary.tsv" ]]; then
+        mag_status="available"
+        mag_path="${SUMMARY_DIR}/mag_summary.tsv"
+    elif [[ "${STAGE_STATE[12b_mag_summary]:-}" == "not-applicable" || "${RUN_MAG_SUMMARY}" != true || "${RUN_SUMMARY}" != true ]]; then
+        mag_status="not-applicable"
+        mag_path="not-applicable"
+    elif [[ "${STAGE_FINAL_STATUS[12b_mag_summary]:-}" == "failed" ]]; then
+        mag_status="failed"
+        mag_path="not-applicable"
+    else
+        mag_status="pending"
+        mag_path="not-applicable"
+    fi
+
+    if [[ -s "${SUMMARY_DIR}/run_overview.tsv" ]]; then
+        ov_status="available"
+        ov_path="${SUMMARY_DIR}/run_overview.tsv"
+    elif [[ "${STAGE_FINAL_STATUS[12c_run_overview]:-}" == "failed" ]]; then
+        ov_status="failed"
+        ov_path="${SUMMARY_DIR}/run_overview.tsv"
+    else
+        ov_status="pending"
+        ov_path="${SUMMARY_DIR}/run_overview.tsv"
+    fi
+
+    echo "Taxonomy summary       : ${tax_status}"
+    echo "MAG summary            : ${mag_status}"
+    echo "Run overview           : ${ov_status}"
+    echo "Taxonomy summary path  : ${tax_path}"
+    echo "MAG summary path       : ${mag_path}"
+    echo "Run overview path      : ${ov_path}"
     echo "Logs           : ${LOGS_DIR}/"
     echo "Mamba scripts  : ${TMPSCRIPTS_DIR}/"
 }
