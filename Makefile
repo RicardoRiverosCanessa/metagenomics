@@ -41,6 +41,8 @@ BAM_MANIFEST ?=
 JGI_DEPTH_FILE ?=
 FORCE_STAGE ?=
 RESTART_FROM ?=
+PIPELINE_TMPDIR ?=
+KEEP_TEMPORARY ?= false
 
 READ_INPUT_ARGS = $(if $(strip $(READS_DIR)),--reads-dir "$(READS_DIR)") \
                   $(if $(strip $(CLEAN_READS_DIR)),--clean-reads-dir "$(CLEAN_READS_DIR)")
@@ -86,6 +88,9 @@ COMEBIN_ARGS = --comebin-device "$(COMEBIN_DEVICE)" \
                --comebin-seed "$(COMEBIN_SEED)"
 MAG_FILTER_ARGS = --min-completeness $(call shell_quote,$(MIN_COMPLETENESS)) \
                    --max-contamination $(call shell_quote,$(MAX_CONTAMINATION))
+TMPDIR_ARGS = $(if $(strip $(PIPELINE_TMPDIR)),--tmpdir "$(PIPELINE_TMPDIR)")
+KEEP_TEMPORARY_ARGS = $(if $(filter yes true 1,$(KEEP_TEMPORARY)),--keep-temporary) \
+                      $(if $(filter no false 0,$(KEEP_TEMPORARY)),--no-keep-temporary)
 
 # Redirect Apptainer/Singularity temp and cache dirs to local disk instead of /tmp RAM
 export APPTAINER_TMPDIR     := $(TMP_DIR)/tmp
@@ -207,6 +212,17 @@ clean-tmp:
 	@echo 'Cleaning temporary build/cache directory ($(TMP_DIR))...'
 	@rm -rf $(TMP_DIR)
 
+## test-error-record: Run unit tests for structured fatal error recording
+test-error-record:
+	python3 -m unittest -v tests.test_write_error_record
+
+## test-benchmark-manifest: Run unit tests for benchmark manifest recording
+test-benchmark-manifest:
+	python3 -m unittest -v tests.test_write_benchmark_manifest
+
+## test: Run test suite
+test: test-error-record test-benchmark-manifest
+
 ## test-dry-run: Check Bash syntax and execute a pipeline dry-run (--dry-run)
 test-dry-run:
 	@case "$(RUN_MAPPING)" in true|false) ;; *) echo '[ERROR] RUN_MAPPING must be true or false.'; exit 1 ;; esac
@@ -246,6 +262,8 @@ test-dry-run:
 	  $(BAM_ARGS) \
 	  $(FORCE_STAGE_ARGS) \
 	  $(RESTART_FROM_ARGS) \
+	  $(TMPDIR_ARGS) \
+	  $(KEEP_TEMPORARY_ARGS) \
 	  $(DATABASE_ARGS) \
 	  --outdir "$(OUTDIR)" \
 	  --dry-run

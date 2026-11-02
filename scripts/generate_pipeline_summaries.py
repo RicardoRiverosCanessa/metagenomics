@@ -1031,16 +1031,39 @@ def run_overview(args):
 
     status_map = {}
     duration_map = {}
-    if args.run_status and os.path.isfile(args.run_status):
+    if getattr(args, "stage_status", None) and os.path.isfile(args.stage_status):
+        with open(args.stage_status, "r", encoding="utf-8") as f:
+            reader = csv.reader(f, delimiter="\t")
+            header = next(reader, None)
+            if header:
+                stg_idx = header.index("stage_id") if "stage_id" in header else 2
+                stat_idx = header.index("final_status") if "final_status" in header else 7
+                dur_idx = header.index("wall_time_seconds") if "wall_time_seconds" in header else 10
+                run_idx = header.index("run_id") if "run_id" in header else 1
+                for row in reader:
+                    if not row or not any(row):
+                        continue
+                    if len(row) > run_idx and getattr(args, "run_id", None) and row[run_idx].strip() != args.run_id:
+                        continue
+                    if len(row) > stg_idx:
+                        stg = row[stg_idx].strip()
+                        if len(row) > stat_idx:
+                            status_map[stg] = row[stat_idx].strip()
+                        if len(row) > dur_idx and row[dur_idx].strip() not in ("NA", ""):
+                            duration_map[stg] = row[dur_idx].strip()
+    elif args.run_status and os.path.isfile(args.run_status):
         with open(args.run_status, "r", encoding="utf-8") as f:
             reader = csv.reader(f, delimiter="\t")
             for row in reader:
                 if not row or not any(row):
                     continue
-                if row[0].strip().lower() in ("stage_id", "stage"):
+                if row[0].strip().lower() in ("stage_id", "stage", "stage_internal_id"):
                     continue
                 stg = row[0].strip()
-                status_map[stg] = row[1].strip()
+                if len(row) >= 4:
+                    status_map[stg] = row[3].strip()
+                elif len(row) >= 2:
+                    status_map[stg] = row[1].strip()
                 if len(row) >= 5:
                     duration_map[stg] = row[4].strip()
 
@@ -1073,6 +1096,14 @@ def run_overview(args):
     add_row("outputs", "mag_summary.status", mag_stat, "summary_stage", mag_stat)
     add_row("outputs", "run_overview.path", run_tsv, "summary_stage", "available")
     add_row("outputs", "run_overview.status", "available", "summary_stage", "available")
+
+    # Manifests & Tracking
+    run_man = getattr(args, "run_manifest", "")
+    stg_stat = getattr(args, "stage_status", "")
+    if run_man:
+        add_row("manifests", "run_manifest.path", run_man, "configuration", "available" if os.path.isfile(run_man) else "not-applicable")
+    if stg_stat:
+        add_row("manifests", "stage_status.path", stg_stat, "configuration", "available" if os.path.isfile(stg_stat) else "not-applicable")
 
     # 6. Software Inventory
     sw_inv = args.software_inventory
@@ -1138,6 +1169,17 @@ def run_overview(args):
     add_row("warnings", "warnings.log_reference", log_ref, "summary_stage", "available")
     add_row("errors", "errors.count", str(err_count), "summary_stage", "available")
     add_row("errors", "errors.log_reference", log_ref, "summary_stage", "available")
+    last_err_path = os.path.join(log_ref, "last_error.json")
+    if os.path.isfile(last_err_path):
+        try:
+            with open(last_err_path, "r", encoding="utf-8") as lef:
+                last_err = json.load(lef)
+            add_row("errors", "errors.error_id", str(last_err.get("error_id", "none")), "last_error", "available")
+            add_row("errors", "errors.failed_stage", str(last_err.get("stage_id", "none")), "last_error", "available")
+            add_row("errors", "errors.exit_code", str(last_err.get("exit_code", "none")), "last_error", "available")
+            add_row("errors", "errors.error_report", last_err_path, "last_error", "available")
+        except Exception:
+            pass
 
     if args.dry_run:
         print(f"Run overview     : would run ({len(rows)} entries previewed)")
@@ -1162,12 +1204,12 @@ def run_overview(args):
             "pipeline_version": args.pipeline_version,
             "row_count": len(rows),
             "source_files": [
-                f for f in (args.resume_plan, args.run_status, args.software_inventory, args.database_inventory)
+                f for f in (args.resume_plan, args.run_status, getattr(args, "run_manifest", None), getattr(args, "stage_status", None), args.software_inventory, args.database_inventory)
                 if f and os.path.isfile(f)
             ],
             "source_fingerprints": {
                 f: compute_sha256(f)
-                for f in (args.resume_plan, args.run_status, args.software_inventory, args.database_inventory)
+                for f in (args.resume_plan, args.run_status, getattr(args, "run_manifest", None), getattr(args, "stage_status", None), args.software_inventory, args.database_inventory)
                 if f and os.path.isfile(f)
             },
             "summary_fingerprint": summary_fp,
@@ -1240,6 +1282,8 @@ def main():
     p_ov.add_argument("--final-status", default="completed")
     p_ov.add_argument("--resume-plan", default="")
     p_ov.add_argument("--run-status", default="")
+    p_ov.add_argument("--run-manifest", default="")
+    p_ov.add_argument("--stage-status", default="")
     p_ov.add_argument("--sample-manifest", default="")
     p_ov.add_argument("--reads-source", default="raw")
     p_ov.add_argument("--assembly-path", default="")

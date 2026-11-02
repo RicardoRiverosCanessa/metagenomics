@@ -23,13 +23,63 @@
 ###############################################################################
 
 set -Eeuo pipefail
-trap 'pipeline_error "$?" "${LINENO}"' ERR
-trap 'pipeline_signal INT 130' INT
-trap 'pipeline_signal TERM 143' TERM
+
+early_error_handler() {
+    local rc="$1"
+    local line="$2"
+
+    trap - ERR
+    set +e
+
+    local ts pid
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "unknown-time")"
+    pid="$$"
+
+    printf '[FATAL] %s [%s] Early pipeline failure: exit=%s line=%s command=<redacted-early-command>\n' \
+        "${ts}" "${pid}" "${rc}" "${line}" >&2
+
+    exit "${rc}"
+}
+
+early_signal_handler() {
+    local sig="$1"
+    local rc="$2"
+
+    trap - INT TERM HUP ERR
+    set +e
+
+    local ts pid
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "unknown-time")"
+    pid="$$"
+
+    printf '[FATAL] %s [%s] Early pipeline interrupted by %s (exit=%s)\n' \
+        "${ts}" "${pid}" "${sig}" "${rc}" >&2
+
+    exit "${rc}"
+}
+
+trap 'early_error_handler "$?" "$LINENO"' ERR
+trap 'early_signal_handler INT 130' INT
+trap 'early_signal_handler TERM 143' TERM
+trap 'early_signal_handler HUP 129' HUP
 
 PIPELINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PIPELINE_SCRIPTS_DIR="${PIPELINE_DIR}/scripts"
 SUMMARY_GENERATOR="${PIPELINE_SCRIPTS_DIR}/generate_pipeline_summaries.py"
+WRITE_ERROR_RECORD="${PIPELINE_SCRIPTS_DIR}/write_error_record.py"
+
+PIPELINE_VERSION="${PIPELINE_VERSION:-2.0.0}"
+PIPELINE_START_TIME_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "unknown-time")"
+export PIPELINE_START_TIME_UTC
+PIPELINE_PID="$$"
+PIPELINE_HOSTNAME="$(hostname 2>/dev/null || uname -n 2>/dev/null || echo "localhost")"
+PIPELINE_INVOCATION_RAW=("$0" "$@")
+PIPELINE_INVOCATION_COMMAND=""
+PIPELINE_START_MONOTONIC=""
+
+_rnd="$(head -c 2 /dev/urandom 2>/dev/null | od -An -tx1 2>/dev/null | tr -d ' \n' || true)"
+[[ -z "${_rnd}" ]] && _rnd="$(printf '%04x' "$(( RANDOM % 65536 ))")"
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null || echo "19700101T000000Z")_${PIPELINE_PID}_${_rnd}"
 
 ###############################################################################
 #  CONFIGURATION  —  Edit everything in this block before running             #
@@ -61,9 +111,30 @@ RESUME_REQUESTED=false
 FORCE_REQUESTED=false
 RESTART_REQUESTED=false
 RESTART_REQUEST_COUNT=0
+RUN_MANIFEST_FILE=""
+STAGE_STATUS_FILE=""
 RUN_STATUS_FILE=""
 RESUME_PLAN_FILE=""
+BENCHMARK_WRITER="${PIPELINE_SCRIPTS_DIR}/write_benchmark_manifest.py"
+CURRENT_STAGE_METRICS_DIR=""
+GNU_TIME_BIN=""
+GNU_TIME_AVAILABLE=false
 CURRENT_STAGE=""
+CURRENT_STAGE_NAME=""
+CURRENT_STAGE_ACTION=""
+CURRENT_STAGE_LOG=""
+CURRENT_STAGE_RUNTIME="unknown"
+CURRENT_STAGE_COMMAND=""
+CURRENT_COMMAND_SOURCE_FILE=""
+CURRENT_COMMAND_SOURCE_LINE=""
+
+LAST_VALID_CHECKPOINT="none"
+LAST_VALID_CHECKPOINT_PATH="none"
+LAST_VALID_PRODUCT="none"
+LAST_VALID_PRODUCT_FINGERPRINT="none"
+
+ERROR_HANDLER_ACTIVE=0
+ERROR_ALREADY_RECORDED=0
 RUN_STATUS_INITIALIZED=false
 PIPELINE_TERMINATION_RECORDED=false
 declare -A STAGE_ACTION=()
@@ -72,8 +143,11 @@ declare -A STAGE_STATE=()
 declare -A GRAPH_CHILDREN=()
 declare -A GRAPH_PARENTS=()
 declare -A STAGE_FINAL_STATUS=()
+# shellcheck disable=SC2034
 declare -A STAGE_START_TIME=()
+# shellcheck disable=SC2034
 declare -A STAGE_END_TIME=()
+# shellcheck disable=SC2034
 declare -A STAGE_EXIT_CODE=()
 declare -A STAGE_CHECKPOINT_WRITTEN=()
 declare -A STAGE_FROZEN_EXTERNAL=()
@@ -269,6 +343,36 @@ NEEDS_MAGS=false
 DRY_RUN="${DRY_RUN:-false}"                   # Print commands without running them
 FORCE_RERUN="${FORCE_RERUN:-false}"           # Ignore checkpoints and rerun every step
 
+# ── Temporary Workspace ────────────────────────────────────────────────────────
+# Captured before any export; used as the environment-tier candidate.
+TMPDIR_ENV_ORIGINAL="${TMPDIR:-}"
+# CLI option value for --tmpdir (empty means not provided).
+PIPELINE_TMPDIR_CLI=""
+# Resolved tier: cli | environment | fallback
+PIPELINE_TMPDIR_SOURCE=""
+# Canonical base directory chosen after precedence resolution.
+PIPELINE_TMPDIR_BASE=""
+# ${PIPELINE_TMPDIR_BASE}/metagenomics_pipeline
+PIPELINE_TMP_PARENT=""
+# ${PIPELINE_TMP_PARENT}/${RUN_ID}  — set after plan is frozen
+PIPELINE_RUN_TMPDIR=""
+# ${PIPELINE_RUN_TMPDIR}/reassembly  — set after plan is frozen
+REASSEMBLY_TMPDIR=""
+# ${PIPELINE_RUN_TMPDIR}/.pipeline_tmp_owner
+PIPELINE_TMP_MARKER=""
+# false = remove on controlled success/failure; true = always preserve
+KEEP_TEMPORARY=false
+# Concatenation strategy name and version (frozen at preflight, not changed at runtime)
+REASSEMBLY_TEMP_READS_STRATEGY="gzip-member-concat"
+REASSEMBLY_TEMP_READS_STRATEGY_VERSION="1"
+# Validation name and version
+REASSEMBLY_TEMP_READS_VALIDATION="gzip-integrity-and-source-manifest"
+REASSEMBLY_TEMP_READS_VALIDATION_VERSION="1"
+# Safety margin multiplier applied to estimated space requirement (≥1.0)
+REASSEMBLY_CONCAT_SPACE_FACTOR="1.10"
+# Minimum inodes required in the pipeline workspace (pipeline files only)
+REQUIRED_FREE_INODES=16
+
 ###############################################################################
 #  END OF CONFIGURATION                                                       #
 ###############################################################################
@@ -311,6 +415,15 @@ Options:
   --bracken / --no-bracken     Enable/disable Bracken abundance estimation (default: enabled)
   --reassembly / --no-reassembly
                                Enable/disable MetaWrap reassembly (default: disabled)
+  --tmpdir DIR                 Base directory for temporary pipeline workspaces.
+                               The pipeline creates an isolated RUN_ID directory
+                               below this location. Priority: CLI > TMPDIR env >
+                               fallback (OUTDIR/.tmp). Must be absolute or
+                               resolvable to an absolute path.
+  --keep-temporary             Preserve the current execution's temporary workspace
+                               after success or failure.
+  --no-keep-temporary          Remove the current execution's temporary workspace
+                               during controlled cleanup (default).
   --gtdbtk / --no-gtdbtk       Enable/disable GTDB-Tk (default: enabled)
   --mapping / --no-mapping     Enable/disable mapping (default: enabled)
   --binning / --no-binning     Enable/disable binning (default: enabled)
@@ -408,6 +521,7 @@ while [[ ${#_profile_scan[@]} -gt 0 ]]; do
         --bam-dir|--bam-manifest|--jgi-depth-file|--force-stage|--restart-from|\
         --binners|--refinement-mode|--bins-dir|--bins-source|--vamb-binsplit-separator|\
         --comebin-device|--comebin-seed|--min-completeness|--max-contamination|\
+        --tmpdir|\
         -o|--outdir|--metabinner-scripts-dir|-t|--threads|-m|--memory|-e|--engine|--stop-after)
             _profile_scan=("${_profile_scan[@]:2}") ;;
         *) _profile_scan=("${_profile_scan[@]:1}") ;;
@@ -583,6 +697,40 @@ while [[ $# -gt 0 ]]; do
         --no-bracken)  RUN_BRACKEN=false;    shift ;;
         --reassembly)     RUN_REASSEMBLY=true;  shift ;;
         --no-reassembly)  RUN_REASSEMBLY=false; shift ;;
+        --tmpdir)
+            # Reject absent or empty argument; also reject another recognized
+            # CLI option appearing where the value should be, but allow paths
+            # that begin with '-' (e.g. ./-temporary/work).
+            if [[ -z "${2+set}" || -z "${2}" ]]; then
+                echo "[ERROR] --tmpdir requires a directory value." >&2; exit 1
+            fi
+            # Check whether the next token is a recognized pipeline option.
+            # We test a curated set of single-token flags and two-token keys;
+            # any genuine path cannot match this list even if it starts with '-'.
+            case "${2}" in
+                --tmpdir|--keep-temporary|--no-keep-temporary|\
+                --reassembly|--no-reassembly|--dry-run|--no-dry-run|\
+                --force|--no-force|--resume|--force-stage|--restart-from|\
+                --fastp|--no-fastp|--megahit|--no-megahit|--kraken2|--no-kraken2|\
+                --bracken|--no-bracken|--gtdbtk|--no-gtdbtk|--mapping|--no-mapping|\
+                --binning|--no-binning|--refinement|--no-refinement|--checkm2|--no-checkm2|\
+                --mag-filtering|--no-mag-filtering|--coverm|--no-coverm|\
+                --summary|--no-summary|--taxonomy-summary|--no-taxonomy-summary|\
+                --mag-summary|--no-mag-summary|--run-overview|--no-run-overview|\
+                --taxonomy-only|--assembly-only|\
+                -r|--reads-dir|--clean-reads-dir|--kraken2-db|--checkm2-db|\
+                --gtdbtk-data-path|-a|--assembly-in|--bam-dir|--bam-manifest|\
+                --jgi-depth-file|--binners|\
+                --refinement-mode|--bins-dir|--bins-source|--vamb-binsplit-separator|\
+                --comebin-device|--comebin-seed|--min-completeness|--max-contamination|\
+                -o|--outdir|--metabinner-scripts-dir|-t|--threads|-m|--memory|\
+                -e|--engine|--stop-after|--profile|-h|--help)
+                    echo "[ERROR] --tmpdir requires a directory value (got recognized option '${2}')." >&2
+                    exit 1 ;;
+            esac
+            PIPELINE_TMPDIR_CLI="${2}"; shift 2 ;;
+        --keep-temporary)    KEEP_TEMPORARY=true;  shift ;;
+        --no-keep-temporary) KEEP_TEMPORARY=false; shift ;;
         --gtdbtk)     RUN_GTDBTK=true;    shift ;;
         --no-gtdbtk)  RUN_GTDBTK=false;   shift ;;
         --mapping) RUN_MAPPING=true; shift ;;
@@ -774,32 +922,883 @@ validate_percentage_threshold() {
     fi
 }
 
-# ── Utility Functions ─────────────────────────────────────────────────────────
-run_cmd() {
-    if [[ "${DRY_RUN}" == true ]]; then
-        printf '[DRY-RUN] '
-        printf '%q ' "$@"
-        printf '\n'
-    else
-        printf -v cmd_display '%q ' "$@"
-        log_info "Running: ${cmd_display}"
-        "$@"
+# ── Sanitization Helpers ──────────────────────────────────────────────────────
+sanitize_command() {
+    local -a cmd=("$@")
+    local str=""
+    if (( ${#cmd[@]} > 0 )); then
+        printf -v str '%q ' "${cmd[@]}"
+        str="${str% }"
     fi
+    str="$(printf '%s' "${str}" | sed -E \
+        -e 's/(--(token|password|secret|credential|api-key|key|access-token))([= ])([^ ]+)/\1\3<redacted>/gI' \
+        -e 's/\b(TOKEN|PASSWORD|SECRET|CREDENTIAL|API_KEY|ACCESS_TOKEN)=([^ ]+)/\1=<redacted>/gI')"
+    printf '%s' "${str}"
+}
+
+sanitize_shell_command() {
+    local str="${1:-}"
+    str="$(printf '%s' "${str}" | sed -E \
+        -e 's/(--(token|password|secret|credential|api-key|key|access-token))([= ])([^ ]+)/\1\3<redacted>/gI' \
+        -e 's/\b(TOKEN|PASSWORD|SECRET|CREDENTIAL|API_KEY|ACCESS_TOKEN)=([^ ]+)/\1=<redacted>/gI')"
+    printf '%s' "${str}"
+}
+
+sanitize_tsv_field() {
+    local val="${1:-unknown}"
+    local default="${2:-unknown}"
+    val="$(printf '%s' "${val}" | tr '\r\n\t' '   ' | sed -E 's/[[:space:]]+/ /g' | sed -E 's/^ +| +$//g')"
+    val="$(sanitize_shell_command "${val}")"
+    [[ -z "${val}" ]] && val="${default}"
+    printf '%s' "${val}"
+}
+
+# ── Temporary Workspace Management ───────────────────────────────────────────
+#
+# Tracking variables for error records and status reporting
+TEMPORARY_CLEANUP_STATUS="not-applicable"
+TEMPORARY_FILES_PRESERVED=false
+
+#
+# resolve_pipeline_tmpdir_base
+#   Applies precedence: CLI > TMPDIR env > fallback (OUTDIR/.tmp).
+#   Sets PIPELINE_TMPDIR_SOURCE and PIPELINE_TMPDIR_BASE.
+#   Must be called during preflight after OUTDIR is known.
+#   Does NOT create any directories — that happens in create_pipeline_run_tmpdir.
+#
+resolve_pipeline_tmpdir_base() {
+    local candidate="" source="" outdir_abs=""
+    outdir_abs="$(realpath -m -- "${OUTDIR}" 2>/dev/null || printf '%s' "${OUTDIR}")"
+
+    # ── Canonicalize a path (may or may not exist) ────────────────────────────
+    _canonicalize_tmpdir_path() {
+        local raw="$1"
+        local abs=""
+
+        if [[ -L "${raw}" ]]; then
+            log_error "[Tmpdir] Base directory is a symlink — refusing: ${raw}"
+            return 1
+        fi
+
+        if [[ -e "${raw}" ]]; then
+            abs="$(realpath -- "${raw}" 2>/dev/null)" || {
+                log_error "[Tmpdir] realpath failed for existing path: ${raw}"
+                return 1
+            }
+        else
+            # realpath -m accepts non-existent paths; fall back to manual
+            if realpath --help 2>&1 | grep -q '\-m'; then
+                abs="$(realpath -m -- "${raw}" 2>/dev/null)" || {
+                    log_error "[Tmpdir] realpath -m failed for: ${raw}"
+                    return 1
+                }
+            else
+                # Manual: resolve the deepest existing ancestor, then append
+                local dir basename rest
+                dir="${raw}"
+                rest=""
+                while [[ -n "${dir}" && "${dir}" != "/" && ! -e "${dir}" ]]; do
+                    basename="${dir##*/}"
+                    dir="${dir%/*}"
+                    rest="${basename}${rest:+/}${rest}"
+                done
+                [[ -z "${dir}" ]] && dir="/"
+                local dir_abs
+                dir_abs="$(realpath -- "${dir}" 2>/dev/null || printf '%s' "${dir}")"
+                abs="${dir_abs}${rest:+/}${rest}"
+            fi
+        fi
+        # Must be absolute
+        if [[ "${abs:0:1}" != "/" ]]; then
+            log_error "[Tmpdir] Resolved path is not absolute: ${abs} (from: ${raw})"
+            return 1
+        fi
+        # Reject ambiguous ..
+        if [[ "${abs}" == *"/../"* || "${abs}" == *"/.." ]]; then
+            log_error "[Tmpdir] Resolved path still contains '..': ${abs}"
+            return 1
+        fi
+        printf '%s' "${abs}"
+    }
+
+    # ── Location restriction checks ───────────────────────────────────────────
+    _check_tmpdir_location() {
+        local path="$1"
+        local src="$2"
+
+        if [[ -z "${path}" ]]; then
+            log_error "[Tmpdir] Resolved tmpdir path is empty."
+            return 1
+        fi
+        if [[ "${path}" == "/" ]]; then
+            log_error "[Tmpdir] Refusing to use filesystem root as tmpdir: ${path}"
+            return 1
+        fi
+        if [[ -L "${path}" ]]; then
+            log_error "[Tmpdir] Refusing symlink as tmpdir base: ${path}"
+            return 1
+        fi
+        local home_abs=""
+        home_abs="$(realpath -- "${HOME:-/nonexistent}" 2>/dev/null || printf '%s' "${HOME:-}")"
+        if [[ -n "${home_abs}" && "${path}" == "${home_abs}" ]]; then
+            log_error "[Tmpdir] Refusing to use HOME as tmpdir: ${path}"
+            return 1
+        fi
+        if [[ "${path}" == "${outdir_abs}" ]]; then
+            log_error "[Tmpdir] Refusing to use OUTDIR itself as tmpdir: ${path}"
+            return 1
+        fi
+        # Reject paths inside OUTDIR — unless this is the fallback tier
+        if [[ "${src}" != "fallback" && ( "${path}" == "${outdir_abs}/"* || "${path}" == "${outdir_abs}" ) ]]; then
+            log_error "[Tmpdir] Refusing temporary directory inside OUTDIR (source=${src}): ${path}"
+            log_error "         Use --tmpdir with a path outside ${outdir_abs}."
+            return 1
+        fi
+        # Even for fallback, only ${OUTDIR}/.tmp is allowed
+        if [[ "${src}" == "fallback" && "${path}" != "${outdir_abs}/.tmp" ]]; then
+            log_error "[Tmpdir] Internal: fallback path mismatch: expected ${outdir_abs}/.tmp, got ${path}"
+            return 1
+        fi
+        # Repo root guard
+        local repo_root=""
+        repo_root="$(realpath -m -- "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null || true)"
+        if [[ -n "${repo_root}" && "${path}" == "${repo_root}" ]]; then
+            log_error "[Tmpdir] Refusing to use the repository root as tmpdir: ${path}"
+            return 1
+        fi
+        return 0
+    }
+
+    # ── Tier: CLI ─────────────────────────────────────────────────────────────
+    if [[ -n "${PIPELINE_TMPDIR_CLI}" ]]; then
+        source="cli"
+        candidate="$(_canonicalize_tmpdir_path "${PIPELINE_TMPDIR_CLI}")" || return 1
+        _check_tmpdir_location "${candidate}" "${source}" || return 1
+        PIPELINE_TMPDIR_SOURCE="${source}"
+        PIPELINE_TMPDIR_BASE="${candidate}"
+        PIPELINE_TMP_PARENT="${PIPELINE_TMPDIR_BASE}/metagenomics_pipeline"
+        log_info "[Tmpdir] Source: cli | Base: ${PIPELINE_TMPDIR_BASE}"
+        return 0
+    fi
+
+    # ── Tier: environment ─────────────────────────────────────────────────────
+    if [[ -n "${TMPDIR_ENV_ORIGINAL}" ]]; then
+        source="environment"
+        candidate="$(_canonicalize_tmpdir_path "${TMPDIR_ENV_ORIGINAL}")" || return 1
+        _check_tmpdir_location "${candidate}" "${source}" || return 1
+        PIPELINE_TMPDIR_SOURCE="${source}"
+        PIPELINE_TMPDIR_BASE="${candidate}"
+        PIPELINE_TMP_PARENT="${PIPELINE_TMPDIR_BASE}/metagenomics_pipeline"
+        log_info "[Tmpdir] Source: environment | Base: ${PIPELINE_TMPDIR_BASE}"
+        return 0
+    fi
+
+    # ── Tier: fallback ────────────────────────────────────────────────────────
+    source="fallback"
+    candidate="${outdir_abs}/.tmp"
+    PIPELINE_TMPDIR_SOURCE="${source}"
+    PIPELINE_TMPDIR_BASE="${candidate}"
+    PIPELINE_TMP_PARENT="${PIPELINE_TMPDIR_BASE}/metagenomics_pipeline"
+    log_info "[Tmpdir] Source: fallback | Base: ${PIPELINE_TMPDIR_BASE}"
+    return 0
+}
+
+# validate_pipeline_tmpdir_base
+#   Validates an existing base directory: must be a non-symlink, writable dir
+#   whose canonical path matches what was resolved.
+#   If the base does not yet exist, validates the nearest existing ancestor.
+validate_pipeline_tmpdir_base() {
+    local base="${PIPELINE_TMPDIR_BASE}"
+    if [[ -z "${base}" ]]; then
+        log_error "[Tmpdir] PIPELINE_TMPDIR_BASE is empty."
+        return 1
+    fi
+    if [[ -e "${base}" ]]; then
+        if [[ -L "${base}" ]]; then
+            log_error "[Tmpdir] Base is a symlink — refusing: ${base}"
+            return 1
+        fi
+        if [[ ! -d "${base}" ]]; then
+            log_error "[Tmpdir] Base exists but is not a directory: ${base}"
+            return 1
+        fi
+        if [[ ! -w "${base}" ]]; then
+            log_error "[Tmpdir] Base directory is not writable: ${base}"
+            return 1
+        fi
+        local real_base=""
+        real_base="$(realpath -- "${base}" 2>/dev/null)" || {
+            log_error "[Tmpdir] Cannot resolve canonical path for: ${base}"
+            return 1
+        }
+        if [[ "${real_base}" != "${base}" ]]; then
+            log_error "[Tmpdir] Base resolves to a different canonical path."
+            log_error "         Expected: ${base}"
+            log_error "         Resolved: ${real_base}"
+            return 1
+        fi
+    else
+        # Walk up to the nearest existing ancestor
+        local ancestor="${base}"
+        while [[ -n "${ancestor}" && "${ancestor}" != "/" && ! -e "${ancestor}" ]]; do
+            ancestor="${ancestor%/*}"
+        done
+        [[ -z "${ancestor}" ]] && ancestor="/"
+        if [[ -L "${ancestor}" ]]; then
+            log_error "[Tmpdir] Nearest existing ancestor is a symlink: ${ancestor}"
+            return 1
+        fi
+        if [[ ! -d "${ancestor}" ]]; then
+            log_error "[Tmpdir] Nearest existing ancestor is not a directory: ${ancestor}"
+            return 1
+        fi
+        if [[ ! -w "${ancestor}" ]]; then
+            log_error "[Tmpdir] Nearest existing ancestor is not writable: ${ancestor}"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# check_tmpdir_space SOURCE_R1_ARRAY_NAME SOURCE_R2_ARRAY_NAME
+#   Estimates space needed and checks bytes + inodes in PIPELINE_TMPDIR_BASE.
+#   Uses POSIX df -Pk and df -Pi.
+check_tmpdir_space() {
+    local -n _r1_arr="$1"
+    local -n _r2_arr="$2"
+    local total_bytes=0 f fsize factor
+    factor="${REASSEMBLY_CONCAT_SPACE_FACTOR:-1.10}"
+
+    for f in "${_r1_arr[@]}" "${_r2_arr[@]}"; do
+        if [[ -f "${f}" ]]; then
+            fsize="$(stat -c '%s' -- "${f}" 2>/dev/null || echo 0)"
+            total_bytes=$(( total_bytes + fsize ))
+        fi
+    done
+
+    # Apply safety factor via awk: ceil(total_bytes * factor)
+    local required_bytes
+    required_bytes="$(awk -v b="${total_bytes}" -v f="${factor}" 'BEGIN {
+        val = b * f
+        ival = int(val)
+        if (val > ival) ival++
+        printf "%d", ival
+    }')"
+
+    # Find nearest existing directory for df inquiry
+    local check_path="${PIPELINE_TMPDIR_BASE}"
+    while [[ -n "${check_path}" && "${check_path}" != "/" && ! -e "${check_path}" ]]; do
+        check_path="${check_path%/*}"
+    done
+    [[ -z "${check_path}" ]] && check_path="/"
+
+    local avail_k avail_bytes=-1
+    avail_k="$(LC_ALL=C df -Pk -- "${check_path}" 2>/dev/null | awk 'NR>1 { if (NF>=5 && $4 ~ /^[0-9]+$/) { print $4; exit } }')"
+    if [[ -n "${avail_k}" && "${avail_k}" =~ ^[0-9]+$ ]]; then
+        avail_bytes=$(( avail_k * 1024 ))
+    else
+        log_warn "[Tmpdir] Cannot determine available disk space on ${check_path}; proceeding without space guard."
+    fi
+
+    local avail_inodes=-1
+    avail_inodes="$(LC_ALL=C df -Pi -- "${check_path}" 2>/dev/null | awk 'NR>1 { if (NF>=5 && $4 ~ /^[0-9]+$/) { print $4; exit } }')"
+    if [[ -z "${avail_inodes}" || ! "${avail_inodes}" =~ ^[0-9]+$ ]]; then
+        log_warn "[Tmpdir] Cannot determine available free inodes on ${check_path}; proceeding without inode guard."
+        avail_inodes=-1
+    fi
+
+    log_info "[Tmpdir] Space check for reassembly temporary concatenation:"
+    log_info "         Input reads total : ${total_bytes} bytes"
+    log_info "         Required space    : ${required_bytes} bytes (${factor}x factor)"
+    if (( avail_bytes >= 0 )); then
+        log_info "         Available space   : ${avail_bytes} bytes"
+        if (( avail_bytes < required_bytes )); then
+            log_error "[Tmpdir] Insufficient disk space in ${check_path} for reassembly temporary concatenation:"
+            log_error "         Required  : ${required_bytes} bytes (with ${factor}x factor)"
+            log_error "         Available : ${avail_bytes} bytes"
+            log_error "         Please provide a different base directory using --tmpdir."
+            return 1
+        fi
+    else
+        log_info "         Available space   : unknown"
+    fi
+
+    local min_inodes="${REQUIRED_FREE_INODES:-16}"
+    if (( avail_inodes >= 0 )); then
+        log_info "         Available inodes  : ${avail_inodes} (required: ${min_inodes})"
+        if (( avail_inodes > 0 && avail_inodes < min_inodes )); then
+            log_error "[Tmpdir] Insufficient inodes in ${check_path}:"
+            log_error "         Required  : ${min_inodes}"
+            log_error "         Available : ${avail_inodes}"
+            log_error "         Please provide a different base directory using --tmpdir."
+            return 1
+        fi
+    else
+        log_info "         Available inodes  : unknown (required: ${min_inodes})"
+    fi
+    log_info "[Tmpdir] Space check passed. Note: covers pipeline concatenation only; does not guarantee internal MetaWRAP overhead."
+    return 0
+}
+
+# create_pipeline_run_tmpdir
+#   Creates PIPELINE_RUN_TMPDIR and REASSEMBLY_TMPDIR exclusively (no -p).
+#   Writes the ownership marker.
+create_pipeline_run_tmpdir() {
+    local parent="${PIPELINE_TMP_PARENT}"
+    local run_dir="${PIPELINE_RUN_TMPDIR}"
+    local reassembly_dir="${REASSEMBLY_TMPDIR}"
+    local marker="${PIPELINE_TMP_MARKER}"
+
+    if [[ -z "${run_dir}" || -z "${reassembly_dir}" || -z "${marker}" ]]; then
+        log_error "[Tmpdir] PIPELINE_RUN_TMPDIR / REASSEMBLY_TMPDIR / PIPELINE_TMP_MARKER not set."
+        return 1
+    fi
+
+    # Create the shared parent (idempotent)
+    mkdir -p -- "${parent}" || {
+        log_error "[Tmpdir] Cannot create parent directory: ${parent}"
+        return 1
+    }
+
+    # Create the per-run directory exclusively (fail if it exists)
+    local old_umask
+    old_umask="$(umask)"
+    umask 077
+    if ! mkdir --mode=700 -- "${run_dir}" 2>/dev/null; then
+        umask "${old_umask}"
+        log_error "[Tmpdir] Per-run workspace already exists — refusing to reuse."
+        log_error "         Path: ${run_dir}"
+        log_error "         Inspect it manually. If it is orphaned, remove it and retry."
+        return 1
+    fi
+    mkdir --mode=700 -- "${reassembly_dir}" || {
+        umask "${old_umask}"
+        log_error "[Tmpdir] Cannot create reassembly subdirectory: ${reassembly_dir}"
+        return 1
+    }
+    umask "${old_umask}"
+
+    # Write ownership marker (atomic via temporary file)
+    local ts_utc
+    ts_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "1970-01-01T00:00:00Z")"
+    local marker_tmp="${marker}.tmp.$$"
+    {
+        printf 'schema_version=1\n'
+        printf 'run_id=%s\n'          "${RUN_ID}"
+        printf 'pipeline_pid=%s\n'    "$$"
+        printf 'created_at=%s\n'      "${ts_utc}"
+        printf 'tmpdir_source=%s\n'   "${PIPELINE_TMPDIR_SOURCE}"
+        printf 'tmpdir_base=%s\n'     "${PIPELINE_TMPDIR_BASE}"
+        printf 'run_tmpdir=%s\n'      "${run_dir}"
+    } > "${marker_tmp}" || {
+        rm -f -- "${marker_tmp}" 2>/dev/null || true
+        log_error "[Tmpdir] Cannot write ownership marker (tmp): ${marker_tmp}"
+        return 1
+    }
+    chmod 600 -- "${marker_tmp}" || true
+    mv -- "${marker_tmp}" "${marker}" || {
+        rm -f -- "${marker_tmp}" 2>/dev/null || true
+        log_error "[Tmpdir] Cannot install ownership marker: ${marker}"
+        return 1
+    }
+
+    log_info "[Tmpdir] Workspace created: ${run_dir}"
+    log_info "[Tmpdir] Reassembly tmpdir : ${reassembly_dir}"
+    log_info "[Tmpdir] Marker            : ${marker}"
+    return 0
+}
+
+# validate_run_tmpdir_for_cleanup
+#   Returns 0 iff PIPELINE_RUN_TMPDIR is safe to remove:
+#   - non-empty, non-symlink directory
+#   - absolute path, not /, not HOME, not OUTDIR, not base, not parent
+#   - exact match: ${PIPELINE_TMPDIR_BASE}/metagenomics_pipeline/${RUN_ID}
+#   - reassembly subdir is not a symlink
+#   - ownership marker exists, is regular file, not symlink
+#   - ownership marker fields match RUN_ID, PID, base, and run_tmpdir
+#   - canonical path matches
+#   - concatenated reads/parts are not symlinks
+validate_run_tmpdir_for_cleanup() {
+    local run_dir="${PIPELINE_RUN_TMPDIR:-}"
+    local marker="${PIPELINE_TMP_MARKER:-}"
+    local parent="${PIPELINE_TMP_PARENT:-}"
+    local base="${PIPELINE_TMPDIR_BASE:-}"
+    local reassembly_dir="${REASSEMBLY_TMPDIR:-}"
+
+    [[ -z "${run_dir}" ]] && return 1
+    [[ -z "${marker}" ]]  && return 1
+    [[ -z "${parent}" ]]  && return 1
+    [[ -z "${base}" ]]    && return 1
+
+    # Absolute path check
+    [[ "${run_dir:0:1}" == "/" ]] || return 1
+    # Forbidden roots
+    [[ "${run_dir}" == "/" ]] && return 1
+    [[ -n "${HOME:-}" && "${run_dir}" == "${HOME}" ]] && return 1
+
+    local outdir_abs=""
+    outdir_abs="$(realpath -m -- "${OUTDIR}" 2>/dev/null || printf '%s' "${OUTDIR}")"
+    [[ -n "${outdir_abs}" && "${run_dir}" == "${outdir_abs}" ]] && return 1
+    [[ "${run_dir}" == "${base}" ]] && return 1
+    [[ "${run_dir}" == "${parent}" ]] && return 1
+
+    # Exact pattern match
+    local expected_run_dir="${base}/metagenomics_pipeline/${RUN_ID}"
+    if [[ "${run_dir}" != "${expected_run_dir}" ]]; then
+        log_warn "[Tmpdir] Workspace path does not match expected pattern — skipping cleanup."
+        log_warn "         Expected: ${expected_run_dir}"
+        log_warn "         Actual  : ${run_dir}"
+        return 1
+    fi
+
+    # Symlink checks on directories
+    [[ -L "${run_dir}" ]] && { log_warn "[Tmpdir] Workspace is a symlink — skipping cleanup."; return 1; }
+    [[ -d "${run_dir}" ]] || return 1
+    if [[ -n "${reassembly_dir}" && -e "${reassembly_dir}" ]]; then
+        [[ -L "${reassembly_dir}" ]] && { log_warn "[Tmpdir] Reassembly subdir is a symlink — skipping cleanup."; return 1; }
+    fi
+
+    # Canonical path equality
+    local canon_run=""
+    canon_run="$(realpath -- "${run_dir}" 2>/dev/null || printf '%s' "${run_dir}")"
+    if [[ "${canon_run}" != "${run_dir}" ]]; then
+        log_warn "[Tmpdir] Workspace resolves to a different canonical path — skipping cleanup."
+        return 1
+    fi
+
+    # Verify parent is direct child
+    local actual_parent="${run_dir%/*}"
+    local canon_parent=""
+    canon_parent="$(realpath -- "${parent}" 2>/dev/null || printf '%s' "${parent}")"
+    local canon_actual=""
+    canon_actual="$(realpath -- "${actual_parent}" 2>/dev/null || printf '%s' "${actual_parent}")"
+    if [[ "${canon_actual}" != "${canon_parent}" ]]; then
+        log_warn "[Tmpdir] Workspace parent mismatch — skipping cleanup."
+        return 1
+    fi
+
+    # Ownership marker checks
+    [[ -f "${marker}" && ! -L "${marker}" ]] || { log_warn "[Tmpdir] Ownership marker missing or symlink."; return 1; }
+
+    local m_run_id="" m_pid="" m_base="" m_run_tmpdir=""
+    while IFS='=' read -r k v; do
+        case "${k}" in
+            run_id)       m_run_id="${v}"       ;;
+            pipeline_pid) m_pid="${v}"          ;;
+            tmpdir_base)  m_base="${v}"         ;;
+            run_tmpdir)   m_run_tmpdir="${v}"   ;;
+        esac
+    done < "${marker}"
+
+    if [[ "${m_run_id}" != "${RUN_ID}" ]]; then
+        log_warn "[Tmpdir] Ownership marker RUN_ID mismatch — refusing cleanup (marker: ${m_run_id}, expected: ${RUN_ID})."
+        return 1
+    fi
+    if [[ "${m_pid}" != "$$" ]]; then
+        log_warn "[Tmpdir] Ownership marker PID mismatch — refusing cleanup (marker: ${m_pid}, expected: $$)."
+        return 1
+    fi
+    if [[ -n "${m_base}" && "${m_base}" != "${base}" ]]; then
+        log_warn "[Tmpdir] Ownership marker base mismatch — refusing cleanup."
+        return 1
+    fi
+    if [[ -n "${m_run_tmpdir}" && "${m_run_tmpdir}" != "${run_dir}" ]]; then
+        log_warn "[Tmpdir] Ownership marker run_tmpdir mismatch — refusing cleanup."
+        return 1
+    fi
+
+    # Concatenated files symlink checks
+    if [[ -n "${reassembly_dir}" && -d "${reassembly_dir}" ]]; then
+        [[ -L "${reassembly_dir}/concatenated_R1.fastq.gz" ]] && return 1
+        [[ -L "${reassembly_dir}/concatenated_R2.fastq.gz" ]] && return 1
+        [[ -L "${reassembly_dir}/concatenated_R1.fastq.gz.part" ]] && return 1
+        [[ -L "${reassembly_dir}/concatenated_R2.fastq.gz.part" ]] && return 1
+    fi
+
+    return 0
+}
+
+# cleanup_run_tmpdir
+#   Idempotent wrapper that validates and removes PIPELINE_RUN_TMPDIR.
+cleanup_run_tmpdir() {
+    local run_dir="${PIPELINE_RUN_TMPDIR:-}"
+    [[ -z "${run_dir}" || ! -d "${run_dir}" ]] && return 0
+    if ! validate_run_tmpdir_for_cleanup; then
+        return 1
+    fi
+    rm -rf -- "${run_dir}"
+}
+
+# cleanup_safe_temporaries CONTEXT
+#   Removes PIPELINE_RUN_TMPDIR when it is safe to do so.
+#   CONTEXT: success | failure | signal
+#   Signal context always preserves (cannot guarantee child processes exited).
+#   When KEEP_TEMPORARY=true always preserves.
+cleanup_safe_temporaries() {
+    local context="${1:-unknown}"
+    local run_dir="${PIPELINE_RUN_TMPDIR:-}"
+
+    [[ -z "${run_dir}" ]] && return 0
+    [[ ! -d "${run_dir}" ]] && return 0
+
+    if [[ "${context}" == "signal" ]]; then
+        log_warn "[Tmpdir] Signal received — preserving workspace (cannot guarantee children exited)."
+        log_warn "         Preserved at: ${run_dir}"
+        log_warn "         Inspect and remove manually when safe."
+        TEMPORARY_CLEANUP_STATUS="preserved-after-signal"
+        TEMPORARY_FILES_PRESERVED=true
+        return 0
+    fi
+
+    if [[ "${KEEP_TEMPORARY}" == true ]]; then
+        log_info "[Tmpdir] KEEP_TEMPORARY=true — preserving workspace: ${run_dir}"
+        TEMPORARY_CLEANUP_STATUS="preserved-by-flag"
+        TEMPORARY_FILES_PRESERVED=true
+        return 0
+    fi
+
+    if [[ "${context}" == "failure" ]]; then
+        # Check if child processes of this PID are still active
+        if pgrep -P "$$" >/dev/null 2>&1; then
+            log_warn "[Tmpdir] Child processes still active — preserving workspace: ${run_dir}"
+            log_warn "         Inspect and remove manually when safe."
+            TEMPORARY_CLEANUP_STATUS="preserved-active-children"
+            TEMPORARY_FILES_PRESERVED=true
+            return 0
+        fi
+    fi
+
+    if ! validate_run_tmpdir_for_cleanup; then
+        log_warn "[Tmpdir] Cleanup validation failed — preserving workspace: ${run_dir}"
+        log_warn "         Inspect and remove manually when safe."
+        TEMPORARY_CLEANUP_STATUS="validation-failed"
+        TEMPORARY_FILES_PRESERVED=true
+        return 0
+    fi
+
+    log_info "[Tmpdir] Removing temporary workspace (context=${context}): ${run_dir}"
+    if rm -rf -- "${run_dir}"; then
+        log_info "[Tmpdir] Temporary workspace removed."
+        TEMPORARY_CLEANUP_STATUS="removed"
+        TEMPORARY_FILES_PRESERVED=false
+    else
+        log_warn "[Tmpdir] rm -rf failed for workspace: ${run_dir}"
+        TEMPORARY_CLEANUP_STATUS="removal-failed"
+        TEMPORARY_FILES_PRESERVED=true
+    fi
+}
+
+# show_tmpdir_dry_run_info
+#   Prints temporary workspace plan during dry-run (no directories created).
+show_tmpdir_dry_run_info() {
+    local est_r1=0 est_r2=0 f s
+    for f in "${ACTIVE_R1_FILES[@]}"; do
+        if [[ -f "${f}" ]]; then
+            s="$(stat -c '%s' -- "${f}" 2>/dev/null || echo 0)"
+            est_r1=$(( est_r1 + s ))
+        fi
+    done
+    for f in "${ACTIVE_R2_FILES[@]}"; do
+        if [[ -f "${f}" ]]; then
+            s="$(stat -c '%s' -- "${f}" 2>/dev/null || echo 0)"
+            est_r2=$(( est_r2 + s ))
+        fi
+    done
+    local total_in=$(( est_r1 + est_r2 ))
+    local factor="${REASSEMBLY_CONCAT_SPACE_FACTOR:-1.10}"
+    local est_bytes
+    est_bytes="$(awk -v b="${total_in}" -v f="${factor}" 'BEGIN {
+        val = b * f
+        ival = int(val)
+        if (val > ival) ival++
+        printf "%d", ival
+    }')"
+
+    local check_path="${PIPELINE_TMPDIR_BASE}"
+    while [[ -n "${check_path}" && "${check_path}" != "/" && ! -e "${check_path}" ]]; do
+        check_path="${check_path%/*}"
+    done
+    [[ -z "${check_path}" ]] && check_path="/"
+
+    local avail_k avail_bytes_str="unknown"
+    avail_k="$(LC_ALL=C df -Pk -- "${check_path}" 2>/dev/null | awk 'NR>1 { if (NF>=5 && $4 ~ /^[0-9]+$/) { print $4; exit } }')"
+    if [[ -n "${avail_k}" && "${avail_k}" =~ ^[0-9]+$ ]]; then
+        avail_bytes_str="$(( avail_k * 1024 ))"
+    fi
+
+    local avail_inodes avail_inodes_str="unknown"
+    avail_inodes="$(LC_ALL=C df -Pi -- "${check_path}" 2>/dev/null | awk 'NR>1 { if (NF>=5 && $4 ~ /^[0-9]+$/) { print $4; exit } }')"
+    if [[ -n "${avail_inodes}" && "${avail_inodes}" =~ ^[0-9]+$ ]]; then
+        avail_inodes_str="${avail_inodes}"
+    fi
+
+    log_info "[DRY-RUN] Temporary workspace plan:"
+    log_info "  Temporary base                   : ${PIPELINE_TMPDIR_BASE:-<unresolved>}"
+    log_info "  Temporary source                 : ${PIPELINE_TMPDIR_SOURCE:-<unresolved>}"
+    log_info "  Run temporary directory         : would create ${PIPELINE_RUN_TMPDIR:-<unresolved>}"
+    log_info "  Reassembly temp strategy         : ${REASSEMBLY_TEMP_READS_STRATEGY}"
+    log_info "  Strategy version                 : ${REASSEMBLY_TEMP_READS_STRATEGY_VERSION}"
+    log_info "  Temporary validation             : ${REASSEMBLY_TEMP_READS_VALIDATION}"
+    log_info "  Estimated concatenation bytes    : ${est_bytes}"
+    log_info "  Available temporary bytes        : ${avail_bytes_str}"
+    log_info "  Required free inodes             : ${REQUIRED_FREE_INODES:-16}"
+    log_info "  Available free inodes            : ${avail_inodes_str}"
+    log_info "  MetaWRAP workspace estimate      : not included"
+    log_info "  Keep temporary                   : ${KEEP_TEMPORARY}"
+    log_info "  Reassembly bind                  : would bind read-write ${PIPELINE_RUN_TMPDIR:-<unresolved>}"
+}
+
+# prepare_reassembly_tmpdir R1_RESULT_VAR R2_RESULT_VAR
+#   Validates inputs, checks space, and concatenates paired-end reads into REASSEMBLY_TMPDIR.
+#   Uses binary (gzip multi-member) concatenation with .part + gzip -t.
+#   Sets the named result variables to the final paths.
+prepare_reassembly_tmpdir() {
+    local _r1_var="$1"
+    local _r2_var="$2"
+
+    local r1_out="${REASSEMBLY_TMPDIR}/concatenated_R1.fastq.gz"
+    local r2_out="${REASSEMBLY_TMPDIR}/concatenated_R2.fastq.gz"
+    local r1_part="${r1_out}.part"
+    local r2_part="${r2_out}.part"
+
+    # Step 1: Validate active sample arrays from manifest
+    local n_ids="${#ACTIVE_SAMPLE_IDS[@]}"
+    local n_r1="${#ACTIVE_R1_FILES[@]}"
+    local n_r2="${#ACTIVE_R2_FILES[@]}"
+    if (( n_ids == 0 )); then
+        log_error "[Step 07] No active samples found in manifest for reassembly."
+        return 1
+    fi
+    if ! (( n_ids == n_r1 && n_ids == n_r2 )); then
+        log_error "[Step 07] Sample count mismatch in active manifest: ${n_ids} IDs, ${n_r1} R1s, ${n_r2} R2s."
+        return 1
+    fi
+
+    local i r1_f r2_f
+    for (( i=0; i<${#ACTIVE_SAMPLE_IDS[@]}; i++ )); do
+        r1_f="${ACTIVE_R1_FILES[i]}"
+        r2_f="${ACTIVE_R2_FILES[i]}"
+        if [[ ! -f "${r1_f}" || ! -r "${r1_f}" ]]; then
+            log_error "[Step 07] Active R1 file missing or unreadable: ${r1_f}"
+            return 1
+        fi
+        if [[ ! -f "${r2_f}" || ! -r "${r2_f}" ]]; then
+            log_error "[Step 07] Active R2 file missing or unreadable: ${r2_f}"
+            return 1
+        fi
+        if [[ "${r1_f}" == "${r2_f}" ]]; then
+            log_error "[Step 07] R1 and R2 are identical path for sample ${ACTIVE_SAMPLE_IDS[i]}: ${r1_f}"
+            return 1
+        fi
+    done
+
+    # Step 2: Check that final files do not already exist (no accidental reuse)
+    if [[ -e "${r1_out}" || -e "${r2_out}" ]]; then
+        log_error "[Step 07] Reassembly temporary file already exists — refusing to overwrite."
+        log_error "         R1: ${r1_out}"
+        log_error "         R2: ${r2_out}"
+        return 1
+    fi
+
+    # Step 3: Space pre-flight
+    check_tmpdir_space ACTIVE_R1_FILES ACTIVE_R2_FILES || return 1
+
+    # Step 4: Concatenate R1 in manifest order to .part
+    log_info "[Step 07] Concatenating ${#ACTIVE_R1_FILES[@]} R1 reads into temporary ${r1_part}..."
+    rm -f -- "${r1_part}"
+    if ! cat -- "${ACTIVE_R1_FILES[@]}" > "${r1_part}"; then
+        log_error "[Step 07] Failed during R1 concatenation."
+        rm -f -- "${r1_part}" 2>/dev/null || true
+        return 1
+    fi
+
+    # Step 5: Concatenate R2 in manifest order to .part
+    log_info "[Step 07] Concatenating ${#ACTIVE_R2_FILES[@]} R2 reads into temporary ${r2_part}..."
+    rm -f -- "${r2_part}"
+    if ! cat -- "${ACTIVE_R2_FILES[@]}" > "${r2_part}"; then
+        log_error "[Step 07] Failed during R2 concatenation."
+        rm -f -- "${r1_part}" "${r2_part}" 2>/dev/null || true
+        return 1
+    fi
+
+    # Step 6: Verify both part files are non-empty
+    if [[ ! -s "${r1_part}" ]]; then
+        log_error "[Step 07] Concatenated R1 part file is empty: ${r1_part}"
+        rm -f -- "${r1_part}" "${r2_part}" 2>/dev/null || true
+        return 1
+    fi
+    if [[ ! -s "${r2_part}" ]]; then
+        log_error "[Step 07] Concatenated R2 part file is empty: ${r2_part}"
+        rm -f -- "${r1_part}" "${r2_part}" 2>/dev/null || true
+        return 1
+    fi
+
+    # Step 7: Validate gzip integrity via gzip -t
+    log_info "[Step 07] Validating R1 gzip integrity..."
+    if ! gzip -t -- "${r1_part}" 2>/dev/null; then
+        log_error "[Step 07] gzip integrity check failed for concatenated R1."
+        log_error "          Note: gzip -t checks file integrity only; it does not"
+        log_error "          validate that R1 and R2 reads are correctly paired."
+        rm -f -- "${r1_part}" "${r2_part}" 2>/dev/null || true
+        return 1
+    fi
+    log_info "[Step 07] Validating R2 gzip integrity..."
+    if ! gzip -t -- "${r2_part}" 2>/dev/null; then
+        log_error "[Step 07] gzip integrity check failed for concatenated R2."
+        log_error "          Note: gzip -t checks file integrity only; it does not"
+        log_error "          validate that R1 and R2 reads are correctly paired."
+        rm -f -- "${r1_part}" "${r2_part}" 2>/dev/null || true
+        return 1
+    fi
+
+    # Step 8: Atomic rename within same directory
+    mv -- "${r1_part}" "${r1_out}" || {
+        log_error "[Step 07] Cannot rename R1 part to final path: ${r1_out}"
+        rm -f -- "${r1_part}" "${r2_part}" 2>/dev/null || true
+        return 1
+    }
+    mv -- "${r2_part}" "${r2_out}" || {
+        log_error "[Step 07] Cannot rename R2 part to final path: ${r2_out}"
+        rm -f -- "${r1_out}" "${r2_part}" 2>/dev/null || true
+        return 1
+    }
+
+    # Step 9: Final product check
+    if [[ ! -f "${r1_out}" || ! -s "${r1_out}" || ! -f "${r2_out}" || ! -s "${r2_out}" ]]; then
+        log_error "[Step 07] Concatenated final files failed final existence/non-empty check."
+        return 1
+    fi
+
+    printf -v "${_r1_var}" '%s' "${r1_out}"
+    printf -v "${_r2_var}" '%s' "${r2_out}"
+    log_info "[Step 07] Concatenated reads ready in temporary workspace:"
+    log_info "          R1: ${r1_out}"
+    log_info "          R2: ${r2_out}"
+    return 0
+}
+
+# ── Utility Functions & Wrappers ─────────────────────────────────────────────
+run_cmd() {
+    CURRENT_COMMAND_SOURCE_FILE="${BASH_SOURCE[1]:-unknown}"
+    CURRENT_COMMAND_SOURCE_LINE="${BASH_LINENO[0]:-0}"
+    CURRENT_STAGE_RUNTIME="${CURRENT_STAGE_RUNTIME:-host}"
+    CURRENT_STAGE_COMMAND="$(sanitize_command "$@")"
+
+    if [[ "${DRY_RUN}" == true ]]; then
+        printf '[DRY-RUN] %s\n' "${CURRENT_STAGE_COMMAND}"
+        CURRENT_STAGE_COMMAND=""
+        CURRENT_COMMAND_SOURCE_FILE=""
+        CURRENT_COMMAND_SOURCE_LINE=""
+        return 0
+    fi
+
+    local cmd_display
+    printf -v cmd_display '%q ' "$@"
+    log_info "Running: ${cmd_display}"
+
+    local had_errexit=0
+    local rc=0
+    [[ $- == *e* ]] && had_errexit=1
+
+    set +e
+    "$@"
+    rc=$?
+    (( had_errexit )) && set -e
+
+    if (( rc == 0 )); then
+        CURRENT_STAGE_COMMAND=""
+        CURRENT_COMMAND_SOURCE_FILE=""
+        CURRENT_COMMAND_SOURCE_LINE=""
+    fi
+
+    return "${rc}"
 }
 
 run_cmd_redirect() {
     local output="$1"
     shift
+    CURRENT_COMMAND_SOURCE_FILE="${BASH_SOURCE[1]:-unknown}"
+    CURRENT_COMMAND_SOURCE_LINE="${BASH_LINENO[0]:-0}"
+    CURRENT_STAGE_RUNTIME="${CURRENT_STAGE_RUNTIME:-host}"
+    CURRENT_STAGE_COMMAND="$(sanitize_command "$@") > $(printf '%q' "${output}")"
+
     if [[ "${DRY_RUN}" == true ]]; then
-        printf '[DRY-RUN] '
-        printf '%q ' "$@"
-        printf '> %q\n' "${output}"
-    else
-        printf -v cmd_display '%q ' "$@"
-        log_info "Running: ${cmd_display}> $(printf '%q' "${output}")"
-        "$@" > "${output}"
+        printf '[DRY-RUN] %s\n' "${CURRENT_STAGE_COMMAND}"
+        CURRENT_STAGE_COMMAND=""
+        CURRENT_COMMAND_SOURCE_FILE=""
+        CURRENT_COMMAND_SOURCE_LINE=""
+        return 0
     fi
+
+    local cmd_display
+    printf -v cmd_display '%q ' "$@"
+    log_info "Running: ${cmd_display}> $(printf '%q' "${output}")"
+
+    local had_errexit=0
+    local rc=0
+    [[ $- == *e* ]] && had_errexit=1
+
+    set +e
+    "$@" > "${output}"
+    rc=$?
+    (( had_errexit )) && set -e
+
+    if (( rc == 0 )); then
+        CURRENT_STAGE_COMMAND=""
+        CURRENT_COMMAND_SOURCE_FILE=""
+        CURRENT_COMMAND_SOURCE_LINE=""
+    fi
+
+    return "${rc}"
 }
+
+run_cmd_with_tee() {
+    local log="$1"
+    shift
+    [[ "${1:-}" == "--" ]] && shift
+
+    CURRENT_STAGE_LOG="${log}"
+    CURRENT_COMMAND_SOURCE_FILE="${BASH_SOURCE[1]:-unknown}"
+    CURRENT_COMMAND_SOURCE_LINE="${BASH_LINENO[0]:-0}"
+    CURRENT_STAGE_RUNTIME="${CURRENT_STAGE_RUNTIME:-host}"
+    CURRENT_STAGE_COMMAND="$(sanitize_command "$@")"
+
+    if [[ "${DRY_RUN}" == true ]]; then
+        printf '[DRY-RUN] %s 2>&1 | tee %q\n' "${CURRENT_STAGE_COMMAND}" "${log}"
+        "$@"
+        local mock_rc=$?
+        CURRENT_STAGE_COMMAND=""
+        CURRENT_COMMAND_SOURCE_FILE=""
+        CURRENT_COMMAND_SOURCE_LINE=""
+        return "${mock_rc}"
+    fi
+
+    mkdir -p "$(dirname "${log}")"
+
+    local had_errexit=0
+    local pipe_rc=0
+    [[ $- == *e* ]] && had_errexit=1
+
+    set +e
+    if [[ "${GNU_TIME_AVAILABLE:-false}" == true && -n "${CURRENT_STAGE_METRICS_DIR:-}" && -d "${CURRENT_STAGE_METRICS_DIR:-}" ]]; then
+        local time_out="${CURRENT_STAGE_METRICS_DIR}/time_${RANDOM}_$$.txt"
+        "${GNU_TIME_BIN}" -v -o "${time_out}" "$@" 2>&1 | tee "${log}"
+        pipe_rc="${PIPESTATUS[0]}"
+    else
+        "$@" 2>&1 | tee "${log}"
+        pipe_rc="${PIPESTATUS[0]}"
+    fi
+    (( had_errexit )) && set -e
+
+    if (( pipe_rc == 0 )); then
+        CURRENT_STAGE_COMMAND=""
+        CURRENT_COMMAND_SOURCE_FILE=""
+        CURRENT_COMMAND_SOURCE_LINE=""
+    fi
+
+    return "${pipe_rc}"
+}
+
 # ── run_tool(step_label, sif_path, uri, command...) ───────────────────────────
 # Runs a direct binary in its SIF image in Apptainer mode, preserving the
 # original direct command path in mamba mode.
@@ -809,9 +1808,14 @@ run_tool() {
     local uri="$3"
     shift 3
 
+    CURRENT_COMMAND_SOURCE_FILE="${BASH_SOURCE[1]:-unknown}"
+    CURRENT_COMMAND_SOURCE_LINE="${BASH_LINENO[0]:-0}"
+    CURRENT_STAGE_COMMAND="$(sanitize_command "$@")"
+
     if [[ "${EXEC_MODE}" == "mamba" ]]; then
+        CURRENT_STAGE_RUNTIME="host"
         run_cmd "$@"
-        return
+        return $?
     fi
 
     ensure_sif_image "${sif_path}" "${uri}" || return 1
@@ -820,14 +1824,36 @@ run_tool() {
     local -a bind_args=()
     build_bind_mounts bind_args
 
+    local abs_sif
+    abs_sif="$(realpath -m "${sif_path}" 2>/dev/null || echo "${sif_path}")"
+    CURRENT_STAGE_RUNTIME="apptainer:${abs_sif}"
+
     log_info "[Step ${step_label}] Engine: Apptainer | Image: ${sif_path}"
     if [[ "${DRY_RUN}" == true ]]; then
         printf '[DRY-RUN] %q ' "${runtime}" exec --cleanenv "${bind_args[@]}" "${sif_path}" "$@"
         printf '\n'
+        CURRENT_STAGE_COMMAND=""
+        CURRENT_COMMAND_SOURCE_FILE=""
+        CURRENT_COMMAND_SOURCE_LINE=""
         return 0
     fi
 
+    local had_errexit=0
+    local rc=0
+    [[ $- == *e* ]] && had_errexit=1
+
+    set +e
     "${runtime}" exec --cleanenv "${bind_args[@]}" "${sif_path}" "$@"
+    rc=$?
+    (( had_errexit )) && set -e
+
+    if (( rc == 0 )); then
+        CURRENT_STAGE_COMMAND=""
+        CURRENT_COMMAND_SOURCE_FILE=""
+        CURRENT_COMMAND_SOURCE_LINE=""
+    fi
+
+    return "${rc}"
 }
 
 # ── run_tool_shell(step_label, sif_path, uri, command) ─────────────────────────
@@ -838,13 +1864,36 @@ run_tool_shell() {
     local uri="$3"
     local command="$4"
 
+    CURRENT_COMMAND_SOURCE_FILE="${BASH_SOURCE[1]:-unknown}"
+    CURRENT_COMMAND_SOURCE_LINE="${BASH_LINENO[0]:-0}"
+    CURRENT_STAGE_COMMAND="$(sanitize_shell_command "${command}")"
+
     if [[ "${EXEC_MODE}" == "mamba" ]]; then
+        CURRENT_STAGE_RUNTIME="host"
         if [[ "${DRY_RUN}" == true ]]; then
             printf '[DRY-RUN] bash -o pipefail -c %q\n' "${command}"
-        else
-            bash -o pipefail -c "${command}"
+            CURRENT_STAGE_COMMAND=""
+            CURRENT_COMMAND_SOURCE_FILE=""
+            CURRENT_COMMAND_SOURCE_LINE=""
+            return 0
         fi
-        return
+
+        local had_errexit=0
+        local rc=0
+        [[ $- == *e* ]] && had_errexit=1
+
+        set +e
+        bash -o pipefail -c "${command}"
+        rc=$?
+        (( had_errexit )) && set -e
+
+        if (( rc == 0 )); then
+            CURRENT_STAGE_COMMAND=""
+            CURRENT_COMMAND_SOURCE_FILE=""
+            CURRENT_COMMAND_SOURCE_LINE=""
+        fi
+
+        return "${rc}"
     fi
 
     ensure_sif_image "${sif_path}" "${uri}" || return 1
@@ -853,14 +1902,36 @@ run_tool_shell() {
     local -a bind_args=()
     build_bind_mounts bind_args
 
+    local abs_sif
+    abs_sif="$(realpath -m "${sif_path}" 2>/dev/null || echo "${sif_path}")"
+    CURRENT_STAGE_RUNTIME="apptainer:${abs_sif}"
+
     log_info "[Step ${step_label}] Engine: Apptainer | Image: ${sif_path}"
     if [[ "${DRY_RUN}" == true ]]; then
         printf '[DRY-RUN] %q ' "${runtime}" exec --cleanenv "${bind_args[@]}" "${sif_path}" bash -o pipefail -c "${command}"
         printf '\n'
+        CURRENT_STAGE_COMMAND=""
+        CURRENT_COMMAND_SOURCE_FILE=""
+        CURRENT_COMMAND_SOURCE_LINE=""
         return 0
     fi
 
+    local had_errexit=0
+    local rc=0
+    [[ $- == *e* ]] && had_errexit=1
+
+    set +e
     "${runtime}" exec --cleanenv "${bind_args[@]}" "${sif_path}" bash -o pipefail -c "${command}"
+    rc=$?
+    (( had_errexit )) && set -e
+
+    if (( rc == 0 )); then
+        CURRENT_STAGE_COMMAND=""
+        CURRENT_COMMAND_SOURCE_FILE=""
+        CURRENT_COMMAND_SOURCE_LINE=""
+    fi
+
+    return "${rc}"
 }
 
 # ── ensure_sif_image(sif_path, uri) ──────────────────────────────────────────
@@ -881,7 +1952,6 @@ ensure_sif_image() {
         return 1
     fi
 
-    # Determine available container runtime
     local runtime=""
     if command -v apptainer &>/dev/null; then
         runtime="apptainer"
@@ -903,16 +1973,21 @@ ensure_sif_image() {
     "${runtime}" pull "${sif_path}" "${uri}"
 }
 
-# ── build_bind_mounts(array_name) ─────────────────────────────────────────────
-# Populates an array with "-B" and "/abs/path:/abs/path" argument pairs covering all
-# directories that the containerised steps need to read or write.
-# Uses the same absolute paths on host and inside the container so that
-# any generated scripts that reference ${OUTDIR} etc. work without translation.
-run_in_sif() {
+run_in_sif_exec() {
     local sif_file="$1"
     shift
+    CURRENT_COMMAND_SOURCE_FILE="${BASH_SOURCE[1]:-unknown}"
+    CURRENT_COMMAND_SOURCE_LINE="${BASH_LINENO[0]:-0}"
+    local abs_sif
+    abs_sif="$(realpath -m "${sif_file}" 2>/dev/null || echo "${sif_file}")"
+    CURRENT_STAGE_RUNTIME="apptainer:${abs_sif}"
+    CURRENT_STAGE_COMMAND="$(sanitize_command "$@")"
+
     if [[ "${DRY_RUN}" == true ]]; then
         echo -e "${YELLOW}[DRY-RUN]${NC} [$(basename "${sif_file}")] $*"
+        CURRENT_STAGE_COMMAND=""
+        CURRENT_COMMAND_SOURCE_FILE=""
+        CURRENT_COMMAND_SOURCE_LINE=""
         return 0
     fi
     if [[ "${EXEC_MODE}" == "apptainer" ]]; then
@@ -920,11 +1995,86 @@ run_in_sif() {
         apptainer_bin=$(command -v apptainer 2>/dev/null || command -v singularity 2>/dev/null)
         local -a bind_args=()
         build_bind_mounts bind_args
-        # Execute via bash -c so compound pipes (like bowtie2 | samtools) run entirely inside the container
-        "${apptainer_bin}" exec --cleanenv "${bind_args[@]}" "${sif_file}" bash -c "$*"
+
+        local had_errexit=0
+        local rc=0
+        [[ $- == *e* ]] && had_errexit=1
+
+        set +e
+        "${apptainer_bin}" exec --cleanenv "${bind_args[@]}" "${sif_file}" "$@"
+        rc=$?
+        (( had_errexit )) && set -e
+
+        if (( rc == 0 )); then
+            CURRENT_STAGE_COMMAND=""
+            CURRENT_COMMAND_SOURCE_FILE=""
+            CURRENT_COMMAND_SOURCE_LINE=""
+        fi
+        return "${rc}"
     else
         run_cmd "$@"
     fi
+}
+
+run_in_sif_shell() {
+    local sif_file="$1"
+    local command_str="$2"
+    CURRENT_COMMAND_SOURCE_FILE="${BASH_SOURCE[1]:-unknown}"
+    CURRENT_COMMAND_SOURCE_LINE="${BASH_LINENO[0]:-0}"
+    local abs_sif
+    abs_sif="$(realpath -m "${sif_file}" 2>/dev/null || echo "${sif_file}")"
+    CURRENT_STAGE_RUNTIME="apptainer:${abs_sif}"
+    CURRENT_STAGE_COMMAND="$(sanitize_shell_command "${command_str}")"
+
+    if [[ "${DRY_RUN}" == true ]]; then
+        echo -e "${YELLOW}[DRY-RUN]${NC} [$(basename "${sif_file}")] ${command_str}"
+        CURRENT_STAGE_COMMAND=""
+        CURRENT_COMMAND_SOURCE_FILE=""
+        CURRENT_COMMAND_SOURCE_LINE=""
+        return 0
+    fi
+    if [[ "${EXEC_MODE}" == "apptainer" ]]; then
+        local apptainer_bin
+        apptainer_bin=$(command -v apptainer 2>/dev/null || command -v singularity 2>/dev/null)
+        local -a bind_args=()
+        build_bind_mounts bind_args
+
+        local had_errexit=0
+        local rc=0
+        [[ $- == *e* ]] && had_errexit=1
+
+        set +e
+        "${apptainer_bin}" exec --cleanenv "${bind_args[@]}" "${sif_file}" bash -o pipefail -c "${command_str}"
+        rc=$?
+        (( had_errexit )) && set -e
+
+        if (( rc == 0 )); then
+            CURRENT_STAGE_COMMAND=""
+            CURRENT_COMMAND_SOURCE_FILE=""
+            CURRENT_COMMAND_SOURCE_LINE=""
+        fi
+        return "${rc}"
+    else
+        local had_errexit=0
+        local rc=0
+        [[ $- == *e* ]] && had_errexit=1
+
+        set +e
+        bash -o pipefail -c "${command_str}"
+        rc=$?
+        (( had_errexit )) && set -e
+
+        if (( rc == 0 )); then
+            CURRENT_STAGE_COMMAND=""
+            CURRENT_COMMAND_SOURCE_FILE=""
+            CURRENT_COMMAND_SOURCE_LINE=""
+        fi
+        return "${rc}"
+    fi
+}
+
+run_in_sif() {
+    run_in_sif_shell "$1" "${*:2}"
 }
 
 
@@ -1258,22 +2408,24 @@ run_mamba_file() {
     local env_name="$2"
     local script_file="$3"
 
+    CURRENT_COMMAND_SOURCE_FILE="${BASH_SOURCE[1]:-unknown}"
+    CURRENT_COMMAND_SOURCE_LINE="${BASH_LINENO[0]:-0}"
+    CURRENT_STAGE_COMMAND="bash $(printf '%q' "${script_file}")"
+
     if [[ "${EXEC_MODE}" == "apptainer" ]]; then
-        # Resolve container image for this environment
         local sif_path uri
         read -r sif_path uri < <(_env_to_sif "${env_name}")
+        local abs_sif
+        abs_sif="$(realpath -m "${sif_path}" 2>/dev/null || echo "${sif_path}")"
+        CURRENT_STAGE_RUNTIME="apptainer:${abs_sif}"
 
         log_info "[Step ${step_label}] Engine: Apptainer | Image: ${sif_path}"
         log_info "[Step ${step_label}] Script: ${script_file}"
 
-        # Pull image if absent
         ensure_sif_image "${sif_path}" "${uri}" || return 1
-
-        # Resolve bind-mount arguments
         local -a bind_args=()
         build_bind_mounts bind_args
 
-        # Vamb retains its historical GPU behavior; COMEBin opts in only for CUDA.
         local -a gpu_args=()
         if [[ "${env_name}" == "${ENV_VAMB}" ]] && _has_gpu; then
             gpu_args=(--nv)
@@ -1284,7 +2436,6 @@ run_mamba_file() {
             log_info "[Step ${step_label}] COMEBin CUDA requested — adding --nv flag."
         fi
 
-        # Determine available runtime
         local runtime="apptainer"
         command -v apptainer &>/dev/null || runtime="singularity"
 
@@ -1294,14 +2445,32 @@ run_mamba_file() {
             echo -e "${YELLOW}[DRY-RUN]${NC} --- script contents ---"
             cat "${script_file}"
             echo -e "${YELLOW}[DRY-RUN]${NC} --- end of script ---"
+            CURRENT_STAGE_COMMAND=""
+            CURRENT_COMMAND_SOURCE_FILE=""
+            CURRENT_COMMAND_SOURCE_LINE=""
             return 0
         fi
 
+        local had_errexit=0
+        local rc=0
+        [[ $- == *e* ]] && had_errexit=1
+
+        set +e
         "${runtime}" exec --cleanenv "${gpu_args[@]}" "${bind_args[@]}" \
             "${sif_path}" bash "${script_file}"
+        rc=$?
+        (( had_errexit )) && set -e
+
+        if (( rc == 0 )); then
+            CURRENT_STAGE_COMMAND=""
+            CURRENT_COMMAND_SOURCE_FILE=""
+            CURRENT_COMMAND_SOURCE_LINE=""
+        fi
+
+        return "${rc}"
 
     else
-        # ── mamba fallback ────────────────────────────────────────────────────
+        CURRENT_STAGE_RUNTIME="mamba:${env_name}"
         log_info "[Step ${step_label}] Engine: mamba | Env: ${BOLD}${env_name}${NC}"
         log_info "[Step ${step_label}] Script: ${script_file}"
         if [[ "${DRY_RUN}" == true ]]; then
@@ -1309,9 +2478,28 @@ run_mamba_file() {
             echo -e "${YELLOW}[DRY-RUN]${NC} --- script contents ---"
             cat "${script_file}"
             echo -e "${YELLOW}[DRY-RUN]${NC} --- end of script ---"
+            CURRENT_STAGE_COMMAND=""
+            CURRENT_COMMAND_SOURCE_FILE=""
+            CURRENT_COMMAND_SOURCE_LINE=""
             return 0
         fi
+
+        local had_errexit=0
+        local rc=0
+        [[ $- == *e* ]] && had_errexit=1
+
+        set +e
         mamba run -n "${env_name}" bash "${script_file}"
+        rc=$?
+        (( had_errexit )) && set -e
+
+        if (( rc == 0 )); then
+            CURRENT_STAGE_COMMAND=""
+            CURRENT_COMMAND_SOURCE_FILE=""
+            CURRENT_COMMAND_SOURCE_LINE=""
+        fi
+
+        return "${rc}"
     fi
 }
 
@@ -3053,6 +4241,24 @@ checkpoint_config_manifest() {
             07_reassembly)
                 printf 'enabled=%s\nbins_for_reassembly=%s\nbins_for_qc=%s\nthreads=%s\nmemory=%s\nimage=%s\n' \
                     "${RUN_REASSEMBLY}" "${BINS_FOR_REASSEMBLY}" "${BINS_FOR_QC}" "${THREADS}" "${MEMORY}" "${SIF_METAWRAP_URI}"
+                printf 'temporary_reads_strategy=%s\ntemporary_reads_strategy_version=%s\n' \
+                    "${REASSEMBLY_TEMP_READS_STRATEGY}" "${REASSEMBLY_TEMP_READS_STRATEGY_VERSION}"
+                printf 'temporary_reads_validation=%s\ntemporary_reads_validation_version=%s\n' \
+                    "${REASSEMBLY_TEMP_READS_VALIDATION}" "${REASSEMBLY_TEMP_READS_VALIDATION_VERSION}"
+                printf 'active_sample_manifest_fingerprint=%s\n' \
+                    "$(sha256sum "${SAMPLE_MANIFEST_ACTIVE:-${FASTP_CLEAN_SAMPLE_MANIFEST:-${RAW_SAMPLE_MANIFEST}}}" 2>/dev/null | awk '{print $1}')"
+                printf 'active_sample_ids=%s\n' "${ACTIVE_SAMPLE_IDS[*]:-}"
+                local _src_r1_count=0 _src_r1_bytes=0 _src_r2_count=0 _src_r2_bytes=0 _rsf
+                for _rsf in "${ACTIVE_R1_FILES[@]}"; do
+                    _src_r1_count=$(( _src_r1_count + 1 ))
+                    _src_r1_bytes=$(( _src_r1_bytes + $(stat -c '%s' -- "${_rsf}" 2>/dev/null || echo 0) ))
+                done
+                for _rsf in "${ACTIVE_R2_FILES[@]}"; do
+                    _src_r2_count=$(( _src_r2_count + 1 ))
+                    _src_r2_bytes=$(( _src_r2_bytes + $(stat -c '%s' -- "${_rsf}" 2>/dev/null || echo 0) ))
+                done
+                printf 'source_read_pair_count=%s\nread1_total_size_bytes=%s\nread2_total_size_bytes=%s\n' \
+                    "${_src_r1_count}" "${_src_r1_bytes}" "${_src_r2_bytes}"
                 append_bins_manifest "${BINS_FOR_REASSEMBLY}" ;;
             08_checkm2)
                 printf 'selected_binners=%s\nrefinement_mode=%s\nrefinement_effective=%s\nbins_source_requested=%s\nbins_source_resolved=%s\nbins=%s\ndb=%s\nthreads=%s\nimage=%s\n' \
@@ -3569,6 +4775,173 @@ apply_restart_cleanup() {
     done
 }
 
+stage_display_name() {
+    local id="$1"
+    case "${id}" in
+        01_fastp) echo "Quality Control (fastp)" ;;
+        02_megahit) echo "Assembly (MEGAHIT)" ;;
+        03_kraken2) echo "Taxonomy (Kraken2/Bracken)" ;;
+        04_mapping) echo "Read Mapping & Contig Depth" ;;
+        05a_vamb) echo "Binning (Vamb)" ;;
+        05b_metabinner) echo "Binning (MetaBinner)" ;;
+        05c_comebin) echo "Binning (COMEBin)" ;;
+        06_refinement) echo "Bin Refinement (MetaWRAP)" ;;
+        07_reassembly) echo "Bin Reassembly" ;;
+        08_checkm2) echo "Quality Assessment (CheckM2)" ;;
+        09_filter_mags) echo "MAG Filtering" ;;
+        10_gtdbtk) echo "Taxonomic Classification (GTDB-Tk)" ;;
+        11_coverm) echo "MAG Coverage (CoverM)" ;;
+        12a_taxonomy_summary) echo "Taxonomy Summary" ;;
+        12b_mag_summary) echo "MAG Summary" ;;
+        12c_run_overview) echo "Run Overview" ;;
+        12_summary) echo "Consolidated Summary" ;;
+        pipeline) echo "Preflight" ;;
+        *) echo "${id}" ;;
+    esac
+}
+
+stage_primary_log() {
+    local id="$1"
+    local log="unknown"
+    if [[ -n "${LOGS_DIR:-}" ]]; then
+        case "${id}" in
+            01_fastp) log="${LOGS_DIR}/step_01_fastp.log" ;;
+            02_megahit) log="${LOGS_DIR}/step_02_megahit.log" ;;
+            03_kraken2) log="${LOGS_DIR}/step_03_kraken2.log" ;;
+            04_mapping) log="${LOGS_DIR}/step_04_mapping.log" ;;
+            05a_vamb) log="${LOGS_DIR}/step_05a_vamb.log" ;;
+            05b_metabinner) log="${LOGS_DIR}/step_05b_metabinner_run.log" ;;
+            05c_comebin) log="${LOGS_DIR}/step_05c_comebin.log" ;;
+            06_refinement) log="${LOGS_DIR}/step_06_bin_refinement.log" ;;
+            07_reassembly) log="${LOGS_DIR}/step_07_reassembly.log" ;;
+            08_checkm2) log="${LOGS_DIR}/step_08_checkm2.log" ;;
+            09_filter_mags) log="${LOGS_DIR}/step_09_filter_mags.log" ;;
+            10_gtdbtk) log="${LOGS_DIR}/step_10_gtdbtk.log" ;;
+            11_coverm) log="${LOGS_DIR}/step_11_coverm.log" ;;
+            12a_taxonomy_summary) log="${LOGS_DIR}/step_12a_taxonomy_summary.log" ;;
+            12b_mag_summary) log="${LOGS_DIR}/step_12b_mag_summary.log" ;;
+            12c_run_overview) log="${LOGS_DIR}/step_12c_run_overview.log" ;;
+            pipeline) log="${LOGS_DIR}/pipeline.log" ;;
+            *) log="unknown" ;;
+        esac
+    fi
+    echo "${log}"
+}
+
+stage_primary_output() {
+    local id="$1"
+    case "${id}" in
+        01_fastp) echo "${FASTP_CLEAN_SAMPLE_MANIFEST:-${QC_DIR}/trimmed}" ;;
+        02_megahit) echo "${CONTIGS:-${ASSEMBLY_DIR}/final.contigs.fa}" ;;
+        03_kraken2) echo "${KRAKEN2_DIR}/reports" ;;
+        04_mapping) echo "${DEPTH_FILE:-${BINNING_DIR}/depth_matrix.txt}" ;;
+        05a_vamb) echo "${VAMB_FINAL_BINS_DIR}" ;;
+        05b_metabinner) echo "${METABINNER_FINAL_BINS_DIR}" ;;
+        05c_comebin) echo "${COMEBIN_FINAL_BINS_DIR}" ;;
+        06_refinement) echo "${REFINED_BINS_DIR:-${REFINEMENT_DIR}}" ;;
+        07_reassembly) echo "${REASSEMBLY_DIR}" ;;
+        08_checkm2) echo "${CHECKM2_DIR}/quality_report.tsv" ;;
+        09_filter_mags) echo "${MAGS_DIR}" ;;
+        10_gtdbtk) echo "${GTDBTK_DIR}" ;;
+        11_coverm) echo "${ABUNDANCE_DIR}" ;;
+        12a_taxonomy_summary) echo "${SUMMARY_DIR}/taxonomy_summary.tsv" ;;
+        12b_mag_summary) echo "${SUMMARY_DIR}/mag_summary.tsv" ;;
+        12c_run_overview) echo "${SUMMARY_DIR}/run_overview.tsv" ;;
+        *) echo "NA" ;;
+    esac
+}
+
+stage_primary_output_fingerprint() {
+    local out
+    out="$(stage_primary_output "$1")"
+    if [[ -f "${out}" ]]; then
+        sha256sum "${out}" 2>/dev/null | awk '{print $1}' || echo "NA"
+    elif [[ -d "${out}" ]]; then
+        find "${out}" -maxdepth 2 -type f -exec stat -c '%n %s' {} + 2>/dev/null | sort | sha256sum 2>/dev/null | awk '{print $1}' || echo "NA"
+    else
+        echo "NA"
+    fi
+}
+
+stage_primary_tool_version() {
+    local stage="$1" tool
+    local -a tools=()
+    mapfile -t tools < <(inventory_stage_tools "${stage}" 2>/dev/null || true)
+    for tool in "${tools[@]}"; do
+        local v="${ID_VERSION[${stage}|${tool}]:-unknown}"
+        [[ "${v}" != "unknown" && -n "${v}" ]] && { echo "${v}"; return 0; }
+    done
+    echo "NA"
+}
+
+stage_primary_runtime_fingerprint() {
+    local stage="$1" tool
+    local -a tools=()
+    mapfile -t tools < <(inventory_stage_tools "${stage}" 2>/dev/null || true)
+    for tool in "${tools[@]}"; do
+        local fp="${ID_RUNTIME_FINGERPRINT[${stage}|${tool}]:-unknown}"
+        [[ "${fp}" != "unknown" && -n "${fp}" ]] && { echo "${fp}"; return 0; }
+    done
+    echo "NA"
+}
+
+stage_primary_database_fingerprint() {
+    local stage="$1" dbkey=""
+    case "${stage}" in
+        03_kraken2) dbkey="${stage}|kraken2-bracken" ;;
+        08_checkm2) dbkey="${stage}|checkm2" ;;
+        10_gtdbtk) dbkey="${stage}|gtdbtk" ;;
+        *) echo "NA"; return 0 ;;
+    esac
+    local dfp="${DB_FINGERPRINT[${dbkey}]:-unknown}"
+    if [[ "${dfp}" != "unknown" && -n "${dfp}" ]]; then
+        echo "${dfp}"
+    else
+        echo "NA"
+    fi
+}
+
+set_last_valid_checkpoint() {
+    local chk_id="$1"
+    local chk_path="${2:-none}"
+    local prod="${3:-none}"
+    local prod_fp="${4:-none}"
+    local ts
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "unknown-time")"
+
+    LAST_VALID_CHECKPOINT="${chk_id}"
+    LAST_VALID_CHECKPOINT_PATH="${chk_path}"
+    LAST_VALID_PRODUCT="${prod}"
+    LAST_VALID_PRODUCT_FINGERPRINT="${prod_fp}"
+
+    [[ "${DRY_RUN:-false}" == true ]] && return 0
+    [[ -z "${OUTDIR:-}" || ! -d "${OUTDIR}" ]] && return 0
+
+    local chk_state_dir="${LOGS_DIR}/checkpoint_state"
+    mkdir -p "${chk_state_dir}"
+    local run_chk_file="${chk_state_dir}/${RUN_ID}.tsv"
+    local last_state_file="${LOGS_DIR}/last_valid_checkpoint.state"
+
+    if [[ ! -s "${run_chk_file}" ]]; then
+        printf 'run_id\tcheckpoint_id\tcheckpoint_path\tproduct\tproduct_fingerprint\ttimestamp_utc\n' > "${run_chk_file}"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "${RUN_ID}" "${chk_id}" "${chk_path}" "${prod}" "${prod_fp}" "${ts}" >> "${run_chk_file}"
+
+    local tmp_state
+    tmp_state="$(mktemp "${LOGS_DIR}/.last_chk_state.XXXXXX")"
+    printf 'run_id=%s\ncheckpoint_id=%s\ncheckpoint_path=%s\nproduct=%s\nproduct_fingerprint=%s\ntimestamp_utc=%s\n' \
+        "${RUN_ID}" "${chk_id}" "${chk_path}" "${prod}" "${prod_fp}" "${ts}" > "${tmp_state}"
+    mv -f "${tmp_state}" "${last_state_file}"
+}
+
+set_last_valid_product() {
+    local prod="$1"
+    local prod_fp="${2:-none}"
+    LAST_VALID_PRODUCT="${prod}"
+    LAST_VALID_PRODUCT_FINGERPRINT="${prod_fp}"
+}
+
 run_stage() {
     local id="$1" function_name="$2" action="${STAGE_ACTION[$1]:-disabled}"
     stage_is_active "${id}" || return 0
@@ -3577,114 +4950,647 @@ run_stage() {
         assert_database_identity_frozen "${id}" || return 1
     fi
     CURRENT_STAGE="${id}"
+    CURRENT_STAGE_NAME="$(stage_display_name "${id}")"
+    CURRENT_STAGE_ACTION="${action}"
+    CURRENT_STAGE_LOG="$(stage_primary_log "${id}")"
+    CURRENT_STAGE_RUNTIME="unknown"
+    CURRENT_STAGE_COMMAND=""
+    CURRENT_COMMAND_SOURCE_FILE=""
+    CURRENT_COMMAND_SOURCE_LINE=""
+
     STAGE_START_TIME["${id}"]="$(date -Is)"
     STAGE_FINAL_STATUS["${id}"]=not-reached
-    "$function_name"
-    STAGE_END_TIME["${id}"]="$(date -Is)"
-    STAGE_EXIT_CODE["${id}"]=0
-    if [[ "${DRY_RUN}" == true ]]; then
-        STAGE_FINAL_STATUS["${id}"]=dry-run
-    elif [[ "${action}" == reuse ]]; then
+
+    if [[ "${action}" == reuse ]]; then
+        if ! is_done "${id}"; then
+            log_error "[Step ${id}] Action is reuse but checkpoint is not valid or complete."
+            return 1
+        fi
+        if ! validate_step_products "${id}"; then
+            log_error "[Step ${id}] Action is reuse but products failed validation."
+            return 1
+        fi
+        local chk_path="${CHECKPOINT_DIR}/${id}.done"
+        set_last_valid_checkpoint "${id}" "${chk_path}" "reused" "none"
+        STAGE_START_TIME["${id}"]="NA"
+        STAGE_END_TIME["${id}"]="NA"
+        STAGE_EXIT_CODE["${id}"]=0
         STAGE_FINAL_STATUS["${id}"]=reused
+        if [[ "${DRY_RUN}" != true && "${RUN_STATUS_INITIALIZED:-false}" == true ]]; then
+            python3 "${BENCHMARK_WRITER}" stage-finish \
+                --stage-status-path "${STAGE_STATUS_FILE}" \
+                --compat-run-status-path "${RUN_STATUS_FILE}" \
+                --run-id "${RUN_ID}" \
+                --stage-id "${id}" \
+                --planned-action "reuse" \
+                --checkpoint-path "${chk_path}" \
+                --checkpoint-reason "${STAGE_REASON[$id]:-checkpoint_reused}" \
+                --validation-status "passed" \
+                --primary-log "${CURRENT_STAGE_LOG}" \
+                --primary-output "$(stage_primary_output "${id}")" \
+                --output-fingerprint "$(stage_primary_output_fingerprint "${id}")" \
+                --runtime "${CURRENT_STAGE_RUNTIME:-apptainer}" \
+                --message "reused from valid checkpoint" >/dev/null 2>&1 || true
+        fi
     else
-        STAGE_FINAL_STATUS["${id}"]=completed
+        local stage_start_utc stage_end_utc stage_start_mono stage_end_mono wall_seconds="NA"
+        local stage_metrics_dir="${OUTDIR}/logs/.metrics_${id}_${RUN_ID}"
+        CURRENT_STAGE_METRICS_DIR="${stage_metrics_dir}"
+
+        stage_start_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        stage_start_mono="$(python3 -c 'import time; print(f"{time.monotonic():.6f}")' 2>/dev/null || echo "0.0")"
+        STAGE_START_TIME["${id}"]="${stage_start_utc}"
+
+        if [[ "${DRY_RUN}" != true && "${RUN_STATUS_INITIALIZED:-false}" == true ]]; then
+            mkdir -p "${stage_metrics_dir}"
+            python3 "${BENCHMARK_WRITER}" stage-start \
+                --stage-status-path "${STAGE_STATUS_FILE}" \
+                --compat-run-status-path "${RUN_STATUS_FILE}" \
+                --run-id "${RUN_ID}" \
+                --stage-id "${id}" \
+                --start-time-utc "${stage_start_utc}" >/dev/null 2>&1 || true
+        fi
+
+        "$function_name"
+        local func_rc=$?
+
+        stage_end_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        stage_end_mono="$(python3 -c 'import time; print(f"{time.monotonic():.6f}")' 2>/dev/null || echo "0.0")"
+        wall_seconds="$(python3 -c "print(f'{(float(\"${stage_end_mono}\") - float(\"${stage_start_mono}\")):.3f}')" 2>/dev/null || echo "NA")"
+
+        STAGE_END_TIME["${id}"]="${stage_end_utc}"
+        STAGE_EXIT_CODE["${id}"]="${func_rc}"
+        if [[ "${DRY_RUN}" == true ]]; then
+            STAGE_FINAL_STATUS["${id}"]=dry-run-success
+        else
+            STAGE_FINAL_STATUS["${id}"]=success
+        fi
+
+        local chk_act="executed"
+        [[ "${action}" == force ]] && chk_act="forced"
+        [[ "${action}" == restart ]] && chk_act="restarted"
+
+        if [[ "${DRY_RUN}" != true && "${RUN_STATUS_INITIALIZED:-false}" == true ]]; then
+            python3 "${BENCHMARK_WRITER}" stage-finish \
+                --stage-status-path "${STAGE_STATUS_FILE}" \
+                --compat-run-status-path "${RUN_STATUS_FILE}" \
+                --run-id "${RUN_ID}" \
+                --stage-id "${id}" \
+                --planned-action "${action}" \
+                --checkpoint-action "${chk_act}" \
+                --final-status "${STAGE_FINAL_STATUS[$id]}" \
+                --start-time-utc "${stage_start_utc}" \
+                --end-time-utc "${stage_end_utc}" \
+                --wall-time-seconds "${wall_seconds}" \
+                --metrics-dir "${stage_metrics_dir}" \
+                --exit-code "${func_rc}" \
+                --checkpoint-path "${CHECKPOINT_DIR}/${id}.done" \
+                --checkpoint-status "$([[ "${STAGE_CHECKPOINT_WRITTEN[$id]:-false}" == true ]] && echo written || echo missing)" \
+                --checkpoint-reason "${STAGE_REASON[$id]:-run_executed}" \
+                --validation-status "passed" \
+                --primary-log "${CURRENT_STAGE_LOG}" \
+                --primary-output "$(stage_primary_output "${id}")" \
+                --output-fingerprint "$(stage_primary_output_fingerprint "${id}")" \
+                --runtime "${CURRENT_STAGE_RUNTIME:-apptainer}" \
+                --tool-version "$(stage_primary_tool_version "${id}")" \
+                --runtime-fingerprint "$(stage_primary_runtime_fingerprint "${id}")" \
+                --database-fingerprint "$(stage_primary_database_fingerprint "${id}")" \
+                --message "stage completed successfully" >/dev/null 2>&1 || true
+        fi
+        rm -rf "${stage_metrics_dir}" 2>/dev/null || true
     fi
-    update_run_status "${id}" "${STAGE_FINAL_STATUS[$id]}"
+
     CURRENT_STAGE=""
+    CURRENT_STAGE_NAME=""
+    CURRENT_STAGE_ACTION=""
+    CURRENT_STAGE_LOG=""
+    CURRENT_STAGE_RUNTIME="unknown"
+    CURRENT_STAGE_COMMAND=""
+    CURRENT_COMMAND_SOURCE_FILE=""
+    CURRENT_COMMAND_SOURCE_LINE=""
 }
 
-pipeline_error() {
-    local status="$1" line="$2" id
+record_pipeline_termination_state() {
+    local status="$1"
+    local exit_code="$2"
+    local error_id="$3"
+
+    local current_stg="${CURRENT_STAGE:-pipeline}"
+    local end_ts
+    end_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")"
+
+    STAGE_FINAL_STATUS["${current_stg}"]="${status}"
+    STAGE_END_TIME["${current_stg}"]="${end_ts}"
+    STAGE_EXIT_CODE["${current_stg}"]="${exit_code}"
+
+    local id
+    for id in "${STAGE_IDS[@]+"${STAGE_IDS[@]}"}"; do
+        if [[ "${STAGE_FINAL_STATUS[$id]:-}" == not-reached || -z "${STAGE_FINAL_STATUS[$id]:-}" ]]; then
+            STAGE_FINAL_STATUS["${id}"]=not-reached
+        fi
+    done
+
+    if [[ "${DRY_RUN:-false}" == true || "${RUN_STATUS_INITIALIZED:-false}" != true || ( ! -f "${RUN_STATUS_FILE:-}" && ! -f "${STAGE_STATUS_FILE:-}" ) ]]; then
+        return 2
+    fi
+
+    if [[ -f "${RUN_STATUS_FILE:-}" ]]; then
+        python3 - "${RUN_STATUS_FILE}" "${current_stg}" "${status}" "${end_ts}" "${exit_code}" "${error_id}" "${RUN_ID}" "${LAST_VALID_CHECKPOINT:-none}" "${OUTDIR:-.}/logs/last_error.json" "${CURRENT_STAGE_ACTION:-unknown}" <<'PY_STATUS_TERM'
+import csv, sys
+path, stage, status, end_time, exit_code, error_id, run_id, last_chk, err_rep, stg_action = sys.argv[1:11]
+try:
+    with open(path, newline='', encoding='utf-8') as f:
+        reader = csv.reader(f, delimiter='\t')
+        rows = list(reader)
+    if not rows:
+        sys.exit(1)
+    headers = rows[0]
+    extra_cols = ["run_id", "error_id", "last_valid_checkpoint", "error_report", "failed_stage", "failed_stage_action"]
+    for col in extra_cols:
+        if col not in headers:
+            headers.append(col)
+
+    stg_idx = headers.index("stage_internal_id") if "stage_internal_id" in headers else 0
+    status_idx = headers.index("final_status") if "final_status" in headers else 3
+    end_idx = headers.index("end_time") if "end_time" in headers else 5
+    code_idx = headers.index("exit_code") if "exit_code" in headers else 6
+
+    out_rows = [headers]
+    found = False
+    for row in rows[1:]:
+        if not row:
+            continue
+        while len(row) < len(headers):
+            row.append("")
+        stg_id = row[stg_idx]
+        if stg_id == stage:
+            found = True
+            row[status_idx] = status
+            row[end_idx] = end_time
+            row[code_idx] = str(exit_code)
+        elif row[status_idx] == "not-reached" or not row[status_idx]:
+            row[status_idx] = "not-reached"
+
+        if "run_id" in headers: row[headers.index("run_id")] = run_id
+        if "error_id" in headers: row[headers.index("error_id")] = error_id
+        if "last_valid_checkpoint" in headers: row[headers.index("last_valid_checkpoint")] = last_chk
+        if "error_report" in headers: row[headers.index("error_report")] = err_rep
+        if "failed_stage" in headers: row[headers.index("failed_stage")] = stage
+        if "failed_stage_action" in headers: row[headers.index("failed_stage_action")] = stg_action
+        out_rows.append(row)
+
+    if not found and stage == "pipeline":
+        new_row = ["" for _ in headers]
+        new_row[stg_idx] = "pipeline"
+        if "stage_public_name" in headers: new_row[headers.index("stage_public_name")] = "Preflight"
+        if "planned_action" in headers: new_row[headers.index("planned_action")] = stg_action
+        new_row[status_idx] = status
+        new_row[end_idx] = end_time
+        new_row[code_idx] = str(exit_code)
+        if "run_id" in headers: new_row[headers.index("run_id")] = run_id
+        if "error_id" in headers: new_row[headers.index("error_id")] = error_id
+        if "last_valid_checkpoint" in headers: new_row[headers.index("last_valid_checkpoint")] = last_chk
+        if "error_report" in headers: new_row[headers.index("error_report")] = err_rep
+        if "failed_stage" in headers: new_row[headers.index("failed_stage")] = stage
+        if "failed_stage_action" in headers: new_row[headers.index("failed_stage_action")] = stg_action
+        out_rows.append(new_row)
+
+    with open(path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.writer(f, delimiter='\t')
+        writer.writerows(out_rows)
+except Exception:
+    sys.exit(1)
+PY_STATUS_TERM
+    fi
+
+    local b_writer="${BENCHMARK_WRITER:-${PIPELINE_SCRIPTS_DIR:-./scripts}/write_benchmark_manifest.py}"
+    if [[ -f "${STAGE_STATUS_FILE:-}" && -f "${b_writer}" ]]; then
+        local end_mono
+        end_mono="$(python3 -c 'import time; print(f"{time.monotonic():.6f}")' 2>/dev/null || echo "0.0")"
+        local wall_sec="NA"
+        if [[ -n "${PIPELINE_START_MONOTONIC:-}" ]]; then
+            wall_sec="$(python3 -c "print(f'{(float(\"${end_mono}\") - float(\"${PIPELINE_START_MONOTONIC}\")):.3f}')" 2>/dev/null || echo "NA")"
+        fi
+
+        local manifest_status="failed"
+        case "${status}" in
+            interrupted) manifest_status="interrupted" ;;
+            terminated) manifest_status="terminated" ;;
+            *) manifest_status="failed" ;;
+        esac
+
+        if [[ "${status}" == "interrupted" || "${status}" == "terminated" ]]; then
+            python3 "${b_writer}" stage-signal \
+                --stage-status-path "${STAGE_STATUS_FILE}" \
+                --run-id "${RUN_ID}" \
+                --stage-id "${current_stg}" \
+                --signal "$([[ "${status}" == interrupted ]] && echo INT || echo TERM)" \
+                --exit-code "${exit_code}" \
+                --end-time-utc "${end_ts}" \
+                --error-id "${error_id}" \
+                --message "Pipeline interrupted by signal: ${status}" >/dev/null 2>&1 || true
+        else
+            python3 "${b_writer}" stage-fail \
+                --stage-status-path "${STAGE_STATUS_FILE}" \
+                --run-id "${RUN_ID}" \
+                --stage-id "${current_stg}" \
+                --planned-action "${CURRENT_STAGE_ACTION:-run}" \
+                --exit-code "${exit_code}" \
+                --end-time-utc "${end_ts}" \
+                --primary-log "${CURRENT_STAGE_LOG:-NA}" \
+                --error-id "${error_id}" \
+                --message "Pipeline stage failure in ${current_stg}" >/dev/null 2>&1 || true
+        fi
+
+        if [[ -f "${RUN_MANIFEST_FILE:-}" ]]; then
+            local err_count=1
+            if [[ -f "${LOGS_DIR:-}/errors.tsv" ]]; then
+                err_count="$(awk 'NR>1 {count++} END {print count+0}' "${LOGS_DIR}/errors.tsv" 2>/dev/null || echo 1)"
+            fi
+
+            python3 "${b_writer}" finalize-run \
+                --run-manifest-path "${RUN_MANIFEST_FILE}" \
+                --run-id "${RUN_ID}" \
+                --final-status "${manifest_status}" \
+                --exit-code "${exit_code}" \
+                --end-time-utc "${end_ts}" \
+                --wall-time-seconds "${wall_sec}" \
+                --warning-count "0" \
+                --error-count "${err_count}" >/dev/null 2>&1 || true
+        fi
+    fi
+
+    return 0
+}
+
+record_fallback_error() {
+    local rc="$1"
+    if (( rc == 0 )); then
+        return 0
+    fi
+
+    local stg="${CURRENT_STAGE:-pipeline}"
+    local stg_name="${CURRENT_STAGE_NAME:-$(stage_display_name "${stg}")}"
+    local stg_action="${CURRENT_STAGE_ACTION:-unknown}"
+    local stg_log="${CURRENT_STAGE_LOG:-$(stage_primary_log "${stg}")}"
+    local runtime="${CURRENT_STAGE_RUNTIME:-unknown}"
+    local final_cmd="${CURRENT_STAGE_COMMAND:-unknown}"
+
+    local trap_src_file="${BASH_SOURCE[0]:-unknown}"
+    local trap_src_line="${LINENO:-0}"
+    local call_src_file="${CURRENT_COMMAND_SOURCE_FILE:-${trap_src_file}}"
+    local call_src_line="${CURRENT_COMMAND_SOURCE_LINE:-${trap_src_line}}"
+
+    local status="failed"
+    local is_primary=false err_id="" err_key="" state=""
+
+    if [[ ! -f "${WRITE_ERROR_RECORD}" ]]; then
+        printf '[FATAL] %s [%s] Pipeline fallback failure: exit=%s line=%s\n' \
+            "${RUN_ID}" "$$" "${rc}" "${trap_src_line}" >&2
+        return 0
+    fi
+
+    while IFS='=' read -r k v; do
+        case "${k}" in
+            IS_PRIMARY) is_primary="${v}" ;;
+            ERROR_ID) err_id="${v}" ;;
+            ERROR_KEY) err_key="${v}" ;;
+            STATE) state="${v}" ;;
+        esac
+    done < <(python3 "${WRITE_ERROR_RECORD}" reserve \
+        --outdir "${OUTDIR}" \
+        --run-id "${RUN_ID}" \
+        --stage-id "${stg}" \
+        --stage-name "${stg_name}" \
+        --stage-action "${stg_action}" \
+        --exit-code "${rc}" \
+        --trap-source-file "${trap_src_file}" \
+        --trap-source-line "${trap_src_line}" \
+        --call-source-file "${call_src_file}" \
+        --call-source-line "${call_src_line}" \
+        --command "${final_cmd}" \
+        --pid "$$")
+
+    if [[ "${is_primary}" != true ]]; then
+        return 0
+    fi
+
+    local run_status_update_status="not-available"
+    record_pipeline_termination_state "${status}" "${rc}" "${err_id}"
+    local rec_rc=$?
+    if (( rec_rc == 0 )); then
+        run_status_update_status="updated"
+    elif (( rec_rc == 1 )); then
+        run_status_update_status="failed"
+    else
+        run_status_update_status="not-available"
+    fi
+
+    cleanup_safe_temporaries "failure"
+    python3 "${WRITE_ERROR_RECORD}" commit \
+        --outdir "${OUTDIR}" \
+        --run-id "${RUN_ID}" \
+        --error-id "${err_id}" \
+        --error-key "${err_key}" \
+        --stage-id "${stg}" \
+        --stage-name "${stg_name}" \
+        --stage-action "${stg_action}" \
+        --exit-code "${rc}" \
+        --signal "none" \
+        --trap-source-file "${trap_src_file}" \
+        --trap-source-line "${trap_src_line}" \
+        --call-source-file "${call_src_file}" \
+        --call-source-line "${call_src_line}" \
+        --function-name "record_fallback_error" \
+        --command "${final_cmd}" \
+        --log-path "${stg_log}" \
+        --runtime "${runtime}" \
+        --last-valid-checkpoint "${LAST_VALID_CHECKPOINT:-none}" \
+        --last-valid-checkpoint-path "${LAST_VALID_CHECKPOINT_PATH:-none}" \
+        --last-valid-product "${LAST_VALID_PRODUCT:-none}" \
+        --last-valid-product-fingerprint "${LAST_VALID_PRODUCT_FINGERPRINT:-none}" \
+        --message "Uncaught script termination fallback" \
+        --status "${status}" \
+        --run-status-update-status "${run_status_update_status}" \
+        --pipeline-version "${PIPELINE_VERSION}" \
+        --hostname "${PIPELINE_HOSTNAME}" \
+        --pid "$$" \
+        --temporary-directory "${PIPELINE_RUN_TMPDIR:-none}" \
+        --temporary-files-preserved "${TEMPORARY_FILES_PRESERVED:-false}" \
+        --temporary-cleanup-status "${TEMPORARY_CLEANUP_STATUS:-not-applicable}" >/dev/null 2>&1 || true
+
+    printf '[FATAL] %s | stage=%s | action=%s | exit=%s | line=%s | log=%s | last_checkpoint=%s\n' \
+        "${err_id}" "${stg}" "${stg_action}" "${rc}" "${trap_src_line}" "${stg_log}" "${LAST_VALID_CHECKPOINT:-none}" >&2
+}
+
+pipeline_error_handler() {
+    local rc="$1"
+    local line="$2"
+    local trap_cmd="$3"
+
     trap - ERR
-    PIPELINE_TERMINATION_RECORDED=true
-    if [[ -n "${CURRENT_STAGE:-}" ]]; then
-        id="${CURRENT_STAGE}"
-        STAGE_FINAL_STATUS["${id}"]=failed
-        STAGE_END_TIME["${id}"]="$(date -Is)"
-        STAGE_EXIT_CODE["${id}"]="${status}"
-        update_run_status "${id}" failed || true
+    set +e
+
+    if (( ERROR_HANDLER_ACTIVE == 1 || ERROR_ALREADY_RECORDED == 1 )); then
+        exit "${rc}"
     fi
-    for id in "${STAGE_IDS[@]}"; do
-        if [[ "${STAGE_FINAL_STATUS[$id]:-}" == not-reached ]]; then
-            update_run_status "${id}" not-reached || true
+    ERROR_HANDLER_ACTIVE=1
+
+    local trap_src_file="${BASH_SOURCE[0]:-unknown}"
+    local trap_src_line="${line}"
+    local call_src_file="${CURRENT_COMMAND_SOURCE_FILE:-${trap_src_file}}"
+    local call_src_line="${CURRENT_COMMAND_SOURCE_LINE:-${trap_src_line}}"
+    local func_name="${FUNCNAME[1]:-${FUNCNAME[0]:-unknown}}"
+
+    local stg="${CURRENT_STAGE:-pipeline}"
+    local stg_name="${CURRENT_STAGE_NAME:-$(stage_display_name "${stg}")}"
+    local stg_action="${CURRENT_STAGE_ACTION:-unknown}"
+    local stg_log="${CURRENT_STAGE_LOG:-$(stage_primary_log "${stg}")}"
+    local runtime="${CURRENT_STAGE_RUNTIME:-unknown}"
+
+    local final_cmd="${CURRENT_STAGE_COMMAND:-}"
+    if [[ -z "${final_cmd}" ]]; then
+        final_cmd="$(sanitize_command "${trap_cmd}")"
+    fi
+    [[ -z "${final_cmd}" ]] && final_cmd="unknown"
+
+    local status="failed"
+    if [[ "${stg_action}" == "preflight" || "${stg}" == "pipeline" ]]; then
+        status="preflight-failed"
+    fi
+
+    if [[ "${DRY_RUN:-false}" == true ]]; then
+        printf '[FATAL] [DRY-RUN] stage=%s | action=%s | exit=%s | line=%s | command=%s | would write errors.tsv in %s/logs/\n' \
+            "${stg}" "${stg_action}" "${rc}" "${trap_src_line}" "${final_cmd}" "${OUTDIR}" >&2
+        PIPELINE_TERMINATION_RECORDED=true
+        ERROR_ALREADY_RECORDED=1
+        exit "${rc}"
+    fi
+
+    if [[ ! -f "${WRITE_ERROR_RECORD}" ]]; then
+        printf '[FATAL] Pipeline error handler: exit=%s line=%s (error record manager unavailable)\n' \
+            "${rc}" "${trap_src_line}" >&2
+        PIPELINE_TERMINATION_RECORDED=true
+        ERROR_ALREADY_RECORDED=1
+        exit "${rc}"
+    fi
+
+    local is_primary=false err_id="" err_key="" state=""
+    while IFS='=' read -r k v; do
+        case "${k}" in
+            IS_PRIMARY) is_primary="${v}" ;;
+            ERROR_ID) err_id="${v}" ;;
+            ERROR_KEY) err_key="${v}" ;;
+            STATE) state="${v}" ;;
+        esac
+    done < <(python3 "${WRITE_ERROR_RECORD}" reserve \
+        --outdir "${OUTDIR}" \
+        --run-id "${RUN_ID}" \
+        --stage-id "${stg}" \
+        --stage-name "${stg_name}" \
+        --stage-action "${stg_action}" \
+        --exit-code "${rc}" \
+        --trap-source-file "${trap_src_file}" \
+        --trap-source-line "${trap_src_line}" \
+        --call-source-file "${call_src_file}" \
+        --call-source-line "${call_src_line}" \
+        --command "${final_cmd}" \
+        --pid "$$")
+
+    if [[ "${is_primary}" == true ]]; then
+        local run_status_update_status="not-available"
+        record_pipeline_termination_state "${status}" "${rc}" "${err_id}"
+        local rec_rc=$?
+        if (( rec_rc == 0 )); then
+            run_status_update_status="updated"
+        elif (( rec_rc == 1 )); then
+            run_status_update_status="failed"
+        else
+            run_status_update_status="not-available"
         fi
-    done
-    if [[ -x "${SUMMARY_GENERATOR:-}" && "${DRY_RUN:-false}" != true && -d "${OUTDIR:-}" ]]; then
-        local tax_stat="not-applicable" mag_stat="not-applicable"
-        [[ -s "${SUMMARY_DIR:-}/taxonomy_summary.tsv" ]] && tax_stat="available"
-        [[ -s "${SUMMARY_DIR:-}/mag_summary.tsv" ]] && mag_stat="available"
-        python3 "${SUMMARY_GENERATOR}" overview \
-            --outdir "${SUMMARY_DIR:-${OUTDIR}/12_summary}" \
-            --pipeline-outdir "${OUTDIR}" \
-            --pipeline-version "${PIPELINE_VERSION:-2.0.0}" \
-            --run-id "${RUN_ID:-run_${$}}" \
-            --profile "${REQUESTED_PROFILE:-custom}" \
-            --execution-mode "${EXEC_MODE:-apptainer}" \
-            --resume-plan "${OUTDIR}/resume_plan.tsv" \
-            --run-status "${OUTDIR}/run_status.tsv" \
-            --sample-manifest "${SAMPLE_MANIFEST_ACTIVE:-}" \
-            --reads-source "${ACTIVE_READS_SOURCE:-raw}" \
-            --assembly-path "${CONTIGS:-}" \
-            --assembly-source "$([[ -n "${ASSEMBLY_IN:-}" ]] && echo external || echo megahit)" \
-            --bins-source-requested "${BINS_SOURCE:-}" \
-            --bins-source-resolved "${BINS_SOURCE_RESOLVED:-}" \
-            --external-bins-fingerprint "${EXTERNAL_BINS_FINGERPRINT:-}" \
-            --threads "${THREADS:-1}" \
-            --min-completeness "${MIN_COMPLETENESS:-70}" \
-            --max-contamination "${MAX_CONTAMINATION:-10}" \
-            --comebin-device "${COMEBIN_DEVICE:-cpu}" \
-            --enabled-stages "${STAGE_IDS[*]:-}" \
-            --refinement-mode "${REFINEMENT_MODE:-auto}" \
-            --reassembly-enabled "${RUN_REASSEMBLY:-false}" \
-            --checkpoint-dir "${CHECKPOINT_DIR:-${OUTDIR}/.checkpoints}" \
-            --taxonomy-summary-status "${tax_stat}" \
-            --mag-summary-status "${mag_stat}" \
-            --software-inventory "${LOGS_DIR:-${OUTDIR}/logs}/software_versions.tsv" \
-            --database-inventory "${LOGS_DIR:-${OUTDIR}/logs}/database_versions.tsv" \
-            --log-reference "${LOGS_DIR:-${OUTDIR}/logs}" \
-            --final-status "failed" \
-            --errors-count 1 >/dev/null 2>&1 || true
+
+        cleanup_safe_temporaries "failure"
+        python3 "${WRITE_ERROR_RECORD}" commit \
+            --outdir "${OUTDIR}" \
+            --run-id "${RUN_ID}" \
+            --error-id "${err_id}" \
+            --error-key "${err_key}" \
+            --stage-id "${stg}" \
+            --stage-name "${stg_name}" \
+            --stage-action "${stg_action}" \
+            --exit-code "${rc}" \
+            --signal "none" \
+            --trap-source-file "${trap_src_file}" \
+            --trap-source-line "${trap_src_line}" \
+            --call-source-file "${call_src_file}" \
+            --call-source-line "${call_src_line}" \
+            --function-name "${func_name}" \
+            --command "${final_cmd}" \
+            --log-path "${stg_log}" \
+            --runtime "${runtime}" \
+            --last-valid-checkpoint "${LAST_VALID_CHECKPOINT:-none}" \
+            --last-valid-checkpoint-path "${LAST_VALID_CHECKPOINT_PATH:-none}" \
+            --last-valid-product "${LAST_VALID_PRODUCT:-none}" \
+            --last-valid-product-fingerprint "${LAST_VALID_PRODUCT_FINGERPRINT:-none}" \
+            --message "Pipeline stage failure in ${stg}" \
+            --status "${status}" \
+            --run-status-update-status "${run_status_update_status}" \
+            --pipeline-version "${PIPELINE_VERSION}" \
+            --hostname "${PIPELINE_HOSTNAME}" \
+            --pid "$$" \
+            --temporary-directory "${PIPELINE_RUN_TMPDIR:-none}" \
+            --temporary-files-preserved "${TEMPORARY_FILES_PRESERVED:-false}" \
+            --temporary-cleanup-status "${TEMPORARY_CLEANUP_STATUS:-not-applicable}" >/dev/null 2>&1 || true
+
+        printf '[FATAL] %s | stage=%s | action=%s | exit=%s | line=%s | log=%s | last_checkpoint=%s\n' \
+            "${err_id}" "${stg}" "${stg_action}" "${rc}" "${trap_src_line}" "${stg_log}" "${LAST_VALID_CHECKPOINT:-none}" >&2
     fi
-    printf '[FATAL] Pipeline failed with exit code %s at line %s. Check logs in %s/logs/.\n' \
-        "${status}" "${line}" "${OUTDIR}" >&2
-    exit "${status}"
+
+    PIPELINE_TERMINATION_RECORDED=true
+    ERROR_ALREADY_RECORDED=1
+    exit "${rc}"
 }
 
-pipeline_signal() {
-    local signal="$1" status="$2" id
-    trap - INT TERM ERR
-    PIPELINE_TERMINATION_RECORDED=true
-    log_warn "Pipeline interrupted by ${signal}."
-    if [[ -n "${CURRENT_STAGE:-}" ]]; then
-        id="${CURRENT_STAGE}"
-        STAGE_FINAL_STATUS["${id}"]=interrupted
-        STAGE_END_TIME["${id}"]="$(date -Is)"
-        STAGE_EXIT_CODE["${id}"]="${status}"
-        update_run_status "${id}" interrupted || true
+pipeline_signal_handler() {
+    local sig="$1"
+    local rc="$2"
+
+    trap - ERR INT TERM HUP
+    set +e
+
+    if (( ERROR_HANDLER_ACTIVE == 1 || ERROR_ALREADY_RECORDED == 1 )); then
+        exit "${rc}"
     fi
-    for id in "${STAGE_IDS[@]}"; do
-        if [[ "${STAGE_FINAL_STATUS[$id]:-}" == not-reached ]]; then
-            update_run_status "${id}" not-reached || true
+    ERROR_HANDLER_ACTIVE=1
+
+    local status="terminated"
+    [[ "${sig}" == "INT" ]] && status="interrupted"
+
+    local stg="${CURRENT_STAGE:-pipeline}"
+    local stg_name="${CURRENT_STAGE_NAME:-$(stage_display_name "${stg}")}"
+    local stg_action="${CURRENT_STAGE_ACTION:-unknown}"
+    local stg_log="${CURRENT_STAGE_LOG:-$(stage_primary_log "${stg}")}"
+    local runtime="${CURRENT_STAGE_RUNTIME:-unknown}"
+    local final_cmd="${CURRENT_STAGE_COMMAND:-unknown}"
+
+    local trap_src_file="${BASH_SOURCE[0]:-unknown}"
+    local trap_src_line="${LINENO:-0}"
+    local call_src_file="${CURRENT_COMMAND_SOURCE_FILE:-${trap_src_file}}"
+    local call_src_line="${CURRENT_COMMAND_SOURCE_LINE:-${trap_src_line}}"
+
+    if [[ "${DRY_RUN:-false}" == true ]]; then
+        printf '[FATAL] [DRY-RUN] stage=%s | action=%s | exit=%s | signal=%s | line=%s\n' \
+            "${stg}" "${stg_action}" "${rc}" "${sig}" "${trap_src_line}" >&2
+        PIPELINE_TERMINATION_RECORDED=true
+        ERROR_ALREADY_RECORDED=1
+        exit "${rc}"
+    fi
+
+    if [[ ! -f "${WRITE_ERROR_RECORD}" ]]; then
+        printf '[FATAL] Pipeline signal handler: %s (exit=%s)\n' "${sig}" "${rc}" >&2
+        PIPELINE_TERMINATION_RECORDED=true
+        ERROR_ALREADY_RECORDED=1
+        exit "${rc}"
+    fi
+
+    local is_primary=false err_id="" err_key="" state=""
+    while IFS='=' read -r k v; do
+        case "${k}" in
+            IS_PRIMARY) is_primary="${v}" ;;
+            ERROR_ID) err_id="${v}" ;;
+            ERROR_KEY) err_key="${v}" ;;
+            STATE) state="${v}" ;;
+        esac
+    done < <(python3 "${WRITE_ERROR_RECORD}" reserve \
+        --outdir "${OUTDIR}" \
+        --run-id "${RUN_ID}" \
+        --stage-id "${stg}" \
+        --stage-name "${stg_name}" \
+        --stage-action "${stg_action}" \
+        --exit-code "${rc}" \
+        --trap-source-file "${trap_src_file}" \
+        --trap-source-line "${trap_src_line}" \
+        --call-source-file "${call_src_file}" \
+        --call-source-line "${call_src_line}" \
+        --command "${final_cmd}" \
+        --pid "$$")
+
+    if [[ "${is_primary}" == true ]]; then
+        local run_status_update_status="not-available"
+        record_pipeline_termination_state "${status}" "${rc}" "${err_id}"
+        local rec_rc=$?
+        if (( rec_rc == 0 )); then
+            run_status_update_status="updated"
+        elif (( rec_rc == 1 )); then
+            run_status_update_status="failed"
+        else
+            run_status_update_status="not-available"
         fi
-    done
-    exit "${status}"
+
+        cleanup_safe_temporaries "signal"
+        python3 "${WRITE_ERROR_RECORD}" commit \
+            --outdir "${OUTDIR}" \
+            --run-id "${RUN_ID}" \
+            --error-id "${err_id}" \
+            --error-key "${err_key}" \
+            --stage-id "${stg}" \
+            --stage-name "${stg_name}" \
+            --stage-action "${stg_action}" \
+            --exit-code "${rc}" \
+            --signal "${sig}" \
+            --trap-source-file "${trap_src_file}" \
+            --trap-source-line "${trap_src_line}" \
+            --call-source-file "${call_src_file}" \
+            --call-source-line "${call_src_line}" \
+            --function-name "pipeline_signal_handler" \
+            --command "${final_cmd}" \
+            --log-path "${stg_log}" \
+            --runtime "${runtime}" \
+            --last-valid-checkpoint "${LAST_VALID_CHECKPOINT:-none}" \
+            --last-valid-checkpoint-path "${LAST_VALID_CHECKPOINT_PATH:-none}" \
+            --last-valid-product "${LAST_VALID_PRODUCT:-none}" \
+            --last-valid-product-fingerprint "${LAST_VALID_PRODUCT_FINGERPRINT:-none}" \
+            --message "Pipeline interrupted by signal ${sig}" \
+            --status "${status}" \
+            --run-status-update-status "${run_status_update_status}" \
+            --pipeline-version "${PIPELINE_VERSION}" \
+            --hostname "${PIPELINE_HOSTNAME}" \
+            --pid "$$" \
+            --temporary-directory "${PIPELINE_RUN_TMPDIR:-none}" \
+            --temporary-files-preserved "${TEMPORARY_FILES_PRESERVED:-false}" \
+            --temporary-cleanup-status "${TEMPORARY_CLEANUP_STATUS:-not-applicable}" >/dev/null 2>&1 || true
+
+        printf '[FATAL] %s | stage=%s | action=%s | exit=%s | signal=%s | line=%s | log=%s | last_checkpoint=%s\n' \
+            "${err_id}" "${stg}" "${stg_action}" "${rc}" "${sig}" "${trap_src_line}" "${stg_log}" "${LAST_VALID_CHECKPOINT:-none}" >&2
+    fi
+
+    PIPELINE_TERMINATION_RECORDED=true
+    ERROR_ALREADY_RECORDED=1
+    exit "${rc}"
 }
 
-pipeline_exit() {
-    local status="$1" id
-    [[ "${status}" -ne 0 && "${PIPELINE_TERMINATION_RECORDED}" != true ]] || return 0
-    PIPELINE_TERMINATION_RECORDED=true
-    if [[ -n "${CURRENT_STAGE:-}" ]]; then
-        STAGE_FINAL_STATUS["${CURRENT_STAGE}"]=failed
-        STAGE_END_TIME["${CURRENT_STAGE}"]="$(date -Is)"
-        STAGE_EXIT_CODE["${CURRENT_STAGE}"]="${status}"
-        update_run_status "${CURRENT_STAGE}" failed || true
+pipeline_exit_handler() {
+    local rc="$1"
+    if (( rc == 0 )); then
+        return 0
     fi
-    for id in "${STAGE_IDS[@]}"; do
-        [[ "${STAGE_FINAL_STATUS[$id]:-}" == not-reached ]] && update_run_status "${id}" not-reached || true
-    done
+    if (( ERROR_HANDLER_ACTIVE == 1 || ERROR_ALREADY_RECORDED == 1 )); then
+        return 0
+    fi
+    if [[ "${PIPELINE_TERMINATION_RECORDED}" == true ]]; then
+        return 0
+    fi
+
+    record_fallback_error "${rc}"
 }
-trap 'pipeline_exit "$?"' EXIT
+
+install_pipeline_traps() {
+    trap 'pipeline_error_handler "$?" "$LINENO" "$BASH_COMMAND"' ERR
+    trap 'pipeline_signal_handler INT 130' INT
+    trap 'pipeline_signal_handler TERM 143' TERM
+    trap 'pipeline_signal_handler HUP 129' HUP
+    trap 'pipeline_exit_handler "$?"' EXIT
+}
 
 mark_done() {
     local step="$1" tool key
@@ -3712,6 +5618,31 @@ mark_done() {
     checkpoint_config_manifest "${step}" > "${CHECKPOINT_DIR}/${step}.config"
     touch "${CHECKPOINT_DIR}/${step}.done"
     STAGE_CHECKPOINT_WRITTEN["${step}"]=true
+
+    local main_prod="none" prod_fp="none"
+    case "${step}" in
+        01_fastp) main_prod="${FASTP_CLEAN_SAMPLE_MANIFEST:-none}" ;;
+        02_megahit) main_prod="${CONTIGS:-none}" ;;
+        03_kraken2) main_prod="${KRAKEN2_DIR}/reports" ;;
+        04_mapping) main_prod="${DEPTH_FILE:-none}" ;;
+        05a_vamb) main_prod="${VAMB_DIR}/final_bins" ;;
+        05b_metabinner) main_prod="${METABINNER_DIR}/final_bins" ;;
+        05c_comebin) main_prod="${COMEBIN_DIR}/final_bins" ;;
+        06_refinement) main_prod="${REFINED_BINS_DIR:-none}" ;;
+        07_reassembly) main_prod="${REASSEMBLY_DIR}" ;;
+        08_checkm2) main_prod="${CHECKM2_DIR}/quality_report.tsv" ;;
+        09_filter_mags) main_prod="${MAGS_DIR}" ;;
+        10_gtdbtk) main_prod="${GTDBTK_DIR}" ;;
+        11_coverm) main_prod="${ABUNDANCE_DIR}" ;;
+        12a_taxonomy_summary) main_prod="${SUMMARY_DIR}/taxonomy_summary.tsv" ;;
+        12b_mag_summary) main_prod="${SUMMARY_DIR}/mag_summary.tsv" ;;
+        12c_run_overview) main_prod="${SUMMARY_DIR}/run_overview.tsv" ;;
+        *) main_prod="none" ;;
+    esac
+    [[ -n "${main_prod}" && -f "${main_prod}" ]] && prod_fp="$(sha256sum "${main_prod}" 2>/dev/null | awk '{print $1}')"
+
+    set_last_valid_checkpoint "${step}" "${CHECKPOINT_DIR}/${step}.done" "${main_prod}" "${prod_fp:-none}"
+    set_last_valid_product "${main_prod}" "${prod_fp:-none}"
     log_info "[Step ${step}] Checkpoint written."
 }
 
@@ -3744,6 +5675,9 @@ SUMMARY_DIR="${OUTDIR}/12_summary"
 LOGS_DIR="${OUTDIR}/logs"
 CHECKPOINT_DIR="${OUTDIR}/.checkpoints"
 TMPSCRIPTS_DIR="${OUTDIR}/logs/mamba_scripts"
+
+# Install full traps now that directories and error system are initialized
+install_pipeline_traps
 
 # ── Global State Variables ────────────────────────────────────────────────────
 CONTIGS=""
@@ -4855,44 +6789,82 @@ persist_resume_plan() {
 }
 
 initialize_run_status() {
-    local id public action status
+    RUN_MANIFEST_FILE="${LOGS_DIR}/run_manifest.tsv"
+    STAGE_STATUS_FILE="${LOGS_DIR}/stage_status.tsv"
     RUN_STATUS_FILE="${OUTDIR}/run_status.tsv"
+
     [[ "${DRY_RUN}" == true ]] && return 0
-    mkdir -p "${OUTDIR}"
-    {
-        printf 'stage_internal_id\tstage_public_name\tplanned_action\tfinal_status\tstart_time\tend_time\texit_code\tcheckpoint_written\n'
-        for id in "${STAGE_IDS[@]}"; do
-            public="$(get_stage_public_name "${id}")"
-            action="${STAGE_ACTION[$id]}"
-            case "${action}" in
-                disabled|not-applicable) status="${action}" ;;
-                *) status=not-reached ;;
-            esac
-            STAGE_FINAL_STATUS["${id}"]="${status}"
-            printf '%s\t%s\t%s\t%s\t\t\t\tfalse\n' "${id}" "${public}" "${action}" "${status}"
-        done
-    } > "${RUN_STATUS_FILE}"
+    mkdir -p "${LOGS_DIR}" "${OUTDIR}"
+
+    local cpu_req="NA"
+    if [[ -n "${SLURM_CPUS_PER_TASK:-}" ]]; then
+        cpu_req="${SLURM_CPUS_PER_TASK}"
+    elif [[ -n "${PBS_NP:-}" ]]; then
+        cpu_req="${PBS_NP}"
+    fi
+
+    local mem_lim="NA"
+    if [[ -n "${SLURM_MEM_PER_NODE:-}" ]]; then
+        mem_lim="${SLURM_MEM_PER_NODE}"
+    fi
+
+    local -a keep_tmp_args=()
+    [[ "${KEEP_TEMPORARY}" == true ]] && keep_tmp_args=(--keep-temporary)
+
+    python3 "${BENCHMARK_WRITER}" init \
+        --run-manifest-path "${RUN_MANIFEST_FILE}" \
+        --stage-status-path "${STAGE_STATUS_FILE}" \
+        --compat-run-status-path "${RUN_STATUS_FILE}" \
+        --resume-plan-path "${RESUME_PLAN_FILE}" \
+        --checkpoint-dir "${CHECKPOINT_DIR}" \
+        --run-id "${RUN_ID}" \
+        --pipeline-version "${PIPELINE_VERSION:-2.0.0}" \
+        --profile "${REQUESTED_PROFILE:-custom}" \
+        --execution-mode "${EXEC_MODE}" \
+        --start-time-utc "${PIPELINE_START_TIME_UTC}" \
+        --outdir "${OUTDIR}" \
+        --command-line "${PIPELINE_INVOCATION_COMMAND}" \
+        --hostname "${PIPELINE_HOSTNAME:-unknown}" \
+        --cpu-requested "${cpu_req}" \
+        --threads-effective "${THREADS}" \
+        --memory-limit-bytes "${mem_lim}" \
+        --active-sample-count "${#ACTIVE_SAMPLE_IDS[@]}" \
+        --active-reads-source "${ACTIVE_READS_SOURCE:-none}" \
+        --sample-manifest-path "${SAMPLE_MANIFEST_ACTIVE:-NA}" \
+        --sample-manifest-fingerprint "${ACTIVE_SAMPLE_MANIFEST_FINGERPRINT:-NA}" \
+        --assembly-source "$([[ -n "${ASSEMBLY_IN}" ]] && echo external || echo megahit)" \
+        --assembly-path "${CONTIGS:-NA}" \
+        --assembly-fingerprint "${ASSEMBLY_FINGERPRINT:-NA}" \
+        --bins-source-requested "${BINS_SOURCE:-NA}" \
+        --bins-source-resolved "${BINS_SOURCE_RESOLVED:-NA}" \
+        --bins-fingerprint "${EXTERNAL_BINS_FINGERPRINT:-NA}" \
+        --min-completeness "${MIN_COMPLETENESS}" \
+        --max-contamination "${MAX_CONTAMINATION}" \
+        --tmpdir-source "${PIPELINE_TMPDIR_SOURCE:-fallback}" \
+        --tmpdir-base "${PIPELINE_TMPDIR_BASE:-NA}" \
+        "${keep_tmp_args[@]}" \
+        --software-inventory-path "${LOGS_DIR}/software_versions.tsv" \
+        --database-inventory-path "${LOGS_DIR}/database_versions.tsv" \
+        --error-history-path "${LOGS_DIR}/errors.tsv" \
+        --last-error-path "${LOGS_DIR}/last_error.json" \
+        --taxonomy-summary-path "${SUMMARY_DIR}/taxonomy_summary.tsv" \
+        --mag-summary-path "${SUMMARY_DIR}/mag_summary.tsv" \
+        --run-overview-path "${SUMMARY_DIR}/run_overview.tsv" \
+        --warning-count "0" \
+        --error-count "0"
+
     RUN_STATUS_INITIALIZED=true
 }
 
 update_run_status() {
-    local id="$1" status="$2" start="${STAGE_START_TIME[$1]:-}" end="${STAGE_END_TIME[$1]:-}"
-    local code="${STAGE_EXIT_CODE[$1]:-}" checkpoint="${STAGE_CHECKPOINT_WRITTEN[$1]:-false}"
+    local id="$1" status="$2"
     [[ "${DRY_RUN}" == true || "${RUN_STATUS_INITIALIZED}" != true ]] && return 0
-    python3 - "${RUN_STATUS_FILE}" "${id}" "${status}" "${start}" "${end}" "${code}" "${checkpoint}" <<'PY_STATUS'
-import csv, sys
-path, stage, status, start, end, code, checkpoint = sys.argv[1:]
-with open(path, newline='', encoding='utf-8') as stream:
-    rows = list(csv.DictReader(stream, delimiter='\t'))
-for row in rows:
-    if row['stage_internal_id'] == stage:
-        row.update(final_status=status, start_time=start, end_time=end,
-                   exit_code=code, checkpoint_written=checkpoint)
-with open(path, 'w', newline='', encoding='utf-8') as stream:
-    writer = csv.DictWriter(stream, fieldnames=rows[0].keys(), delimiter='\t', lineterminator='\n')
-    writer.writeheader()
-    writer.writerows(rows)
-PY_STATUS
+    STAGE_FINAL_STATUS["${id}"]="${status}"
+    : "${STAGE_START_TIME[$id]:-}" "${STAGE_END_TIME[$id]:-}" "${STAGE_EXIT_CODE[$id]:-}"
+    python3 "${BENCHMARK_WRITER}" sync-compat \
+        --stage-status-path "${STAGE_STATUS_FILE}" \
+        --compat-run-status-path "${RUN_STATUS_FILE}" \
+        --run-id "${RUN_ID}" >/dev/null 2>&1 || true
 }
 
 assert_path_within_outdir() {
@@ -4935,9 +6907,18 @@ clean_stage_outputs() {
         case "${protected_path}" in
             "$(realpath -m "${LOGS_DIR}/inventory")"|\
             "$(realpath -m "${LOGS_DIR}/inventory")"/*|\
+            "$(realpath -m "${LOGS_DIR}/run_manifest.tsv")"|\
+            "$(realpath -m "${LOGS_DIR}/stage_status.tsv")"|\
+            "$(realpath -m "${OUTDIR}/run_status.tsv")"|\
             "$(realpath -m "${LOGS_DIR}/software_versions.tsv")"|\
-            "$(realpath -m "${LOGS_DIR}/database_versions.tsv")")
-                log_error "Refusing to clean protected inventory path: ${path}"
+            "$(realpath -m "${LOGS_DIR}/database_versions.tsv")"|\
+            "$(realpath -m "${LOGS_DIR}/errors.tsv")"|\
+            "$(realpath -m "${LOGS_DIR}/last_error.json")"|\
+            "$(realpath -m "${LOGS_DIR}/checkpoint_state")"|\
+            "$(realpath -m "${LOGS_DIR}/checkpoint_state")"/*|\
+            "$(realpath -m "${LOGS_DIR}/last_valid_checkpoint.state")"|\
+            "$(realpath -m "${LOGS_DIR}")"/.error_recorded.*)
+                log_error "Refusing to clean protected persistent error or inventory path: ${path}"
                 return 1 ;;
         esac
         if [[ "${id}" == 05a_vamb ]]; then
@@ -5444,6 +7425,25 @@ preflight_check() {
         errors=$((errors + 1))
     fi
 
+    # ── Temporary workspace: resolve base and freeze per-run paths ────────────
+    # Must run after configure_stage_actions so we know the reassembly action.
+    if ! resolve_pipeline_tmpdir_base; then
+        (( errors += 1 ))
+    else
+        validate_pipeline_tmpdir_base || (( errors += 1 )) || true
+        # Freeze the per-run paths (after plan is frozen)
+        PIPELINE_RUN_TMPDIR="${PIPELINE_TMP_PARENT}/${RUN_ID}"
+        REASSEMBLY_TMPDIR="${PIPELINE_RUN_TMPDIR}/reassembly"
+        PIPELINE_TMP_MARKER="${PIPELINE_RUN_TMPDIR}/.pipeline_tmp_owner"
+        if [[ "${DRY_RUN}" == true ]]; then
+            show_tmpdir_dry_run_info
+        elif [[ "${RUN_REASSEMBLY}" == true ]] && stage_action_requires_execution 07_reassembly; then
+            if ! check_tmpdir_space ACTIVE_R1_FILES ACTIVE_R2_FILES; then
+                (( errors += 1 ))
+            fi
+        fi
+    fi
+
     # External assemblies are opt-in and never disable MEGAHIT implicitly.
     if [[ "${RUN_MEGAHIT}" == true && -n "${ASSEMBLY_IN}" ]]; then
         log_error "--assembly-in cannot be combined with MEGAHIT; pass --no-megahit explicitly."
@@ -5695,6 +7695,26 @@ preflight_check() {
     for graph_parent in "${STAGE_IDS[@]}"; do
         log_info "  $(get_stage_public_name "${graph_parent}") [${STAGE_STATE[$graph_parent]}]: ${STAGE_ACTION[$graph_parent]} (${STAGE_REASON[$graph_parent]})"
     done
+    # Detect GNU time for resource metrics
+    if /usr/bin/time --version 2>&1 | grep -q "GNU Time"; then
+        GNU_TIME_BIN="/usr/bin/time"
+        GNU_TIME_AVAILABLE=true
+        log_info "[Benchmark] GNU time detected: ${GNU_TIME_BIN}."
+    else
+        GNU_TIME_BIN=""
+        GNU_TIME_AVAILABLE=false
+        log_info "[Benchmark] GNU time not detected; CPU/RSS metrics will be recorded as NA."
+    fi
+    PIPELINE_START_MONOTONIC="$(python3 -c 'import time; print(f"{time.monotonic():.6f}")' 2>/dev/null || echo "0.0")"
+    PIPELINE_INVOCATION_COMMAND="$(sanitize_command "${PIPELINE_INVOCATION_RAW[@]}")"
+
+    if [[ "${DRY_RUN}" == true ]]; then
+        log_info "[DRY-RUN] Benchmark manifests planned:"
+        log_info "  Run manifest   : would record ${LOGS_DIR}/run_manifest.tsv"
+        log_info "  Stage status   : would record ${LOGS_DIR}/stage_status.tsv"
+        log_info "  Compatibility  : would mirror to ${OUTDIR}/run_status.tsv"
+    fi
+
     persist_resume_plan
     initialize_run_status
     log_info "Pre-flight OK."
@@ -5752,22 +7772,22 @@ step_01_fastp() {
         local step_log="${LOGS_DIR}/step_01_fastp_${sample}.log"
 
         log_info "[Step 01] Processing sample: ${sample}"
-        run_tool "01" "${SIF_FASTP}" "${SIF_FASTP_URI}" fastp \
-            -i "${r1}" \
-            -I "${r2}" \
-            -o "${out_r1}" \
-            -O "${out_r2}" \
-            -h "${html_report}" \
-            -j "${json_report}" \
-            -D \
-            -5 20 \
-            -3 20 \
-            -r 20 \
-            -M 20 \
-            -e 20 \
-            -n 50 \
-            -w "${fastp_threads}" \
-            2>&1 | tee "${step_log}"
+        run_cmd_with_tee "${step_log}" -- \
+            run_tool "01" "${SIF_FASTP}" "${SIF_FASTP_URI}" fastp \
+                -i "${r1}" \
+                -I "${r2}" \
+                -o "${out_r1}" \
+                -O "${out_r2}" \
+                -h "${html_report}" \
+                -j "${json_report}" \
+                -D \
+                -5 20 \
+                -3 20 \
+                -r 20 \
+                -M 20 \
+                -e 20 \
+                -n 50 \
+                -w "${fastp_threads}"
 
         CLEAN_R1_FILES+=("${out_r1}")
         CLEAN_R2_FILES+=("${out_r2}")
@@ -5824,14 +7844,14 @@ step_02_megahit() {
         run_cmd rm -rf "${megahit_outdir}"
     fi
 
-    run_tool "02" "${SIF_MEGAHIT}" "${SIF_MEGAHIT_URI}" megahit \
-        -1 "${r1_list}" \
-        -2 "${r2_list}" \
-        -o "${megahit_outdir}" \
-        -t "${THREADS}" \
-        --min-contig-len "${MIN_CONTIG_LEN}" \
-        -m "${mem_bytes}" \
-        2>&1 | tee "${step_log}"
+    run_cmd_with_tee "${step_log}" -- \
+        run_tool "02" "${SIF_MEGAHIT}" "${SIF_MEGAHIT_URI}" megahit \
+            -1 "${r1_list}" \
+            -2 "${r2_list}" \
+            -o "${megahit_outdir}" \
+            -t "${THREADS}" \
+            --min-contig-len "${MIN_CONTIG_LEN}" \
+            -m "${mem_bytes}"
 
     local raw_contigs="${megahit_outdir}/final.contigs.fa"
     CONTIGS="${ASSEMBLY_DIR}/final.contigs.fa"
@@ -5900,23 +7920,23 @@ step_03_kraken2_bracken() {
         local bracken_log="${LOGS_DIR}/step_03_bracken_${base}.log"
 
         log_info "[Step 03] Running Kraken2 for sample: ${base}"
-        run_tool "03" "${SIF_KRAKEN2}" "${SIF_KRAKEN2_URI}" kraken2 \
-            --db "${KRAKEN2_DB}" \
-            --threads "${THREADS}" \
-            --paired "${r1}" "${r2}" \
-            --output "${kraken_out}" \
-            --report "${kraken_report}" \
-            2>&1 | tee "${kraken_log}"
+        run_cmd_with_tee "${kraken_log}" -- \
+            run_tool "03" "${SIF_KRAKEN2}" "${SIF_KRAKEN2_URI}" kraken2 \
+                --db "${KRAKEN2_DB}" \
+                --threads "${THREADS}" \
+                --paired "${r1}" "${r2}" \
+                --output "${kraken_out}" \
+                --report "${kraken_report}"
 
         log_info "[Step 03] Running Bracken for sample: ${base}"
-        run_tool "03" "${SIF_KRAKEN2}" "${SIF_KRAKEN2_URI}" bracken \
-            -d "${KRAKEN2_DB}" \
-            -i "${kraken_report}" \
-            -o "${bracken_out}" \
-            -r "${BRACKEN_READ_LEN}" \
-            -l "${BRACKEN_TAX_LEVEL}" \
-            -t "${BRACKEN_THRESHOLD}" \
-            2>&1 | tee "${bracken_log}"
+        run_cmd_with_tee "${bracken_log}" -- \
+            run_tool "03" "${SIF_KRAKEN2}" "${SIF_KRAKEN2_URI}" bracken \
+                -d "${KRAKEN2_DB}" \
+                -i "${kraken_report}" \
+                -o "${bracken_out}" \
+                -r "${BRACKEN_READ_LEN}" \
+                -l "${BRACKEN_TAX_LEVEL}" \
+                -t "${BRACKEN_THRESHOLD}"
     done
 
     mark_done "03_kraken2"
@@ -5955,11 +7975,11 @@ step_04_mapping_depth() {
     local build_log="${LOGS_DIR}/step_04_bowtie2_build.log"
 
     log_info "[Step 04] Building Bowtie2 index..."
-    run_tool "04" "${SIF_MAPPING}" "${SIF_MAPPING_URI}" bowtie2-build \
-        --threads "${THREADS}" \
-        "${CONTIGS}" \
-        "${bt2_index}" \
-        2>&1 | tee "${build_log}"
+    run_cmd_with_tee "${build_log}" -- \
+        run_tool "04" "${SIF_MAPPING}" "${SIF_MAPPING_URI}" bowtie2-build \
+            --threads "${THREADS}" \
+            "${CONTIGS}" \
+            "${bt2_index}"
 
     local -a r1_sources=("${ACTIVE_R1_FILES[@]}")
     local -a r2_sources=("${ACTIVE_R2_FILES[@]}")
@@ -6007,10 +8027,10 @@ step_04_mapping_depth() {
     local jgi_log="${LOGS_DIR}/step_04_jgi_depth.log"
 
     log_info "[Step 04] Running jgi_summarize_bam_contig_depths..."
-    run_tool "04" "${SIF_MAPPING}" "${SIF_MAPPING_URI}" jgi_summarize_bam_contig_depths \
-        --outputDepth "${DEPTH_FILE}" \
-        "${SORTED_BAMS[@]}" \
-        2>&1 | tee "${jgi_log}"
+    run_cmd_with_tee "${jgi_log}" -- \
+        run_tool "04" "${SIF_MAPPING}" "${SIF_MAPPING_URI}" jgi_summarize_bam_contig_depths \
+            --outputDepth "${DEPTH_FILE}" \
+            "${SORTED_BAMS[@]}"
 
     mark_done "04_mapping"
 }
@@ -6059,7 +8079,8 @@ step_05a_vamb() {
     local vamb_script="${TMPSCRIPTS_DIR}/step_05a_vamb.sh"
     write_vamb_script "${vamb_script}"
 
-    run_mamba_file "05a" "${ENV_VAMB}" "${vamb_script}" 2>&1 | tee "${LOGS_DIR}/step_05a_vamb.log"
+    run_cmd_with_tee "${LOGS_DIR}/step_05a_vamb.log" -- \
+        run_mamba_file "05a" "${ENV_VAMB}" "${vamb_script}"
 
     local vamb_bins_dir="${VAMB_DIR}/vamb_out/bins"
     if [[ "${DRY_RUN}" == true ]]; then
@@ -6136,7 +8157,8 @@ python "${METABINNER_SCRIPTS_DIR}/gen_kmer.py" "${METABINNER_DIR}/assembly.fa" "
 MB_PREP_SCRIPT
 
     chmod +x "${mb_prep_script}"
-    run_mamba_file "05b" "${ENV_METABINNER}" "${mb_prep_script}" 2>&1 | tee "${LOGS_DIR}/step_05b_metabinner_prep.log"
+    run_cmd_with_tee "${LOGS_DIR}/step_05b_metabinner_prep.log" -- \
+        run_mamba_file "05b" "${ENV_METABINNER}" "${mb_prep_script}"
 
     # Step 4: Write embedded Python sync script
     log_info "[Step 05b] Writing sync_metabinner.py..."
@@ -6271,7 +8293,8 @@ bash "${METABINNER_RUNNER}" \\
 MB_RUN_SCRIPT
 
     chmod +x "${mb_run_script}"
-    run_mamba_file "05b" "${ENV_METABINNER}" "${mb_run_script}" 2>&1 | tee "${LOGS_DIR}/step_05b_metabinner_run.log"
+    run_cmd_with_tee "${LOGS_DIR}/step_05b_metabinner_run.log" -- \
+        run_mamba_file "05b" "${ENV_METABINNER}" "${mb_run_script}"
 
     local mb_bins_dir="${METABINNER_DIR}/metabinner_out/result_bins"
     if [[ "${DRY_RUN}" == true ]]; then
@@ -6331,7 +8354,8 @@ step_05c_comebin() {
     local comebin_script="${TMPSCRIPTS_DIR}/step_05c_comebin.sh"
     COMEBIN_BAM_DIR="$(prepare_comebin_bam_dir)"
     write_comebin_script "${comebin_script}"
-    run_mamba_file "05c" "${ENV_COMEBIN}" "${comebin_script}" 2>&1 | tee "${LOGS_DIR}/step_05c_comebin.log"
+    run_cmd_with_tee "${LOGS_DIR}/step_05c_comebin.log" -- \
+        run_mamba_file "05c" "${ENV_COMEBIN}" "${comebin_script}"
 
     local cb_bins_dir="${COMEBIN_DIR}/comebin_res/comebin_res_bins"
     if [[ "${DRY_RUN}" == true ]]; then
@@ -6397,7 +8421,8 @@ step_06_bin_refinement() {
     } > "${refinement_script}"
 
     chmod +x "${refinement_script}"
-    run_mamba_file "06" "${ENV_METAWRAP}" "${refinement_script}" 2>&1 | tee "${LOGS_DIR}/step_06_bin_refinement.log"
+    run_cmd_with_tee "${LOGS_DIR}/step_06_bin_refinement.log" -- \
+        run_mamba_file "06" "${ENV_METAWRAP}" "${refinement_script}"
 
     if [[ "${DRY_RUN}" == true ]]; then
         mark_done "06_refinement"
@@ -6436,35 +8461,175 @@ step_07_reassembly() {
 
     mkdir -p "${REASSEMBLY_DIR}"
 
-    local -a r1_sources=("${ACTIVE_R1_FILES[@]}")
-    local -a r2_sources=("${ACTIVE_R2_FILES[@]}")
+    # ── Create the per-run temporary workspace ────────────────────────────────
+    if [[ -z "${REASSEMBLY_TMPDIR}" ]]; then
+        log_error "[Step 07] REASSEMBLY_TMPDIR is not set. This is an internal error."
+        exit 1
+    fi
+    create_pipeline_run_tmpdir || exit 1
 
-    local all_r1="${REASSEMBLY_DIR}/all_reads_R1.fastq.gz"
-    local all_r2="${REASSEMBLY_DIR}/all_reads_R2.fastq.gz"
+    # ── Concatenate reads into REASSEMBLY_TMPDIR ──────────────────────────────
+    local reassembly_r1="" reassembly_r2=""
+    prepare_reassembly_tmpdir reassembly_r1 reassembly_r2 || exit 1
 
-    log_info "[Step 07] Concatenating R1 reads into ${all_r1}..."
-    run_cmd_redirect "${all_r1}" cat "${r1_sources[@]}"
+    log_info "[Step 07] Temporary reads:"
+    log_info "          R1: ${reassembly_r1}"
+    log_info "          R2: ${reassembly_r2}"
+    log_info "[Step 07] Strategy      : ${REASSEMBLY_TEMP_READS_STRATEGY} v${REASSEMBLY_TEMP_READS_STRATEGY_VERSION}"
+    log_info "[Step 07] Validation    : ${REASSEMBLY_TEMP_READS_VALIDATION} v${REASSEMBLY_TEMP_READS_VALIDATION_VERSION}"
 
-    log_info "[Step 07] Concatenating R2 reads into ${all_r2}..."
-    run_cmd_redirect "${all_r2}" cat "${r2_sources[@]}"
-
+    # ── Dispatch reassembly ───────────────────────────────────────────────────
     local reassembly_script="${TMPSCRIPTS_DIR}/step_07_reassembly.sh"
-    cat > "${reassembly_script}" <<REASSEMBLY_SCRIPT
+
+    if [[ "${EXEC_MODE}" == "apptainer" ]]; then
+        # Build bind mounts; add the per-run tmpdir exclusively (read-write)
+        local sif_path uri
+        read -r sif_path uri < <(_env_to_sif "${ENV_METAWRAP}")
+        local abs_sif
+        abs_sif="$(realpath -m "${sif_path}" 2>/dev/null || echo "${sif_path}")"
+        CURRENT_STAGE_RUNTIME="apptainer:${abs_sif}"
+
+        ensure_sif_image "${sif_path}" "${uri}" || exit 1
+
+        local -a bind_args=()
+        build_bind_mounts bind_args
+        # Add the isolated per-run tmpdir as an exclusive bind (same path inside)
+        bind_args+=(-B "${PIPELINE_RUN_TMPDIR}:${PIPELINE_RUN_TMPDIR}:rw")
+
+        local runtime="apptainer"
+        command -v apptainer &>/dev/null || runtime="singularity"
+
+        # Validate that the reads are visible and tmpdir is writable inside container
+        log_info "[Step 07] Engine: Apptainer | Image: ${sif_path}"
+        if [[ "${DRY_RUN}" != true ]]; then
+            log_info "[Step 07] Validating container access to temporary workspace..."
+            if ! "${runtime}" exec --cleanenv "${bind_args[@]}" "${sif_path}" test -w "${REASSEMBLY_TMPDIR}"; then
+                log_error "[Step 07] Container cannot write to temporary workspace: ${REASSEMBLY_TMPDIR}"
+                exit 1
+            fi
+            if ! "${runtime}" exec --cleanenv "${bind_args[@]}" "${sif_path}" test -r "${reassembly_r1}"; then
+                log_error "[Step 07] Container cannot read temporary R1: ${reassembly_r1}"
+                exit 1
+            fi
+            if ! "${runtime}" exec --cleanenv "${bind_args[@]}" "${sif_path}" test -r "${reassembly_r2}"; then
+                log_error "[Step 07] Container cannot read temporary R2: ${reassembly_r2}"
+                exit 1
+            fi
+        fi
+
+        # Script references the in-container paths (identical due to same-path bind)
+        cat > "${reassembly_script}" <<REASSEMBLY_SCRIPT
 #!/usr/bin/env bash
 set -euo pipefail
 metawrap reassemble_bins \\
     -o "${REASSEMBLY_DIR}" \\
     -b "${BINS_FOR_REASSEMBLY}" \\
-    -1 "${REASSEMBLY_DIR}/all_reads_R1.fastq.gz" \\
-    -2 "${REASSEMBLY_DIR}/all_reads_R2.fastq.gz" \\
+    -1 "${reassembly_r1}" \\
+    -2 "${reassembly_r2}" \\
     -t "${THREADS}" \\
     -m "${MEMORY}"
 REASSEMBLY_SCRIPT
+        chmod +x "${reassembly_script}"
+        log_info "[Step 07] Script: ${reassembly_script}"
 
-    chmod +x "${reassembly_script}"
-    run_mamba_file "07" "${ENV_METAWRAP}" "${reassembly_script}" 2>&1 | tee "${LOGS_DIR}/step_07_reassembly.log"
+        CURRENT_COMMAND_SOURCE_FILE="${BASH_SOURCE[0]}"
+        CURRENT_COMMAND_SOURCE_LINE="${LINENO}"
+        CURRENT_STAGE_COMMAND="${runtime} exec --cleanenv ${bind_args[*]} ${sif_path} bash ${reassembly_script}"
+
+        if [[ "${DRY_RUN}" == true ]]; then
+            printf '[DRY-RUN] %q ' "${runtime}" exec --cleanenv "${bind_args[@]}" \
+                --env "TMPDIR=${REASSEMBLY_TMPDIR}" \
+                --env "TMP=${REASSEMBLY_TMPDIR}" \
+                --env "TEMP=${REASSEMBLY_TMPDIR}" \
+                "${sif_path}" bash "${reassembly_script}"
+            printf '\n'
+            echo -e "${YELLOW}[DRY-RUN]${NC} --- script contents ---"
+            cat "${reassembly_script}"
+            echo -e "${YELLOW}[DRY-RUN]${NC} --- end of script ---"
+            CURRENT_STAGE_COMMAND=""
+            CURRENT_COMMAND_SOURCE_FILE=""
+            CURRENT_COMMAND_SOURCE_LINE=""
+            mark_done "07_reassembly"
+            return 0
+        fi
+
+        local had_errexit=0 rc=0
+        [[ $- == *e* ]] && had_errexit=1
+        set +e
+        run_cmd_with_tee "${LOGS_DIR}/step_07_reassembly.log" -- \
+            env APPTAINERENV_TMPDIR="${REASSEMBLY_TMPDIR}" \
+                APPTAINERENV_TMP="${REASSEMBLY_TMPDIR}" \
+                APPTAINERENV_TEMP="${REASSEMBLY_TMPDIR}" \
+                SINGULARITYENV_TMPDIR="${REASSEMBLY_TMPDIR}" \
+                SINGULARITYENV_TMP="${REASSEMBLY_TMPDIR}" \
+                SINGULARITYENV_TEMP="${REASSEMBLY_TMPDIR}" \
+            "${runtime}" exec --cleanenv "${bind_args[@]}" \
+                --env "TMPDIR=${REASSEMBLY_TMPDIR}" \
+                --env "TMP=${REASSEMBLY_TMPDIR}" \
+                --env "TEMP=${REASSEMBLY_TMPDIR}" \
+                "${sif_path}" bash "${reassembly_script}"
+        rc=$?
+        (( had_errexit )) && set -e
+        if (( rc != 0 )); then
+            exit "${rc}"
+        fi
+        CURRENT_STAGE_COMMAND=""
+        CURRENT_COMMAND_SOURCE_FILE=""
+        CURRENT_COMMAND_SOURCE_LINE=""
+
+    else
+        # Mamba mode: pass TMPDIR/TMP/TEMP only to the reassembly invocation
+        CURRENT_STAGE_RUNTIME="mamba:${ENV_METAWRAP}"
+        cat > "${reassembly_script}" <<REASSEMBLY_SCRIPT
+#!/usr/bin/env bash
+set -euo pipefail
+metawrap reassemble_bins \\
+    -o "${REASSEMBLY_DIR}" \\
+    -b "${BINS_FOR_REASSEMBLY}" \\
+    -1 "${reassembly_r1}" \\
+    -2 "${reassembly_r2}" \\
+    -t "${THREADS}" \\
+    -m "${MEMORY}"
+REASSEMBLY_SCRIPT
+        chmod +x "${reassembly_script}"
+        log_info "[Step 07] Engine: mamba | Env: ${BOLD}${ENV_METAWRAP}${NC}"
+        log_info "[Step 07] Script: ${reassembly_script}"
+
+        CURRENT_COMMAND_SOURCE_FILE="${BASH_SOURCE[0]}"
+        CURRENT_COMMAND_SOURCE_LINE="${LINENO}"
+        CURRENT_STAGE_COMMAND="env TMPDIR=${REASSEMBLY_TMPDIR} TMP=${REASSEMBLY_TMPDIR} TEMP=${REASSEMBLY_TMPDIR} mamba run -n ${ENV_METAWRAP} bash ${reassembly_script}"
+
+        if [[ "${DRY_RUN}" == true ]]; then
+            echo -e "${YELLOW}[DRY-RUN]${NC} env TMPDIR=${REASSEMBLY_TMPDIR} TMP=${REASSEMBLY_TMPDIR} TEMP=${REASSEMBLY_TMPDIR} mamba run -n ${ENV_METAWRAP} bash ${reassembly_script}"
+            echo -e "${YELLOW}[DRY-RUN]${NC} --- script contents ---"
+            cat "${reassembly_script}"
+            echo -e "${YELLOW}[DRY-RUN]${NC} --- end of script ---"
+            CURRENT_STAGE_COMMAND=""
+            CURRENT_COMMAND_SOURCE_FILE=""
+            CURRENT_COMMAND_SOURCE_LINE=""
+            mark_done "07_reassembly"
+            return 0
+        fi
+
+        local had_errexit=0 rc=0
+        [[ $- == *e* ]] && had_errexit=1
+        set +e
+        run_cmd_with_tee "${LOGS_DIR}/step_07_reassembly.log" -- \
+            env TMPDIR="${REASSEMBLY_TMPDIR}" TMP="${REASSEMBLY_TMPDIR}" TEMP="${REASSEMBLY_TMPDIR}" \
+                mamba run -n "${ENV_METAWRAP}" bash "${reassembly_script}"
+        rc=$?
+        (( had_errexit )) && set -e
+        if (( rc != 0 )); then
+            exit "${rc}"
+        fi
+        CURRENT_STAGE_COMMAND=""
+        CURRENT_COMMAND_SOURCE_FILE=""
+        CURRENT_COMMAND_SOURCE_LINE=""
+    fi
 
     mark_done "07_reassembly"
+    # Controlled success cleanup (after checkpoint written)
+    cleanup_safe_temporaries "success"
 }
 
 # ── Step 08: CheckM2 Quality Assessment ───────────────────────────────────────
@@ -6523,7 +8688,8 @@ checkm2 predict \\
 CHECKM2_SCRIPT
 
     chmod +x "${checkm2_script}"
-    run_mamba_file "08" "${ENV_CHECKM2}" "${checkm2_script}" 2>&1 | tee "${LOGS_DIR}/step_08_checkm2.log"
+    run_cmd_with_tee "${LOGS_DIR}/step_08_checkm2.log" -- \
+        run_mamba_file "08" "${ENV_CHECKM2}" "${checkm2_script}"
 
     if [[ ! -f "${CHECKM2_DIR}/quality_report.tsv" ]]; then
         log_error "[Step 08] CheckM2 quality_report.tsv not found. CheckM2 may have failed."
@@ -6725,7 +8891,8 @@ gtdbtk classify_wf \\
 GTDBTK_SCRIPT
 
     chmod +x "${gtdbtk_script}"
-    run_mamba_file "10" "${ENV_GTDBTK}" "${gtdbtk_script}" 2>&1 | tee "${LOGS_DIR}/step_10_gtdbtk.log"
+    run_cmd_with_tee "${LOGS_DIR}/step_10_gtdbtk.log" -- \
+        run_mamba_file "10" "${ENV_GTDBTK}" "${gtdbtk_script}"
 
     mark_done "10_gtdbtk"
 }
@@ -6790,16 +8957,16 @@ step_11_coverm() {
         fi
 
         log_info "[Step 11] Running CoverM for sample: ${base}"
-        run_tool "11" "${SIF_COVERM}" "${SIF_COVERM_URI}" coverm genome \
-            --read1 "${r1}" \
-            --read2 "${r2}" \
-            --genome-fasta-directory "${HQ_BINS_DIR}" \
-            --genome-fasta-extension fa \
-            --threads "${THREADS}" \
-            "${methods_args[@]}" \
-            "${min_cov_args[@]}" \
-            -o "${out_tsv}" \
-            2>&1 | tee "${coverm_log}"
+        run_cmd_with_tee "${coverm_log}" -- \
+            run_tool "11" "${SIF_COVERM}" "${SIF_COVERM_URI}" coverm genome \
+                --read1 "${r1}" \
+                --read2 "${r2}" \
+                --genome-fasta-directory "${HQ_BINS_DIR}" \
+                --genome-fasta-extension fa \
+                --threads "${THREADS}" \
+                "${methods_args[@]}" \
+                "${min_cov_args[@]}" \
+                -o "${out_tsv}"
     done
 
     mark_done "11_coverm"
@@ -6849,7 +9016,12 @@ step_12a_taxonomy_summary() {
     fi
 
     local exit_code=0
-    "${cmd[@]}" || exit_code=$?
+    local had_errexit=0
+    [[ $- == *e* ]] && had_errexit=1
+    set +e
+    "${cmd[@]}"
+    exit_code=$?
+    (( had_errexit )) && set -e
 
     if [[ "${exit_code}" -eq 0 ]]; then
         mark_done "12a_taxonomy_summary"
@@ -6857,7 +9029,7 @@ step_12a_taxonomy_summary() {
         log_info "[Step 12a] Taxonomy summary determined as not-applicable."
     else
         log_error "[Step 12a] Failed to generate taxonomy summary (exit code ${exit_code})."
-        exit 1
+        return "${exit_code}"
     fi
 }
 
@@ -6912,7 +9084,12 @@ step_12b_mag_summary() {
     fi
 
     local exit_code=0
-    "${cmd[@]}" || exit_code=$?
+    local had_errexit=0
+    [[ $- == *e* ]] && had_errexit=1
+    set +e
+    "${cmd[@]}"
+    exit_code=$?
+    (( had_errexit )) && set -e
 
     if [[ "${exit_code}" -eq 0 ]]; then
         mark_done "12b_mag_summary"
@@ -6920,7 +9097,7 @@ step_12b_mag_summary() {
         log_info "[Step 12b] MAG summary determined as not-applicable."
     else
         log_error "[Step 12b] Failed to generate MAG summary (exit code ${exit_code})."
-        exit 1
+        return "${exit_code}"
     fi
 }
 
@@ -6948,11 +9125,13 @@ step_12c_run_overview() {
         --outdir "${SUMMARY_DIR}"
         --pipeline-outdir "${OUTDIR}"
         --pipeline-version "${PIPELINE_VERSION:-2.0.0}"
-        --run-id "${RUN_ID:-run_${$}}"
+        --run-id "${RUN_ID}"
         --profile "${REQUESTED_PROFILE:-custom}"
         --execution-mode "${EXEC_MODE}"
         --resume-plan "${OUTDIR}/resume_plan.tsv"
         --run-status "${OUTDIR}/run_status.tsv"
+        --run-manifest "${RUN_MANIFEST_FILE:-${LOGS_DIR}/run_manifest.tsv}"
+        --stage-status "${STAGE_STATUS_FILE:-${LOGS_DIR}/stage_status.tsv}"
         --sample-manifest "${SAMPLE_MANIFEST_ACTIVE:-${FASTP_CLEAN_SAMPLE_MANIFEST:-${RAW_SAMPLE_MANIFEST}}}"
         --reads-source "${ACTIVE_READS_SOURCE:-raw}"
         --assembly-path "${CONTIGS:-}"
@@ -6982,13 +9161,18 @@ step_12c_run_overview() {
     fi
 
     local exit_code=0
-    "${cmd[@]}" || exit_code=$?
+    local had_errexit=0
+    [[ $- == *e* ]] && had_errexit=1
+    set +e
+    "${cmd[@]}"
+    exit_code=$?
+    (( had_errexit )) && set -e
 
     if [[ "${exit_code}" -eq 0 ]]; then
         mark_done "12c_run_overview"
     else
         log_error "[Step 12c] Failed to generate run overview (exit code ${exit_code})."
-        exit 1
+        return "${exit_code}"
     fi
 }
 
@@ -7054,6 +9238,19 @@ main() {
     echo -e "${CYAN}${BOLD}║${NC}  DRY_RUN                : ${DRY_RUN}"
     echo -e "${CYAN}${BOLD}║${NC}  FORCE_RERUN            : ${FORCE_RERUN}"
     echo -e "${CYAN}${BOLD}║${NC}  RESUME_CONTROL         : ${RESUME_CONTROL}"
+    echo -e "${CYAN}${BOLD}║${NC}  TMPDIR_CLI             : ${PIPELINE_TMPDIR_CLI:-<unset>}"
+    echo -e "${CYAN}${BOLD}║${NC}  KEEP_TEMPORARY         : ${KEEP_TEMPORARY}"
+    if [[ "${DRY_RUN}" == true ]]; then
+        echo -e "${CYAN}${BOLD}║${NC}  Error history          : would write on failure"
+        echo -e "${CYAN}${BOLD}║${NC}  Last error report      : would write on failure"
+        echo -e "${CYAN}${BOLD}║${NC}  Checkpoint state       : would track in normal execution"
+    else
+        echo -e "${CYAN}${BOLD}║${NC}  Error history          : ${LOGS_DIR}/errors.tsv"
+        echo -e "${CYAN}${BOLD}║${NC}  Last error report      : ${LOGS_DIR}/last_error.json"
+        echo -e "${CYAN}${BOLD}║${NC}  Checkpoint state       : ${LOGS_DIR}/checkpoint_state/${RUN_ID}.tsv"
+        echo -e "${CYAN}${BOLD}║${NC}  Error log tail         : 20 lines"
+        echo -e "${CYAN}${BOLD}║${NC}  Error schema           : 1"
+    fi
     echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}\n"
 
     # Pre-flight check
@@ -7222,8 +9419,37 @@ main() {
     echo "Taxonomy summary path  : ${tax_path}"
     echo "MAG summary path       : ${mag_path}"
     echo "Run overview path      : ${ov_path}"
+    if [[ "${DRY_RUN}" != true && "${RUN_STATUS_INITIALIZED:-false}" == true ]]; then
+        local total_end_mono
+        total_end_mono="$(python3 -c 'import time; print(f"{time.monotonic():.6f}")' 2>/dev/null || echo "0.0")"
+        local total_wall="NA"
+        if [[ -n "${PIPELINE_START_MONOTONIC:-}" ]]; then
+            total_wall="$(python3 -c "print(f'{(float(\"${total_end_mono}\") - float(\"${PIPELINE_START_MONOTONIC}\")):.3f}')" 2>/dev/null || echo "NA")"
+        fi
+        local err_count=0
+        if [[ -f "${LOGS_DIR}/errors.tsv" ]]; then
+            err_count="$(awk 'NR>1 {count++} END {print count+0}' "${LOGS_DIR}/errors.tsv" 2>/dev/null || echo 0)"
+        fi
+        python3 "${BENCHMARK_WRITER}" finalize-run \
+            --run-manifest-path "${RUN_MANIFEST_FILE:-${LOGS_DIR}/run_manifest.tsv}" \
+            --run-id "${RUN_ID}" \
+            --final-status "success" \
+            --exit-code 0 \
+            --wall-time-seconds "${total_wall}" \
+            --warning-count "0" \
+            --error-count "${err_count}" \
+            --taxonomy-summary-path "${SUMMARY_DIR}/taxonomy_summary.tsv" \
+            --mag-summary-path "${SUMMARY_DIR}/mag_summary.tsv" \
+            --run-overview-path "${SUMMARY_DIR}/run_overview.tsv" >/dev/null 2>&1 || true
+    fi
+
+    echo "Run manifest   : ${LOGS_DIR}/run_manifest.tsv"
+    echo "Stage status   : ${LOGS_DIR}/stage_status.tsv"
+    echo "Run status     : ${OUTDIR}/run_status.tsv"
     echo "Logs           : ${LOGS_DIR}/"
     echo "Mamba scripts  : ${TMPSCRIPTS_DIR}/"
+    echo "Error history  : ${LOGS_DIR}/errors.tsv"
+    echo "Last error     : ${LOGS_DIR}/last_error.json"
 }
 
 main "$@"

@@ -58,7 +58,9 @@ combinations during preflight rather than silently changing stage settings.
 │   └── vamb.def
 ├── scripts/
 │   ├── generate_pipeline_summaries.py
-│   └── validate_pipeline_outputs.py
+│   ├── validate_pipeline_outputs.py
+│   ├── write_benchmark_manifest.py
+│   └── write_error_record.py
 └── containers/                 # Created automatically
 ```
 
@@ -198,6 +200,9 @@ The script uses Apptainer mode by default. Missing remote images may be pulled a
 | `--bam-dir DIR` | External `<sample>.sorted.bam` files and `.bai`/`.csi` indexes |
 | `--bam-manifest FILE` | External BAM manifest with `sample_id`, `bam`, and `index` columns |
 | `--jgi-depth-file FILE` | External JGI `jgi_summarize_bam_contig_depths` table |
+| `--tmpdir DIR` | Base directory for temporary pipeline workspaces (creates an isolated RUN_ID directory below) |
+| `--keep-temporary` | Preserve current execution's temporary workspace after success or failure |
+| `--no-keep-temporary` | Remove current execution's temporary workspace during controlled cleanup (default) |
 | `--resume` | Reuse valid checkpoints (default) |
 | `--force-stage STAGE` | Force one stage; repeatable, rebuilds its effective descendants |
 | `--restart-from STAGE` | Destructively clears one stage and its effective descendants |
@@ -271,6 +276,7 @@ stages such as mapping, Vamb, or MetaBinner.
 | `--mag-summary` | `--no-mag-summary` | Enabled |
 | `--run-overview` | `--no-run-overview` | Enabled |
 | `--bracken` | `--no-bracken` | Enabled |
+| `--keep-temporary` | `--no-keep-temporary` | Disabled (`--no-keep-temporary`) |
 | `--dry-run` | `--no-dry-run` | Disabled |
 | `--force` | `--no-force` | Disabled |
 
@@ -913,7 +919,7 @@ section	key	value	source	status
 #### Applicability & Failure Handling
 - Applicable in every execution that passes preflight checks.
 - On successful runs, published with `final_status=completed`.
-- On pipeline failure, `pipeline_error()` generates a partial `run_overview.tsv` recording `final_status=failed` and incrementing `errors.count` to preserve error diagnostics.
+- On pipeline failure, `run_status.tsv` is updated directly and idempotently with `final_status=failed`. The fatal error handler intentionally does NOT call `generate_pipeline_summaries.py` or generate `run_overview.tsv` to avoid secondary failures, recursion, or partial overview corruption. Detailed diagnostics are recorded in `OUTDIR/logs/errors.tsv` and `OUTDIR/logs/last_error.json`.
 
 ---
 
@@ -973,6 +979,106 @@ When the pipeline detects an older monolithic checkpoint `12_summary.done` or `1
 - **Failure Safety**: If summary generation fails or aborts, previous valid versions of TSVs and metadata remain intact.
 - **TSV Sanitization**: All tab, carriage return, and newline characters within metadata or taxonomic names are converted to single spaces.
 - **Dry-Run Protection**: Invoking `--dry-run` performs validation and argument resolution without creating staging directories or writing files.
+
+---
+
+## Execution Tracking & Benchmark Manifests
+
+To support reproducible benchmarking, granular performance tracking, and cross-run comparisons without interfering with analytical checkpoints, graph execution, or output validity, the pipeline creates two centralized, versioned manifest tables under `OUTDIR/logs/`:
+
+1. `OUTDIR/logs/run_manifest.tsv` (1 row per `RUN_ID`)
+2. `OUTDIR/logs/stage_status.tsv` (1 row per stage and `RUN_ID`)
+
+### Security and Governance Contracts
+
+- **Central Execution Tracking**: These manifests record the execution lifecycle, environment metadata, and stage metrics.
+- **Not Stage Outputs**: They are not products of any analytical step.
+- **Not Checkpoints**: They do not participate in checkpoint dependency graphs or compatibility decisions.
+- **Immune to Invalidation**: They cannot be targets of `--force-stage` or `--restart-from`.
+- **Protected Against Deletion**: `clean_stage_outputs` and selective clean routines are strictly barred from removing `run_manifest.tsv`, `stage_status.tsv`, or `run_status.tsv`.
+- **Atomic Publishing**: Updates use atomic temporary writes (`.tmp_tsv_*`) and `os.replace` to prevent corrupted reads during concurrent inspections or abrupt interrupts.
+
+---
+
+### 1. `run_manifest.tsv`
+
+Maintains execution-level identity, configurations, input fingerprints, allocated resources, final status, and references to all other manifests. Consecutive runs in the same `OUTDIR` append distinct rows indexed by their unique `RUN_ID`.
+
+#### Exact TSV Header (43 Columns)
+```text
+schema_version	run_id	pipeline_version	profile	execution_mode	dry_run	start_time_utc	end_time_utc	wall_time_seconds	final_status	exit_code	outdir	command_line	hostname	cpu_requested	threads_effective	memory_limit_bytes	active_sample_count	active_reads_source	sample_manifest_path	sample_manifest_fingerprint	assembly_source	assembly_path	assembly_fingerprint	bins_source_requested	bins_source_resolved	bins_fingerprint	min_completeness	max_contamination	tmpdir_source	tmpdir_base	keep_temporary	resume_plan_path	stage_status_path	software_inventory_path	database_inventory_path	error_history_path	last_error_path	taxonomy_summary_path	mag_summary_path	run_overview_path	warning_count	error_count
+```
+
+#### Field Contracts & Permitted Values
+- **`schema_version`**: Initial version `1`.
+- **`run_id`**: Canonical `YYYYMMDDTHHMMSSZ_<PID>_<RAND>` execution identifier.
+- **`execution_mode`**: `apptainer` or `mamba`.
+- **`dry_run`**: `true` or `false`.
+- **`final_status`**: `running`, `success`, `failed`, `interrupted`, `terminated`, `dry-run-success`, `dry-run-failed`.
+- **`wall_time_seconds`**: Monotonic total execution duration formatted to 3 decimal places (or `NA` while running).
+- **`command_line`**: Invocation command sanitized against tokens, passwords, secrets, credentials, and API keys.
+- **`cpu_requested`**: Externally allocated CPU count from `SLURM_CPUS_PER_TASK` or `PBS_NP` (or `NA` if undetermined). Total physical host CPU is never substituted.
+- **`memory_limit_bytes`**: Memory allocation limit from `SLURM_MEM_PER_NODE` or cgroup quotas (or `NA` if undetermined). Total host RAM is never substituted.
+- **`warning_count` / `error_count`**: Derived strictly from structured records (`errors.tsv` row counts, validation checks), never by counting arbitrary regex matches.
+
+---
+
+### 2. `stage_status.tsv`
+
+Canonical stage-level execution manifest. Records applicability, planned actions, observed checkpoint decisions, wall-clock duration (via monotonic clock), CPU and memory metrics (via GNU `/usr/bin/time -v`), exit codes, and output fingerprints.
+
+#### Exact TSV Header (32 Columns)
+```text
+schema_version	run_id	stage_id	stage_name	applicability	planned_action	checkpoint_action	final_status	start_time_utc	end_time_utc	wall_time_seconds	user_cpu_seconds	system_cpu_seconds	cpu_utilization_percent	max_rss_kib	io_read_bytes	io_write_bytes	exit_code	checkpoint_path	checkpoint_status	checkpoint_reason	input_state	validation_status	primary_log	primary_output	output_fingerprint	runtime	tool_version	runtime_fingerprint	database_fingerprint	error_id	message
+```
+
+#### Stage Lifecycle & Metrics Separation Matrix
+
+The pipeline strictly isolates planned decisions from observed runtime actions. Unexecuted stages never spoof zero-duration or zero-memory metrics:
+
+| Field | Executed Stage (`run`, `force`, `restart`) | Reused Checkpoint (`reuse`) | Disabled Stage | Not-Applicable Stage | Unreached (After Upstream Failure) |
+|---|---|---|---|---|---|
+| **`applicability`** | `applicable` | `applicable` | `disabled` | `not-applicable` | `applicable` |
+| **`planned_action`** | `run`, `force`, `restart` | `reuse` | `disabled` | `not-applicable` | `run`, `force`, `restart` |
+| **`checkpoint_action`** | `executed`, `forced`, `restarted` | `reused` | `skipped-disabled` | `skipped-not-applicable` | `not-reached` |
+| **`final_status`** | `success` / `failed` | `reused` | `disabled` | `not-applicable` | `not-reached` |
+| **`start_time_utc`** | ISO-8601 UTC | `NA` | `NA` | `NA` | `NA` |
+| **`end_time_utc`** | ISO-8601 UTC | `NA` | `NA` | `NA` | `NA` |
+| **`wall_time_seconds`** | Measured monotonic seconds | `NA` | `NA` | `NA` | `NA` |
+| **`user_cpu_seconds`** | Measured via GNU time | `NA` | `NA` | `NA` | `NA` |
+| **`system_cpu_seconds`**| Measured via GNU time | `NA` | `NA` | `NA` | `NA` |
+| **`max_rss_kib`** | Peak memory from GNU time | `NA` | `NA` | `NA` | `NA` |
+| **`cpu_utilization_percent`** | Calculated % from GNU time | `NA` | `NA` | `NA` | `NA` |
+| **`io_read_bytes`** | `NA` (block count not bytes) | `NA` | `NA` | `NA` | `NA` |
+| **`io_write_bytes`** | `NA` (block count not bytes) | `NA` | `NA` | `NA` | `NA` |
+| **`exit_code`** | `0` or command error code | `0` | `NA` | `NA` | `NA` |
+
+---
+
+### 3. Relationship with Other Pipeline Manifests
+
+```
+                      ┌────────────────────────────┐
+                      │    resume_plan.tsv         │ (Pre-execution frozen plan)
+                      └─────────────┬──────────────┘
+                                    │ initializes
+                                    ▼
+                      ┌────────────────────────────┐
+                      │    stage_status.tsv        │ (Canonical runtime stage state)
+                      └─────────────┬──────────────┘
+                                    │ generates
+                                    ▼
+                      ┌────────────────────────────┐
+                      │    run_status.tsv          │ (Compatibility view)
+                      └────────────────────────────┘
+```
+
+- **`resume_plan.tsv` (`OUTDIR/resume_plan.tsv`)**: Frozen pre-execution plan recording planned actions, graph parents, dependencies, and reasons. Remains immutable throughout execution.
+- **`stage_status.tsv` (`OUTDIR/logs/stage_status.tsv`)**: The single canonical source of truth for observed stage state, durations, and resource metrics.
+- **`run_status.tsv` (`OUTDIR/run_status.tsv`)**: Maintained as an automatic, idempotent compatibility projection generated directly from `stage_status.tsv`.
+- **`run_overview.tsv` (`OUTDIR/12_summary/run_overview.tsv`)**: Summary table that references and consumes `run_manifest.tsv` and `stage_status.tsv` without independently recalculating execution parameters or stage metrics.
+
+---
 
 ## Checkpoints and reproducibility
 
@@ -1267,6 +1373,371 @@ stages, including:
 - MetaBinner script configuration;
 - assembly availability only when an active assembly consumer needs one.
 
+## Fatal Error Capture and Fault Recovery Architecture
+
+The pipeline implements a structured, robust, and non-recursive fatal error capture system designed to ensure post-mortem reproducibility, process safety, and clear recovery paths for large-scale metagenomic workflows.
+
+### 1. Dual-Phase Trap Architecture
+
+The error handling system operates in two distinct phases:
+
+```text
+┌────────────────────────────────────────────────────────┐
+│ Phase 1: Early Error Traps (Bootstrap & Preflight)     │
+│ - Installed immediately after shebang (set -Eeuo pipefail)│
+│ - Traps ERR, INT (130), TERM (143), HUP (129)          │
+│ - Independent of OUTDIR, LOGS_DIR, Python, or disk writes│
+│ - Single formatted error message to stderr             │
+│ - Preserves original exit code without side effects    │
+└───────────────────────────┬────────────────────────────┘
+                            │ Argument parsing & directory layout complete
+                            ▼
+┌────────────────────────────────────────────────────────┐
+│ Phase 2: Full Persistent Error System                  │
+│ - Installed via install_pipeline_traps                 │
+│ - Replaces early traps with canonical handlers:        │
+│     * pipeline_error_handler                           │
+│     * pipeline_signal_handler                          │
+│     * pipeline_exit_handler                            │
+│ - Process-safe deduplication via atomic file markers   │
+│ - Thread/process-safe locked persistence in errors.tsv │
+│ - Atomic materialized view in last_error.json          │
+│ - Per-run checkpoint tracking in checkpoint_state/     │
+│ - Idempotent run_status.tsv updates                    │
+└────────────────────────────────────────────────────────┘
+```
+
+#### Early Traps vs Full System
+| Property | Early Traps | Full Persistent Traps |
+|---|---|---|
+| **Activation Point** | Immediately after shebang (`set -Eeuo pipefail`) | After argument parsing and `OUTDIR/logs/` initialization |
+| **Handlers** | `early_error_handler`, `early_signal_handler` | `pipeline_error_handler`, `pipeline_signal_handler`, `pipeline_exit_handler` |
+| **Disk Writes** | None (read-only / stderr only) | `errors.tsv`, `last_error.json`, `run_status.tsv`, `checkpoint_state/` |
+| **ERROR_ID** | Not assigned | Sequential `<RUN_ID>:E0001` assigned under `flock` |
+| **Exit Code** | Strictly preserved | Strictly preserved |
+| **Log Snippet** | None | Bounded log tail (max 50 lines, max 8 KiB) |
+| **Scope** | Command-line errors, path resolution, early preflight | All pipeline stages, tool execution, and child workflows |
+
+#### What Bash Traps Can and Cannot Capture
+- **Captured**:
+  - Unhandled non-zero exit codes from commands executed in Bash functions (`ERR`).
+  - Process interruptions and terminations (`SIGINT` = 130, `SIGTERM` = 143, `SIGHUP` = 129).
+  - Wrapper errors in command execution, container execution, and piped commands (`run_cmd_with_tee` preserves `PIPESTATUS[0]`).
+  - Unexpected script exits with non-zero exit code (`EXIT` fallback).
+- **Not Captured (Explicit Limitations)**:
+  - Bash syntax errors occurring during initial script parsing (e.g. mismatched quotes or syntax errors before execution starts). These must be validated prior to execution using `bash -n run_metagenomics_pipeline.sh` or `shellcheck`.
+  - Errors occurring before trap installation.
+  - Certain fatal bash parameter expansions occurring during shell initialization.
+  - Failures inside asynchronous background tasks spawned with `&` unless explicitly waited on.
+  - Subprocesses spawned without trap propagation (child processes do not inherit bash error traps unless subshells execute within parent trap scopes).
+
+### 2. Execution Identity and Context Variables
+
+Every pipeline execution receives a unique, collision-resistant identifier:
+```text
+RUN_ID = YYYYMMDDTHHMMSSZ_<PID>_<RANDOM_SHORT>
+Example: 20261031T212500Z_18432_a91f
+```
+
+Along with `RUN_ID`, execution provenance is tracked via:
+- `PIPELINE_VERSION`: Semantic version string.
+- `PIPELINE_START_TIME_UTC`: ISO 8601 UTC execution start timestamp.
+- `PIPELINE_PID`: Process identifier of the root pipeline process.
+- `PIPELINE_HOSTNAME`: Execution host system name.
+
+During execution, wrappers maintain live stage context:
+- `CURRENT_STAGE`: Canonical stage identifier (e.g. `02_megahit`, `05a_vamb`, `08_checkm2`).
+- `CURRENT_STAGE_NAME`: Human-readable stage display name.
+- `CURRENT_STAGE_ACTION`: Planned action (`run`, `reuse`, `force`).
+- `CURRENT_STAGE_LOG`: Primary log file path associated with the stage.
+- `CURRENT_STAGE_RUNTIME`: Active runtime environment (`apptainer`, `mamba`, or `host`).
+- `CURRENT_STAGE_COMMAND`: Sanitized command string currently executing.
+- `CURRENT_COMMAND_SOURCE_FILE`: File from which the execution wrapper was invoked.
+- `CURRENT_COMMAND_SOURCE_LINE`: Line number in the calling script where execution was requested.
+- `LAST_VALID_CHECKPOINT`: Name of the last successfully validated checkpoint in *this execution*.
+- `LAST_VALID_CHECKPOINT_PATH`: Absolute path to the validated `.done` checkpoint marker.
+- `LAST_VALID_PRODUCT`: Path to the primary output product validated in the last successful stage.
+- `LAST_VALID_PRODUCT_FINGERPRINT`: SHA-256 / size / mtime fingerprint of the validated product.
+
+### 3. Persistent Error Artifacts
+
+All persistent diagnostic records are stored in `OUTDIR/logs/`:
+
+| Artifact Path | Format | Role & Concurrency Semantics |
+|---|---|---|
+| `OUTDIR/logs/errors.tsv` | TSV (22 columns) | **Primary immutable history**. Append-only across pipeline runs. Writes are serialized using exclusive kernel advisory locks (`fcntl.flock`). |
+| `OUTDIR/logs/last_error.json` | JSON | **Materialized view** of the most recent fatal termination. Written atomically using temporary file creation and POSIX rename (`os.replace`). |
+| `OUTDIR/logs/checkpoint_state/<RUN_ID>.tsv` | TSV | **Execution-scoped checkpoint audit**. Contains only checkpoints validated during the specific `RUN_ID`, preventing state contamination across runs. |
+| `OUTDIR/logs/last_valid_checkpoint.state` | Key-Value State | Atomic pointer recording the overall latest validated checkpoint and product fingerprint. |
+| `OUTDIR/logs/.error_recorded.<RUN_ID>` | Marker File | **Deduplication guard**. Tracks `pending` and `committed` states to eliminate redundant writes across subshells, wrappers, and exit traps. |
+
+#### Protection During Cleaning and Retries
+None of the error logging artifacts (`errors.tsv`, `last_error.json`, `checkpoint_state/`, `last_valid_checkpoint.state`, `.error_recorded.*`) are analytical outputs or checkpoints. They are explicitly excluded from deletion by `clean_stage_outputs`, `--force-stage`, and `--restart-from`. Rerunning a failed pipeline retains the full historical log of previous errors.
+
+### 4. Deduplication and Concurrency Safety
+
+Metagenomic pipelines frequently run commands across subshells, background wrappers, and complex control structures. Without coordination, an error in a subshell can trigger the subshell's `ERR` trap, return non-zero to the parent wrapper, trigger the parent's `ERR` trap, and subsequently trigger the `EXIT` trap, resulting in four identical error entries and noisy logs.
+
+To prevent duplication:
+1. **In-Memory Guards**: The flags `ERROR_HANDLER_ACTIVE`, `ERROR_ALREADY_RECORDED`, and `PIPELINE_TERMINATION_RECORDED` prevent nested error handler recursion within the same shell process.
+2. **Atomic File Marker State Machine**:
+   - `scripts/write_error_record.py reserve` creates `OUTDIR/logs/.error_recorded.<RUN_ID>` with state `pending` and the active PID using atomic file creation (`O_CREAT | O_EXCL`).
+   - If a marker already exists with `pending` or `committed`, subsequent handlers exit immediately with status 0 without writing duplicate records.
+   - **Dead PID Detection & Recovery**: If an execution crashed or was killed (`SIGKILL`) while in `pending` state, subsequent invocations check whether the recorded PID is still alive using `os.kill(pid, 0)`. If the PID is dead, the stale pending marker is automatically cleaned and reclaimed.
+3. **Single Persistent Record**: Only one record is committed per logical failure.
+4. **Single Stderr Message**: Exactly one `[FATAL]` message block is printed to stderr.
+
+### 5. Sanitization, Secret Redaction, and Log Truncation
+
+Error records sanitize all sensitive and control data before writing:
+- **Secret Redaction**: Passwords, API tokens, authorization headers, and credentials matching patterns (`password=...`, `token=...`, `api_key=...`, `http://user:pass@...`) are automatically redacted to `[REDACTED]`.
+- **TSV Field Sanitization**: Tabs (`\t`), newlines (`\n`), and carriage returns (`\r`) in command strings or technical messages are replaced with single spaces to protect TSV table formatting.
+- **Log Snippet Limits**: The fatal error recorder extracts the tail of the failed stage's primary log:
+  - Maximum lines: 50 lines.
+  - Maximum size: 8 KiB (8,192 bytes).
+  - Binary file detection: If a log contains null bytes (`\x00`), log extraction is replaced with `[Binary log file suppressed]`.
+
+### 6. Primary Log Mapping and Recovery Hints
+
+Each stage is associated with a primary log file and a canonical recovery action:
+
+| Stage ID | Stage Display Name | Primary Log Path | Canonical Recovery Action |
+|---|---|---|---|
+| `01_fastp` | QC / Adapter Trimming (fastp) | `OUTDIR/logs/01_fastp.log` | Check read files, permissions, and disk space; retry with `--force-stage fastp` |
+| `02_megahit` | De Novo Assembly (MEGAHIT) | `OUTDIR/logs/02_megahit.log` | Check memory limits and CPU threads; rerun with `--force-stage megahit` |
+| `03_kraken2` | Taxonomic Classification (Kraken2/Bracken) | `OUTDIR/logs/03_kraken2.log` | Verify Kraken2 database integrity; retry with `--force-stage kraken2` |
+| `04_mapping` | Contig Read Mapping & Coverage (Bowtie2/SAMtools) | `OUTDIR/logs/04_mapping.log` | Check alignment memory and disk space; retry with `--force-stage mapping` |
+| `05a_vamb` | Metagenomic Binning (Vamb) | `OUTDIR/logs/05a_vamb.log` | Verify contig depth matrix and Vamb runtime; retry with `--force-stage vamb` |
+| `05b_metabinner` | Metagenomic Binning (MetaBinner) | `OUTDIR/logs/05b_metabinner.log` | Check MetaBinner scripts directory and dependencies; retry with `--force-stage metabinner` |
+| `05c_comebin` | Metagenomic Binning (COMEBin) | `OUTDIR/logs/05c_comebin.log` | Check CUDA/CPU resources and COMEBin environment; retry with `--force-stage comebin` |
+| `06_refinement` | Bin Consensus Refinement (MetaWRAP) | `OUTDIR/logs/06_refinement.log` | Inspect binner outputs and MetaWRAP environment; retry with `--force-stage refinement` |
+| `07_reassembly` | MAG Reassembly (MetaWRAP) | `OUTDIR/logs/07_reassembly.log` | Check reassembly memory requirements; retry with `--force-stage reassembly` |
+| `08_checkm2` | MAG Quality Assessment (CheckM2) | `OUTDIR/logs/08_checkm2.log` | Verify CheckM2 DIAMOND database path; retry with `--force-stage checkm2` |
+| `09_mags` | MAG Filtering & Deduplication | `OUTDIR/logs/09_mags.log` | Verify completeness/contamination thresholds; retry with `--force-stage mag-filtering` |
+| `10_gtdbtk` | Taxonomic Classification of MAGs (GTDB-Tk) | `OUTDIR/logs/10_gtdbtk.log` | Verify GTDB-Tk reference database path; retry with `--force-stage gtdbtk` |
+| `11_abundance` | MAG Abundance Profiling (CoverM) | `OUTDIR/logs/11_abundance.log` | Check CoverM inputs and BAM alignments; retry with `--force-stage coverm` |
+| `12a_taxonomy_summary` | Taxonomy Summary Report | `OUTDIR/logs/12_summary.log` | Check Bracken outputs; retry with `--force-stage taxonomy-summary` |
+| `12b_mag_summary` | MAG Summary Report | `OUTDIR/logs/12_summary.log` | Check MAG filtering and CheckM2 outputs; retry with `--force-stage mag-summary` |
+| `12c_run_overview` | Run Execution Overview | `OUTDIR/logs/12_summary.log` | Check run status logs; retry with `--force-stage run-overview` |
+
+### 7. Signal Handling and Exit Semantics
+
+- **Signals (`INT`, `TERM`, `HUP`)**:
+  - `SIGINT` (Ctrl+C) terminates with exit code **130** and records `signal_name=INT`.
+  - `SIGTERM` terminates with exit code **143** and records `signal_name=TERM`.
+  - `SIGHUP` terminates with exit code **129** and records `signal_name=HUP`.
+- **Exit Trap (`pipeline_exit_handler`)**:
+  - Acts solely as a safety fallback. If the script exits with non-zero status and an error record was not yet committed by `ERR` or signal traps, the exit handler writes a fallback termination record.
+  - If the script exits normally with status 0, the exit trap performs a clean no-op.
+- **Strict Exit Code Preservation**:
+  - The fatal error handler captures the exact exit code of the failing tool (e.g. 1, 2, 127, 137).
+  - Wrapper utilities and helper scripts never substitute the exit code with handler exit codes.
+
+### 8. Example Artifacts
+
+#### Example `errors.tsv`
+```text
+run_id	error_id	timestamp_utc	stage_id	stage_display_name	planned_action	exit_code	signal_name	trap_source_file	trap_source_line	caller_source_file	caller_source_line	active_function	sanitized_command	primary_log	runtime_seconds	last_valid_checkpoint	last_valid_product	technical_message	recovery_hint	log_tail_snippet	status_updated
+20261031T212500Z_18432_a91f	20261031T212500Z_18432_a91f:E0001	2026-10-31T21:28:45Z	02_megahit	De Novo Assembly (MEGAHIT)	run	137	NONE	run_metagenomics_pipeline.sh	3820	run_metagenomics_pipeline.sh	3815	run_megahit	megahit -1 ... -2 ... -o ...	/data/out/logs/02_megahit.log	225	01_fastp	/data/out/01_qc/trimmed/sample_01_R1.fastq.gz	Command exited with status 137	Check memory limits and CPU threads; rerun with --force-stage megahit	Error: out of memory allocating 34359738368 bytes	true
+```
+
+#### Example `last_error.json`
+```json
+{
+  "schema_version": "1.0",
+  "run_id": "20261031T212500Z_18432_a91f",
+  "error_id": "20261031T212500Z_18432_a91f:E0001",
+  "timestamp_utc": "2026-10-31T21:28:45Z",
+  "stage_id": "02_megahit",
+  "stage_display_name": "De Novo Assembly (MEGAHIT)",
+  "planned_action": "run",
+  "exit_code": 137,
+  "signal_name": "NONE",
+  "trap_source_file": "run_metagenomics_pipeline.sh",
+  "trap_source_line": 3820,
+  "caller_source_file": "run_metagenomics_pipeline.sh",
+  "caller_source_line": 3815,
+  "active_function": "run_megahit",
+  "sanitized_command": "megahit -1 ... -2 ... -o ...",
+  "primary_log": "/data/out/logs/02_megahit.log",
+  "runtime_seconds": "225",
+  "last_valid_checkpoint": "01_fastp",
+  "last_valid_product": "/data/out/01_qc/trimmed/sample_01_R1.fastq.gz",
+  "technical_message": "Command exited with status 137",
+  "recovery_hint": "Check memory limits and CPU threads; rerun with --force-stage megahit",
+  "log_tail_snippet": "Error: out of memory allocating 34359738368 bytes",
+  "status_updated": true
+}
+```
+
+#### Example `checkpoint_state/<RUN_ID>.tsv`
+```text
+run_id	stage_id	checkpoint_path	validated_product	product_fingerprint	timestamp_utc
+20261031T212500Z_18432_a91f	01_fastp	/data/out/.checkpoints/01_fastp.done	/data/out/01_qc/trimmed/sample_01_R1.fastq.gz	size:1428570|mtime:1730410125	2026-10-31T21:26:15Z
+```
+
+### 9. Recovering and Resuming After a Failure
+
+When a pipeline execution terminates with an error:
+1. **Inspect the materialized error view**:
+   ```bash
+   cat OUTDIR/logs/last_error.json
+   ```
+2. **Review the technical message and recovery hint**:
+   The `recovery_hint` field specifies whether the stage requires resource adjustments, database path corrections, or input verification.
+3. **Resume the workflow**:
+   - To resume reusing all previously validated checkpoints (the default):
+     ```bash
+     bash run_metagenomics_pipeline.sh --profile full --reads-dir /data/reads --outdir OUTDIR
+     ```
+   - To rerun the failed stage specifically without invalidating unrelated branches:
+     ```bash
+     bash run_metagenomics_pipeline.sh --profile full --reads-dir /data/reads --outdir OUTDIR --force-stage megahit
+     ```
+   - To clear the failed stage and all downstream consumers:
+     ```bash
+     bash run_metagenomics_pipeline.sh --profile full --reads-dir /data/reads --outdir OUTDIR --restart-from megahit
+     ```
+
+---
+
+## Temporary Workspace Management
+
+The pipeline provides secure, isolated, and reproducible management of temporary working directories for intermediate files—specifically the concatenated paired-end read files required by the MetaWRAP bin reassembly stage (`07_reassembly`).
+
+### Command-Line Options
+
+| Option | Argument | Description | Default |
+|---|---|---|---|
+| `--tmpdir` | `DIR` | Base directory for temporary pipeline workspaces. The pipeline creates an isolated `RUN_ID` directory beneath this path. | Resolved via precedence |
+| `--keep-temporary` | None | Preserves the execution's temporary workspace after success or failure for manual inspection. | Disabled |
+| `--no-keep-temporary` | None | Removes the execution's temporary workspace during controlled cleanup upon completion. | Enabled (default) |
+
+### Base Resolution Precedence
+
+The temporary base directory (`PIPELINE_TMPDIR_BASE`) is resolved during pre-flight using strict precedence:
+
+| Priority | Tier | Source | Value Assigned | Location Rules |
+|:---:|---|---|---|---|
+| **1 (Highest)** | CLI | `--tmpdir DIR` | `PIPELINE_TMPDIR_SOURCE="cli"` | Canonical absolute path. **Must NOT** reside within `OUTDIR`. |
+| **2** | Environment | `TMPDIR` | `PIPELINE_TMPDIR_SOURCE="environment"` | Captured from original `TMPDIR`. **Must NOT** reside within `OUTDIR`. |
+| **3 (Lowest)** | Fallback | Default | `PIPELINE_TMPDIR_SOURCE="fallback"` | Exactly `${OUTDIR}/.tmp`. Permitted **only** when fallback is activated. |
+
+> [!IMPORTANT]
+> The path `${OUTDIR}/.tmp` is permitted **strictly and exclusively** when `PIPELINE_TMPDIR_SOURCE=fallback`. If a user manually supplies `--tmpdir ./metagenomics_out/.tmp` or sets `TMPDIR` to that path, the pipeline explicitly rejects it.
+
+### Location Restrictions
+
+The pipeline canonicalizes all candidate paths (resolving symlinks and eliminating `..`) and rejects:
+- The filesystem root (`/`);
+- The user's home directory (`$HOME`);
+- The output directory (`OUTDIR`) itself;
+- Any path situated inside `OUTDIR` (unless resolved via the fallback source);
+- The pipeline repository / script root directory;
+- Any path whose managed base is an existing symlink.
+
+### Per-Run Isolated Workspace Layout
+
+Temporary directories are never shared statically across executions. The pipeline creates an exclusive, per-execution directory tree using the current `RUN_ID`:
+
+```text
+PIPELINE_TMPDIR_BASE/
+└── metagenomics_pipeline/
+    └── <RUN_ID>/                                # Mode 0700, exclusive (no mkdir -p)
+        ├── .pipeline_tmp_owner                  # Mode 0600, atomic ownership marker
+        └── reassembly/                          # Mode 0700
+            ├── concatenated_R1.fastq.gz.part    # Staging write
+            ├── concatenated_R2.fastq.gz.part
+            ├── concatenated_R1.fastq.gz         # Final validated concatenated reads
+            └── concatenated_R2.fastq.gz
+```
+
+Workspaces are created with `umask 077` and `mkdir --mode=700`. If `<RUN_ID>` already exists, the pipeline aborts immediately rather than reusing or deleting existing contents, preventing race conditions between concurrent executions.
+
+### Ownership Marker
+
+Upon workspace initialization, an ownership marker (`.pipeline_tmp_owner`) is written atomically (via temporary file and `mv`) with mode `0600`:
+
+```ini
+schema_version=1
+run_id=20261102T153000Z_12345_6789a
+pipeline_pid=12345
+created_at=2026-11-02T15:30:00Z
+tmpdir_source=cli
+tmpdir_base=/scratch/pipeline_tmp
+run_tmpdir=/scratch/pipeline_tmp/metagenomics_pipeline/20261102T153000Z_12345_6789a
+```
+
+### Temporary Read Concatenation Strategy
+
+MetaWRAP's `reassemble_bins` module requires all paired-end reads across all samples in the cohort to be provided as a single paired FASTQ set. The pipeline produces these files inside `REASSEMBLY_TMPDIR` using:
+- **Strategy**: `gzip-member-concat` (Version `1`)
+- **Validation**: `gzip-integrity-and-source-manifest` (Version `1`)
+
+#### Multi-Member Gzip Concatenation Compatibility
+The `gzip-member-concat` strategy leverages standard RFC 1952 multi-member gzip streams: concatenating individual `.fastq.gz` files via binary concatenation (`cat file1.fastq.gz file2.fastq.gz > concatenated.fastq.gz`). This stream is fully compliant with POSIX `gzip -dc`, `zcat`, `pigz`, Bowtie2, MEGAHIT, and the MetaWRAP runtime without requiring costly uncompress-recompress cycles.
+
+#### Validation Scope
+Concatenation is performed strictly in active manifest order to `.part` files, verified to be non-empty, validated with `gzip -t`, and renamed into place.
+> [!NOTE]
+> `gzip -t` confirms archive and decompression stream integrity. It does **not** validate mate-pairing synchronization between R1 and R2 reads. Pairing guarantees derive from the active sample manifest, which enforces identical sample order and paired integrity during pre-flight.
+
+### Storage Space and Inode Verification
+
+Prior to concatenation, the pipeline calculates total input size:
+$$\text{concatenated\_input\_bytes} = \text{read1\_total\_size\_bytes} + \text{read2\_total\_size\_bytes}$$
+$$\text{required\_concat\_bytes} = \lceil \text{concatenated\_input\_bytes} \times 1.10 \rceil$$
+
+Using `df -Pk` and `df -Pi`, the pipeline verifies:
+1. **Available Bytes**: At least $1.10\times$ the combined input read size is free on the target filesystem.
+2. **Available Inodes**: At least 16 free inodes (`REQUIRED_FREE_INODES=16`) are available in the workspace.
+
+> [!WARNING]
+> This estimation covers pipeline-managed temporary read concatenation. It does **not** estimate or guarantee the internal scratch memory or disk requirements of MetaWRAP's internal SPAdes assembler.
+
+### Apptainer and Mamba Runtime Integration
+
+1. **Apptainer Container Bind**:
+   - The per-run workspace `PIPELINE_RUN_TMPDIR` is bound into the container in read-write mode (`-B "${PIPELINE_RUN_TMPDIR}:${PIPELINE_RUN_TMPDIR}:rw"`).
+   - The mount is strictly isolated to reassembly; the base directory is never bound pipeline-wide.
+   - Container visibility and write permissions are tested before running MetaWRAP.
+2. **Environment Variable Propagation**:
+   - `TMPDIR`, `TMP`, and `TEMP` are passed exclusively to the reassembly process (`--env` and `APPTAINERENV_` for Apptainer; inline command prefix for Mamba).
+   - `TMPDIR` is **never globally exported** across the pipeline host environment.
+
+### Safe Ownership-Verified Cleanup
+
+Removal of temporary workspaces is governed by `validate_run_tmpdir_for_cleanup`:
+- Path is non-empty, absolute, and matches `${PIPELINE_TMPDIR_BASE}/metagenomics_pipeline/${RUN_ID}`;
+- Not `/`, `$HOME`, `OUTDIR`, base, or parent directory;
+- Canonical path matches resolved path;
+- Neither workspace, reassembly subdirectory, nor concatenated files are symlinks;
+- `.pipeline_tmp_owner` exists, is regular, and matches `RUN_ID`, `pipeline_pid`, `tmpdir_base`, and `run_tmpdir`.
+
+#### Cleanup Contexts
+
+| Trigger | Condition | Pipeline Action | Workspace Outcome |
+|---|---|---|---|
+| **Success** | `KEEP_TEMPORARY=false` | Controlled cleanup after checkpoint verified | Removed (`removed`) |
+| **Success** | `KEEP_TEMPORARY=true` | Diagnostic preservation requested | Preserved (`preserved-by-flag`) |
+| **Failure** | Child processes running | Safety guard: children may still access files | Preserved (`preserved-active-children`) |
+| **Failure** | No child processes, valid owner | Controlled error cleanup | Removed (`removed`) |
+| **Signal (INT/TERM/HUP)** | Any | Child processes cannot be guaranteed halted | Preserved (`preserved-after-signal`) |
+
+Any diagnostic workspace preserved upon failure, signal, or via `--keep-temporary` can be safely inspected and manually deleted when no longer needed:
+```bash
+rm -rf /path/to/metagenomics_pipeline/<RUN_ID>
+```
+
+### Checkpoints and Stage Reusability
+
+- The `07_reassembly.config` checkpoint records strategy name, strategy version, validation name, validation version, active manifest fingerprint, active sample IDs, source pair count, and total input read bytes.
+- Temporary directory paths, file mtimes, and `--keep-temporary` flags are **not** recorded in checkpoints. Changing `--tmpdir` does not invalidate an existing valid reassembly checkpoint.
+- If reassembly action is `reuse`, the stage completes immediately from existing products in `OUTDIR/07_reassembly/` without creating temporary directories or concatenating reads.
+- Preserved temporary files are **never reused** as caches by subsequent runs. Every fresh run (`run`, `force`, `restart`) generates its own isolated workspace and re-concatenates active reads.
+
+---
+
 ## Makefile targets
 
 | Target | Purpose |
@@ -1278,6 +1749,8 @@ stages, including:
 | `make pull-containers` | Download the seven remote images |
 | `make test-containers` | Verify all 12 images and their principal commands |
 | `make test-dry-run ...` | Check Bash syntax and run pre-flight validation |
+| `make test-error-record` | Run Python unit and integration test suite for fatal error capture |
+| `make test` | Run all test suites (including error capture) |
 | `make clean-tmp` | Remove local container build/cache files |
 | `make clean` | Remove generated `.sif` images and temporary files |
 
