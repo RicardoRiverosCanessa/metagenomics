@@ -1,0 +1,61 @@
+{
+  "schema_version": "1",
+  "catalog_updated_at": "2026-11-03",
+  "default_database": "kraken2-standard-8",
+  "databases": {
+    "kraken2-standard-8": {
+      "family": "kraken2-bracken",
+      "display_name": "Kraken2 Standard-8",
+      "description": "Standard Kraken2 database capped at 8 GB; includes Bracken k-mer distributions for supported read lengths.",
+      "release": "20260626",
+      "release_date": "2026-06-26",
+      "provider": "Ben Langmead AWS Index Zone",
+      "provider_page": "https://benlangmead.github.io/aws-indexes/k2",
+      "archive_url": "https://genome-idx.s3.amazonaws.com/kraken/k2_standard_08_GB_20260626.tar.gz",
+      "checksum_url": "https://genome-idx.s3.amazonaws.com/kraken/standard_08_GB_20260626/standard_08_GB.md5",
+      "checksum_type": "md5",
+      "archive_checksum": "7685f43cce057c2ca18511c925399b72",
+      "archive_filename": "k2_standard_08_GB_20260626.tar.gz",
+      "archive_type": "tar.gz",
+      "archive_size_bytes": null,
+      "installed_size_bytes": null,
+      "reported_archive_size_gb": 5.5,
+      "reported_index_size_gb": 7.5,
+      "install_subdir": "installed/kraken2/standard-8/20260626",
+      "required_files": [
+        "hash.k2d",
+        "opts.k2d",
+        "taxo.k2d"
+      ],
+      "optional_metadata_files": [
+        "inspect.txt",
+        "ktaxonomy.tsv",
+        "library_report.tsv",
+        "names.dmp",
+        "nodes.dmp",
+        "seqid2taxid.map",
+        "unmapped_accessions.txt"
+      ],
+      "bracken": {
+        "included": true,
+        "read_lengths": [
+          50,
+          75,
+          100,
+          150,
+          200,
+          250,
+          300
+        ],
+        "required_file_template": "database{read_length}mers.kmer_distrib"
+      },
+      "validation": {
+        "reject_symlinks": true,
+        "reject_hardlinks": true,
+        "reject_device_files": true,
+        "reject_absolute_archive_paths": true,
+        "reject_parent_traversal": true
+      }
+    }
+  }
+}

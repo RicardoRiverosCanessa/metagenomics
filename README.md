@@ -1,4 +1,4 @@
-# Shotgun Metagenomics Pipeline
+# MetaNexus — Shotgun Metagenomics Pipeline
 
 A reproducible Bash pipeline for paired-end shotgun metagenomic reads, from quality control and assembly to metagenome-assembled genome (MAG) recovery, quality assessment, taxonomy, abundance estimation, and final summary generation.
 
@@ -7,7 +7,7 @@ The workflow supports two execution modes:
 - **Apptainer/Singularity**: the default and recommended mode, using isolated `.sif` images.
 - **Mamba**: an alternative mode using existing host binaries and named Conda/Mamba environments.
 
-> **Status:** This pipeline is under active development. Validate it with representative test data before using it in production analyses.
+> **Status:** MetaNexus (v0.3.2) is under active development. Validate it with representative test data before using it in production analyses.
 
 ## Workflow branches
 
@@ -50,6 +50,8 @@ combinations during preflight rather than silently changing stage settings.
 .
 ├── run_metagenomics_pipeline.sh
 ├── Makefile
+├── config/
+│   └── database_catalog.json
 ├── defs/
 │   ├── kraken2_bracken.def
 │   ├── mapping_depth.def
@@ -57,10 +59,20 @@ combinations during preflight rather than silently changing stage settings.
 │   ├── comebin.def
 │   └── vamb.def
 ├── scripts/
+│   ├── check_def_syntax.sh
+│   ├── execution_plan.py
 │   ├── generate_pipeline_summaries.py
+│   ├── inspect_versions.py
+│   ├── manage_databases.py
+│   ├── run_container_tests.sh
 │   ├── validate_pipeline_outputs.py
 │   ├── write_benchmark_manifest.py
+│   ├── write_disk_space_report.py
 │   └── write_error_record.py
+├── tests/
+│   ├── test_execution_plan.py
+│   ├── test_inspect_versions.py
+│   └── test_write_disk_space_report.py
 └── containers/                 # Created automatically
 ```
 
@@ -171,6 +183,62 @@ bash run_metagenomics_pipeline.sh \
 The script uses Apptainer mode by default. Missing remote images may be pulled automatically when `AUTO_PULL_SIF=true`.
 
 ## Command-line options
+
+### Identity and version inspection
+
+| Option | Description |
+|---|---|
+| `-V, --version` | Display MetaNexus canonical identity and release status, then exit immediately |
+| `--versions` | Inspect active pipeline tools, runtimes, and databases in a strictly read-only manner without executing analysis or creating `OUTDIR` |
+| `--versions-all` | Inspect all tools, runtimes, and reference databases across all pipeline stages, regardless of profile or disabled stages |
+| `--versions-deep` | Perform cryptographic fingerprinting (SHA-256) of runtime container images and databases (except deep GTDB-Tk) |
+| `--versions-format <text\|json>` | Output format: human-readable aligned text (default) or machine-readable JSON |
+| `--strict-versions` | Exit with code 1 if any inspected tool, runtime, or database is unavailable or unknown |
+
+```bash
+# Show canonical identity
+./run_metagenomics_pipeline.sh --version
+./run_metagenomics_pipeline.sh -V
+
+# Read-only inspection of active tools and runtimes (default: full profile)
+./run_metagenomics_pipeline.sh --versions
+
+# Inspect taxonomy profile tools in JSON format
+./run_metagenomics_pipeline.sh --versions --profile taxonomy --versions-format json
+
+# Inspect all pipeline stages and compute deep image fingerprints
+./run_metagenomics_pipeline.sh --versions --versions-all --versions-deep
+
+# Strict verification: fail if any required tool or database is unavailable
+./run_metagenomics_pipeline.sh --versions --strict-versions
+```
+
+### Execution plan inspection (--plan)
+
+| Option | Description |
+|---|---|
+| `--plan` | Inspect and display the canonical execution plan in a strictly read-only manner without executing analysis or creating `OUTDIR` |
+| `--plan-format <text\|json>` | Output format: human-readable aligned text (default) or machine-readable JSON (requires `--plan`) |
+| `--plan-details <summary\|full>` | Detail level: full with stage details (default) or summary table only (requires `--plan`) |
+| `--strict-plan` | Exit with code 1 if any required stage is blocked (requires `--plan`) |
+
+```bash
+# Terminal execution plan inspection (human-readable table + stage details)
+./run_metagenomics_pipeline.sh --plan
+
+# Structured JSON execution plan
+./run_metagenomics_pipeline.sh --plan --plan-format json
+
+# High-level summary table only
+./run_metagenomics_pipeline.sh --plan --plan-details summary
+
+# Automated gating: fail if any required stage is blocked
+./run_metagenomics_pipeline.sh --plan --strict-plan
+
+# Execution plan inspection with profile and selective rerun flags
+./run_metagenomics_pipeline.sh --plan --profile assembly --force-stage 04_mapping
+./run_metagenomics_pipeline.sh --plan --restart-from 08_checkm2
+```
 
 ### Paths and resources
 
@@ -765,6 +833,12 @@ metagenomics_out/
 │   ├── run_overview.tsv
 │   └── run_overview.meta.json
 ├── logs/
+│   ├── run_manifest.tsv
+│   ├── stage_status.tsv
+│   ├── disk_space.tsv
+│   ├── disk_space.current.tsv
+│   ├── errors.tsv
+│   └── last_error.json
 └── .checkpoints/
 ```
 
@@ -783,6 +857,7 @@ Important outputs include:
 - `12_summary/taxonomy_summary.tsv`: Read-based taxonomic classifications and abundances (Kraken2/Bracken).
 - `12_summary/mag_summary.tsv`: MAG-based quality, taxonomy (GTDB-Tk), and sample coverage/abundance (CoverM).
 - `12_summary/run_overview.tsv`: Technical execution overview, stage statuses, and environment inventories.
+- `logs/disk_space.tsv`: Structured disk space assessment and operational telemetry for the active run.
 - `logs/`: step-specific execution logs and generated helper scripts.
 
 ## Configurable MAG filtering
@@ -1077,6 +1152,184 @@ The pipeline strictly isolates planned decisions from observed runtime actions. 
 - **`stage_status.tsv` (`OUTDIR/logs/stage_status.tsv`)**: The single canonical source of truth for observed stage state, durations, and resource metrics.
 - **`run_status.tsv` (`OUTDIR/run_status.tsv`)**: Maintained as an automatic, idempotent compatibility projection generated directly from `stage_status.tsv`.
 - **`run_overview.tsv` (`OUTDIR/12_summary/run_overview.tsv`)**: Summary table that references and consumes `run_manifest.tsv` and `stage_status.tsv` without independently recalculating execution parameters or stage metrics.
+
+---
+
+## Structured Disk Space Assessment
+
+To prevent out-of-disk failures during intensive metagenomic operations, provide operational visibility, and maintain auditability without risking analytical reproducibility, the pipeline implements a structured disk space assessment architecture.
+
+### Governance and Architectural Contracts
+
+- **Core Operational Telemetry**: Disk evaluation data is saved to `OUTDIR/logs/disk_space.current.tsv` (incremental live ledger) and published to `OUTDIR/logs/disk_space.tsv` (canonical view for the active `RUN_ID`).
+- **Not Stage Outputs**: Disk assessment files are not products of any analytical stage.
+- **Not Checkpoints**: Disk assessment records do not participate in checkpoint dependency graphs, checkpoint validation, or cache compatibility.
+- **Immune to Invalidation**: They cannot be targeted by `--force-stage` or `--restart-from`.
+- **Protected Against Deletion**: `clean_stage_outputs` and selective cleaning routines never delete `disk_space.tsv` or `disk_space.current.tsv`.
+- **Single RUN_ID Binding**: Every row in the public report strictly belongs to the active `RUN_ID`.
+- **Atomic Operations**: All writes and ledger promotions are executed atomically via the dedicated Python helper `scripts/write_disk_space_report.py` using `os.replace`.
+
+### Schema and Column Contract (22 Columns)
+
+`disk_space.tsv` and `disk_space.current.tsv` share an identical, strict 22-column TSV schema:
+
+```text
+run_id	measurement_sequence	check_id	timestamp_utc	stage_id	storage_role	purpose	path	filesystem_id	measurement_type	estimate_confidence	input_bytes_read	estimated_required_bytes	filesystem_available_bytes	filesystem_used_bytes	filesystem_total_bytes	required_free_inodes	available_free_inodes	safety_factor	shared_capacity_group	status	message
+```
+
+| Column | Type / Format | Allowed Values / Description |
+|---|---|---|
+| `run_id` | String | Active run identifier (`YYYYMMDDTHHMMSSZ_<PID>_<RAND>`). All rows in public report share this ID. |
+| `measurement_sequence` | Integer | Strictly increasing positive integer starting at `1` within each `RUN_ID`. |
+| `check_id` | String | Stable check identifier formatted `<stage_id>.<storage_role>.<purpose>` (e.g., `07_reassembly.tmpdir.read-concatenation`). |
+| `timestamp_utc` | String (ISO-8601) | Timestamp with fractional seconds (`YYYY-MM-DDTHH:MM:SS.sssZ`). |
+| `stage_id` | String | Evaluated pipeline stage (e.g., `01_fastp`, `02_megahit`, `07_reassembly`) or `pipeline`. |
+| `storage_role` | String | `outdir`, `tmpdir`, or `other`. |
+| `purpose` | String | Standardized purpose slug (e.g., `pipeline-outputs`, `read-concatenation`, `assembly`, `mapping-bam`). |
+| `path` | String (Absolute Path) | Canonical absolute filesystem path evaluated. If not yet created, nearest existing ancestor is resolved. |
+| `filesystem_id` | String | Stable identifier formatted `<device_id>|<mount_point>` (e.g., `2049|/data`). `unknown` if undetermined. |
+| `measurement_type` | String | `preflight-estimate`, `stage-precheck`, `post-stage-observation`, `final-observation`. |
+| `estimate_confidence` | String | `hard-minimum`, `conservative`, `informational`, `unknown`, `not-applicable`. |
+| `input_bytes_read` | Integer or `NA` | Aggregate size of input files read by the stage. Does not represent new space required. |
+| `estimated_required_bytes` | Integer or `NA` | Incremental new disk space required on the target filesystem. |
+| `filesystem_available_bytes` | Integer or `NA` | Free space reported by the filesystem at time of check. |
+| `filesystem_used_bytes` | Integer or `NA` | Host/cluster-wide total used space on the filesystem (not attributable solely to pipeline). |
+| `filesystem_total_bytes` | Integer or `NA` | Total capacity of the target filesystem. |
+| `required_free_inodes` | Integer or `NA` | Minimum free inodes required for the operation (e.g., `16` for reassembly concat, or `NA`). |
+| `available_free_inodes` | Integer or `NA` | Free inodes reported by filesystem (`NA` if unsupported or unavailable). |
+| `safety_factor` | Decimal or `NA` | Multiplication factor applied to base requirement (e.g., `1.10`, `1.50`, `2.50`, or `NA`). |
+| `shared_capacity_group` | String | Identifier for checks competing for the same filesystem capacity during concurrent operations (`none`, `07_reassembly`, `pipeline_storage`). |
+| `status` | String | Assessment result: `sufficient`, `warning`, `insufficient`, `unknown`, `not-applicable`. |
+| `message` | String | Sanitized diagnostic details formatted as semicolon-separated `key=value` tokens. Tabs, CR, and LF are strictly stripped. |
+
+### Filesystem Identification & Shared Capacity Detection
+
+To accurately evaluate physical disk limits, the pipeline inspects both device IDs and mount points:
+
+1. **Device ID**: Extracted via `stat -c %d <path>`.
+2. **Mount Point**: Extracted via POSIX `df -P <path>`.
+3. **Filesystem Identity**: Synthesized as `<device_id>|<mount_point>`.
+
+#### Shared Capacity Classification Rules
+
+When assessing coexisting storage demands across `OUTDIR` and `TMPDIR`:
+
+| Condition | Device ID Match | Mount Point Match | Classification | Shared Capacity Behavior |
+|---|---|---|---|---|
+| Both attributes match | Match | Match | `shared=true` | Demands coexist on the same storage pool; competing demands are checked against shared capacity. |
+| Both attributes differ | Different | Different | `shared=false` | Isolated filesystems; capacity evaluated independently per storage role. |
+| Discrepancy detected | Match/Different | Different/Match | `shared=unknown` | Ambiguity (e.g., bind-mounts, network mounts); pipeline conservatively logs warning and isolates checks. |
+
+#### Resolution of Uncreated Target Paths
+
+If a stage directory does not yet exist during pre-flight or pre-checks:
+- The pipeline ascends path ancestors using `find_existing_parent` until an existing ancestor directory is resolved.
+- Disk capacity is queried on this ancestor, and the record includes `filesystem_source=existing-parent` in `message`.
+- Once the stage creates the actual directory, post-stage observations re-measure the true path with `filesystem_source=real`.
+
+---
+
+### Estimation Models by Stage
+
+The pipeline maintains a strict distinction between **Input Size** (`input_bytes_read`) and **Incremental Required Space** (`estimated_required_bytes`). Input files are already present on disk; only new outputs and temporary workspace files require additional capacity.
+
+| Stage | Storage Role | Purpose | Model / Formula | Factor | Confidence |
+|---|---|---|---|---|---|
+| `pipeline` | `outdir` | `pipeline-outputs` | Baseline initial verification of output directory | `NA` | `informational` |
+| `pipeline` | `tmpdir` | `workspace` | Baseline initial verification of temporary base directory | `NA` | `informational` |
+| `01_fastp` | `outdir` | `cleaned-reads` | `total_raw_reads_bytes * FASTP_OUTPUT_FACTOR` | `1.10` | `informational` |
+| `02_megahit` | `outdir` | `assembly` | `active_reads_bytes * MEGAHIT_WORK_FACTOR` | `2.50` | `informational` |
+| `03_kraken2` | `outdir` | `taxonomy-output` | `active_reads_bytes * KRAKEN_OUTPUT_FACTOR` | `1.00` | `informational` |
+| `04_mapping` | `outdir` | `mapping-bam` | `active_reads_bytes * MAPPING_OUTPUT_FACTOR` | `1.50` | `informational` |
+| `05a_vamb` | `outdir` | `binning` | `contig_depth_tsv_bytes + contigs_bytes` | `1.00` | `informational` |
+| `05b_metabinner` | `outdir` | `binning` | `contig_depth_tsv_bytes + contigs_bytes` | `1.00` | `informational` |
+| `05c_comebin` | `outdir` | `binning` | `contig_depth_tsv_bytes + contigs_bytes` | `1.00` | `informational` |
+| `06_refinement` | `outdir` | `refinement` | `input_bins_bytes + contigs_bytes` | `1.00` | `informational` |
+| `07_reassembly` | `tmpdir` | `read-concatenation` | `(sum(R1) + sum(R2)) * REASSEMBLY_CONCAT_SPACE_FACTOR` | `1.10` | **`hard-minimum`** (Blocking) |
+| `07_reassembly` | `outdir` | `reassembly-output` | `input_bins_bytes * 1.50` | `1.50` | `informational` |
+| `08_checkm2` | `outdir` | `quality-assessment` | `input_bins_bytes` | `1.00` | `informational` |
+| `10_gtdbtk` | `outdir` | `classification-output`| `mag_bins_bytes` | `1.00` | `informational` |
+| `11_abundance` | `outdir` | `coverage-output` | `bam_files_bytes` | `1.00` | `informational` |
+| `12a_taxonomy_summary` | `outdir` | `summary-output` | Negligible / structured TSV reports | `NA` | `not-applicable` |
+| `12b_mag_summary` | `outdir` | `summary-output` | Negligible / structured TSV reports | `NA` | `not-applicable` |
+| `12c_run_overview` | `outdir` | `summary-output` | Negligible / structured TSV reports | `NA` | `not-applicable` |
+
+> [!NOTE]
+> Reassembly read concatenation (`07_reassembly.tmpdir.read-concatenation`) uses a single canonical calculation: `(sum(R1) + sum(R2)) * REASSEMBLY_CONCAT_SPACE_FACTOR` (`1.10`). It is verified identically in pre-flight, dry-run, and stage pre-checks.
+
+---
+
+### Confidence Levels and Strict Blocking Policy
+
+To prevent false alarms from aborting valid analyses while guaranteeing protection against deterministic failures, the pipeline enforces an explicit blocking hierarchy:
+
+| Confidence Level | Definition | Failure Behavior (`available < required`) | Headroom Warning Behavior (`available < required * 1.25`) | Can Halt Execution? |
+|---|---|---|---|---|
+| **`hard-minimum`** | Mathematically calculable and defensively required lower bound (e.g., concatenated FASTQ bytes + 16 inodes). | `status=insufficient`. Emits error diagnostic and **halts execution immediately**. | `status=warning`. Emits diagnostic warning; continues execution. | **YES** |
+| **`conservative`** | Empirically grounded upper bound for complex stages. | `status=warning` (or `status=insufficient` only if explicitly validated as blocking). | `status=warning`. Emits diagnostic warning; continues execution. | Only if explicitly validated |
+| **`informational`** | Best-effort projection based on typical input ratios. | `status=warning`. Logs warning; **never halts execution**. | `status=warning`. Logs warning; **never halts execution**. | **NO** |
+| **`unknown`** | Storage requirement cannot be reliably modeled. | `status=unknown`. Logs telemetry; **never halts execution**. | N/A | **NO** |
+| **`not-applicable`** | Negligible space requirement (e.g., TSV summaries). | `status=not-applicable`. Recorded for complete audit trail. | N/A | **NO** |
+
+#### Headroom Safety Warning
+
+Whenever available disk space is sufficient to cover `estimated_required_bytes` but falls below the recommended headroom threshold (`DISK_WARNING_HEADROOM_FACTOR="1.25"`), the pipeline marks the check with `status=warning` and annotates `message` with `headroom_warning=available_below_headroom`. This provides early operational visibility without interrupting execution.
+
+---
+
+### Measurement Lifecycle & Points of Observation
+
+The pipeline collects structured disk telemetry at four distinct lifecycle points:
+
+```
+[ Pre-flight Check ] ───────────► preflight-estimate   (OUTDIR & TMPDIR baselines, hard-minimums)
+        │
+        ▼ (Stage Execution Loop)
+[ Immediate Pre-check ] ────────► stage-precheck       (Re-measured immediately before stage starts)
+        │
+        ▼ [ Stage Runs ]
+[ Post-Stage Observation ] ─────► post-stage-observation (Actual output directory size, delta, post-stage fs capacity)
+        │
+        ▼ (Pipeline Completion)
+[ Pipeline Finalization ] ──────► final-observation    (Closing filesystem capacity and total disk warnings)
+```
+
+1. **Pre-flight Estimation (`preflight-estimate`)**:
+   - Assesses initial capacity and inodes for `OUTDIR` and `TMPDIR`.
+   - In dry-run mode (`--dry-run`), pre-flight checks execute fully in read-only mode without creating or modifying TSV files on disk, exiting with status 1 if a `hard-minimum` is violated.
+2. **Stage Pre-check (`stage-precheck`)**:
+   - Re-measured immediately prior to executing any stage in `DISK_PRECHECK_STAGES` (`01_fastp`, `02_megahit`, `03_kraken2`, `04_mapping`, `05a_vamb`, `05b_metabinner`, `05c_comebin`, `06_refinement`, `07_reassembly`, `08_checkm2`, `10_gtdbtk`, `11_abundance`).
+   - Ensures that available space has not been consumed by external processes or preceding stages before committing resources.
+3. **Post-Stage Observation (`post-stage-observation`)**:
+   - Executed immediately after a stage succeeds.
+   - Measures actual stage directory size via `du -sk`, calculates delta change, and records remaining filesystem capacity.
+4. **Final Observation (`final-observation`)**:
+   - Executed during pipeline shutdown in `main()`.
+   - Records closing filesystem state for `OUTDIR` and `TMPDIR`, and summarizes total disk warnings encountered during the run.
+
+---
+
+### Concrete TSV Report Example
+
+Example snippet from `OUTDIR/logs/disk_space.tsv`:
+
+```text
+run_id	measurement_sequence	check_id	timestamp_utc	stage_id	storage_role	purpose	path	filesystem_id	measurement_type	estimate_confidence	input_bytes_read	estimated_required_bytes	filesystem_available_bytes	filesystem_used_bytes	filesystem_total_bytes	required_free_inodes	available_free_inodes	safety_factor	shared_capacity_group	status	message
+20261103T180000Z_12345_a1b2	1	pipeline.outdir.outputs	2026-11-03T18:00:01.120Z	pipeline	outdir	pipeline-outputs	/data/project/metagenomics_out	2049|/data	preflight-estimate	informational	NA	NA	536870912000	4831838208000	5368709120000	NA	15420000	NA	pipeline_storage	sufficient	filesystem_source=real
+20261103T180000Z_12345_a1b2	2	pipeline.tmpdir.workspace	2026-11-03T18:00:01.145Z	pipeline	tmpdir	workspace	/tmp/metagenomics_pipeline/20261103T180000Z_12345_a1b2	2050|/tmp	preflight-estimate	informational	NA	NA	214748364800	107374182400	322122547200	NA	8940000	NA	none	sufficient	filesystem_source=existing-parent
+20261103T180000Z_12345_a1b2	3	01_fastp.outdir.cleaned-reads	2026-11-03T18:00:05.210Z	01_fastp	outdir	cleaned-reads	/data/project/metagenomics_out/01_qc	2049|/data	stage-precheck	informational	21474836480	23622320128	536870912000	4831838208000	5368709120000	NA	15420000	1.10	pipeline_storage	sufficient	filesystem_source=real
+20261103T180000Z_12345_a1b2	4	01_fastp.outdir.cleaned-reads	2026-11-03T18:15:30.850Z	01_fastp	outdir	cleaned-reads	/data/project/metagenomics_out/01_qc	2049|/data	post-stage-observation	not-applicable	NA	NA	516469850112	4852239269888	5368709120000	NA	15419850	NA	pipeline_storage	sufficient	observed_bytes=20401094656;delta_bytes=20401094656
+20261103T180000Z_12345_a1b2	5	07_reassembly.tmpdir.read-concatenation	2026-11-03T19:30:00.100Z	07_reassembly	tmpdir	read-concatenation	/tmp/metagenomics_pipeline/20261103T180000Z_12345_a1b2/reassembly	2050|/tmp	stage-precheck	hard-minimum	20401094656	22441204122	214748364800	107374182400	322122547200	16	8939980	1.10	none	sufficient	filesystem_source=real
+20261103T180000Z_12345_a1b2	6	pipeline.outdir.filesystem-observation	2026-11-03T20:45:00.000Z	pipeline	outdir	filesystem-observation	/data/project/metagenomics_out	2049|/data	final-observation	not-applicable	NA	NA	495123456000	4873585664000	5368709120000	NA	15415000	NA	pipeline_storage	sufficient	total_disk_warnings=0
+```
+
+---
+
+### Known Operational Limitations
+
+1. **Absence of Kernel Space Reservations**: Standard POSIX filesystems do not support non-allocating capacity reservations across unprivileged processes. If external cluster jobs write aggressively to the same filesystem, available space may decrease during stage execution.
+2. **Third-Party Internal Scratch**: Complex wrapped tools (e.g., SPAdes inside MetaWRAP reassembly) allocate unmodeled temporary scratch memory and disk buffers. Only pipeline-managed intermediate artifacts (such as concatenated FASTQ reads) are modeled as `hard-minimum`.
+3. **Cluster/Remote Inode Reporting**: Remote distributed filesystems (Lustre, GPFS, Ceph, NFS) often do not track or report free inodes (`df -Pi` returns `-` or `0`). In such environments, the pipeline safely converts missing inode counts to `NA` rather than failing.
 
 ---
 
@@ -1684,13 +1937,17 @@ Concatenation is performed strictly in active manifest order to `.part` files, v
 
 ### Storage Space and Inode Verification
 
-Prior to concatenation, the pipeline calculates total input size:
-$$\text{concatenated\_input\_bytes} = \text{read1\_total\_size\_bytes} + \text{read2\_total\_size\_bytes}$$
-$$\text{required\_concat\_bytes} = \lceil \text{concatenated\_input\_bytes} \times 1.10 \rceil$$
+Prior to concatenation, the pipeline executes a canonical hard-minimum pre-check integrated into the structured disk space assessment framework (`check_id: 07_reassembly.tmpdir.read-concatenation`):
 
-Using `df -Pk` and `df -Pi`, the pipeline verifies:
-1. **Available Bytes**: At least $1.10\times$ the combined input read size is free on the target filesystem.
-2. **Available Inodes**: At least 16 free inodes (`REQUIRED_FREE_INODES=16`) are available in the workspace.
+$$\text{concatenated\_input\_bytes} = \text{read1\_total\_size\_bytes} + \text{read2\_total\_size\_bytes}$$
+$$\text{required\_concat\_bytes} = \lceil \text{concatenated\_input\_bytes} \times \text{REASSEMBLY\_CONCAT\_SPACE\_FACTOR} \rceil \quad (\text{factor} = 1.10)$$
+
+Using POSIX `df -Pk` and `df -Pi` via the helper functions `get_filesystem_capacity` and `get_available_inodes`, the check verifies:
+1. **Available Bytes**: At least $1.10\times$ the combined input read size is available on the target workspace filesystem. If insufficient, execution is halted immediately prior to stage execution.
+2. **Available Inodes**: At least 16 free inodes (`REQUIRED_FREE_INODES=16`) are available in the workspace (or `NA` if the filesystem does not support inode metrics).
+3. **Headroom Warning**: If available space is between $1.00\times$ and $1.25\times$ (`DISK_WARNING_HEADROOM_FACTOR`), a diagnostic warning is logged without stopping execution.
+
+See [Structured Disk Space Assessment](#structured-disk-space-assessment) for full schema details, models, and blocking policies.
 
 > [!WARNING]
 > This estimation covers pipeline-managed temporary read concatenation. It does **not** estimate or guarantee the internal scratch memory or disk requirements of MetaWRAP's internal SPAdes assembler.
@@ -1738,6 +1995,143 @@ rm -rf /path/to/metagenomics_pipeline/<RUN_ID>
 
 ---
 
+## Execution Plan Contract and Terminal Inspection (--plan)
+
+MetaNexus provides a canonical terminal inspection mode, `--plan`, allowing users, workflow engines, and automated quality gates to inspect the exact set of actions MetaNexus will take before any execution occurs.
+
+### 1. Plan Inspection vs Dry-Run
+
+| Feature | `--plan` | `--dry-run` |
+|---|---|---|
+| **Primary purpose** | Inspect planned stage actions, reasons, dependencies, and blockages | Print concrete execution commands that would run |
+| **Read-only contract** | Strictly enforced: no `OUTDIR` creation, no checkpoint modification, no TSV writes | Execution preview: requires `OUTDIR` path resolution |
+| **Action evaluation** | Evaluates and explains decisions for all 16 pipeline stages | Filters and prints commands for runnable stages based on plan |
+| **Output formats** | Formatted ASCII table or canonical JSON schema | Shell command blocks printed to stdout |
+| **Gating** | `--strict-plan` exits with code 1 if any required stage is blocked | Exits with failure code if preflight validation fails |
+| **Side effects** | Pure read-only; no disk writes or container executions | Previews commands without executing analytical tools |
+
+### 2. Canonical Stage Record
+
+The planner produces a 24-field canonical record for each stage:
+
+| Field | Type | Description |
+|---|---|---|
+| `stage_id` | string | Canonical identifier (e.g., `01_fastp`, `08_checkm2`) |
+| `stage_name` | string | Display name (e.g., `fastp`, `checkm2`) |
+| `configured_enabled`| boolean | Whether the stage is enabled by profile and CLI options |
+| `required` | boolean | `true` only when enabled, applicable, in the effective workflow, and non-informational |
+| `requested_action` | enum | User intent: `normal`, `force`, or `restart` |
+| `applicability` | enum | Workflow eligibility: `applicable`, `not-applicable`, or `indeterminate` |
+| `planned_action` | enum | Executable decision: `run`, `reuse`, `force`, `restart`, `disabled`, `not-applicable`, `blocked` |
+| `checkpoint_path` | string | Path to the stage `.done` checkpoint |
+| `checkpoint_status`| enum | `missing`, `valid`, `invalid`, `stale`, `legacy`, `not-applicable`, `not-inspected` |
+| `checkpoint_reason`| string/null | Reason checkpoint is stale, invalid, or legacy |
+| `input_status` | enum | `available`, `unknown`, `unavailable`, `invalid`, `not-configured`, `not-applicable`, `indeterminate` |
+| `runtime_status` | enum | Availability of container image or local executable |
+| `database_status` | enum | Configuration and presence of reference database files |
+| `output_status` | enum | `available`, `missing`, `invalid`, `unknown`, `not-applicable`, `not-inspected` |
+| `validation_status`| enum | `valid`, `valid-with-warnings`, `invalid`, `failed`, `not-performed`, `not-applicable`, `not-inspected` |
+| `invalidated_by` | list | List of upstream stage IDs that invalidated this stage |
+| `blocking_stage` | string/null | Primary upstream stage ID causing this stage to be blocked |
+| `reason_code` | string | Primary decision reason code determining `planned_action` |
+| `reason_detail` | string/null | Human-readable explanation of the primary reason |
+| `diagnostic_codes` | list | Ordered, unique secondary observations (e.g., `forced-by-user`, `restart-boundary`) |
+| `dependencies` | list | Direct upstream dependencies in the static graph |
+| `downstream` | list | Direct downstream dependencies in the static graph |
+| `primary_output` | string | Canonical primary analytical output directory or file |
+| `primary_log` | string | Canonical log path for the stage |
+
+### 3. Action Determination and Precedence
+
+The canonical decision engine resolves actions in strict precedence order:
+
+1. **Disabled**: If `configured_enabled=false`, `planned_action=disabled`, `reason_code=stage-disabled`, `required=false`. Precedes all resource checks.
+2. **Not Applicable**: If `applicability=not-applicable`, `planned_action=not-applicable`, `reason_code=stage-not-applicable`, `required=false`. Precedes all resource checks.
+3. **Indeterminate Applicability**: If `applicability=indeterminate`, `planned_action=blocked`, `reason_code=applicability-indeterminate`.
+4. **Precondition Blockage**:
+   - External inputs missing or unconfigured: `planned_action=blocked`, `reason_code=external-input-missing`.
+   - Runtime container or executable missing: `planned_action=blocked`, `reason_code=runtime-unavailable`.
+   - Reference database unconfigured or corrupt: `planned_action=blocked`, `reason_code=database-not-configured`.
+   - Upstream dependency blocked: `planned_action=blocked`, `reason_code=dependency-blocked`, `blocking_stage=<id>`.
+   - If blocked under `--force-stage`, `diagnostic_codes` records `forced-by-user`.
+   - If blocked under `--restart-from`, `diagnostic_codes` records `restart-target`.
+5. **Forced / Restarted**:
+   - Target of `--force-stage`: `planned_action=force`, `reason_code=forced-by-user`.
+   - Boundary of `--restart-from`: `planned_action=restart`, `reason_code=restart-boundary`.
+   - Downstream of forced stage: `planned_action=run`, `reason_code=upstream-forced`, `invalidated_by=[<target>]`.
+   - Downstream of restart boundary: `planned_action=run`, `reason_code=downstream-of-restart`, `invalidated_by=[<target>]`.
+6. **Checkpoint Inspection**:
+   - Missing checkpoint: `planned_action=run`, `reason_code=checkpoint-missing`.
+   - Legacy checkpoint (`.done` without `.config`): `planned_action=run`, `reason_code=checkpoint-legacy`.
+   - Invalid / corrupt checkpoint: `planned_action=run`, `reason_code=checkpoint-invalid`.
+   - Stale checkpoint (config or input fingerprint changed): `planned_action=run`, `reason_code=configuration-changed`.
+   - Valid checkpoint with failed product validation: `planned_action=run`, `reason_code=product-validation-failed`.
+   - Valid checkpoint and verified products: `planned_action=reuse`, `reason_code=checkpoint-valid`.
+
+### 4. Graph Cascade and Branch Isolation
+
+- **Taxonomy Branch (`03_kraken2`)**: Invalidating Kraken2 cascades only to `12a_taxonomy_summary` and `12c_run_overview`. It does not invalidate assembly, mapping, binning, CheckM2, or GTDB-Tk.
+- **MAG Recovery Branch (`08_checkm2`)**: Invalidating CheckM2 cascades to `09_filter_mags`, `10_gtdbtk`, `11_coverm`, `12b_mag_summary`, and `12c_run_overview`.
+
+### 5. Executability and Exit Codes
+
+A plan is executable (`executable: true`) if and only if **no required stage is blocked**. Blocked non-required stages (e.g., an unconfigured database for an optional stage) do not prevent execution.
+
+| Exit Code | Condition | Description |
+|---|---|---|
+| `0` | Success | Plan successfully resolved and printed. In standard `--plan`, exits 0 even if stages are blocked. |
+| `1` | Strict failure | `--strict-plan` invoked and `executable: false` (one or more required stages are blocked). |
+| `2` | User error | Command-line usage error (invalid options, unknown profiles or stages, mutually exclusive flags). |
+| `3` | Internal error | Implementation invariant failure (static graph cycle, unknown dependency, duplicate stage ID, mutation after freeze). |
+
+### 6. JSON Schema (`--plan-format json`)
+
+When serialized to JSON, missing scalar fields are represented as `null`, empty list fields as `[]`, and list fields are guaranteed ordered and duplicate-free. Top-level fields include:
+- `schema_version`: `"1"`
+- `pipeline`: `{ "name": "MetaNexus", "version": "0.3.2", "release_status": "development", "profile": "<profile>" }`
+- `plan`: Array of 24-field canonical stage records
+- `summary`: Counts of stages in each planned action state (`run`, `reuse`, `force`, `restart`, `disabled`, `not_applicable`, `blocked`)
+- `executable`: Boolean indicating whether all required stages can execute without blockage
+
+### 7. Current Implementation Bounds and Limitations
+
+- **Pure Read-Only Bounds**: Pure read-only validators inspect file headers, existence, and sizes; deep recalculations (e.g., hashing multi-gigabyte GTDB-Tk data directories) are bounded to preserved metadata.
+- **Dynamic Binner Outputs**: Direct bin collections and refinement products are generated during stage execution; pre-run plan inspection models static dependencies and declared boundaries.
+- **Plan Immutability**: After freeze in `collect_execution_plan`, any mutation of `STAGE_ACTION` triggers exit code 3.
+
+---
+
+## Testing system
+
+MetaNexus provides a tiered automated testing system structured into five distinct test classes:
+
+| Class | Scope | Command | Description |
+|---|---|---|---|
+| **Lint** | Static analysis & syntax | `make lint` | Validates Bash syntax (`lint-bash`), ShellCheck static analysis (`lint-shellcheck`), Apptainer definition syntax (`lint-defs`), and Python syntax compilation (`lint-python`). |
+| **Unit** | Isolated logic & models | `make test-unit` | Executes pure unit tests under `tests/unit/` covering schemas, models, invalidation graph, versions, and disk space without external dependencies. |
+| **Integration** | CLI & contracts | `make test-integration` | Executes CLI integration tests under `tests/integration/` verifying flag parsing, terminal modes, options conflict resolution, and exit codes. |
+| **Container** | Runtime binaries & images | `make test-containers` | Verifies the presence and execution readiness of all 12 Apptainer (`.sif`) container images and their internal binaries. |
+| **Smoke** | End-to-end dry runs | `make test-smoke` | Validates end-to-end pipeline wiring, flag propagation, and plan emission against sample fastq fixtures using `--plan` and `--dry-run`. |
+
+### Running tests
+
+```bash
+# Run unit and integration tests (fast, no container execution required)
+make test
+
+# Run static analysis and linting
+make lint
+
+# Run container verification tests
+make test-containers
+
+# Run smoke tests
+make test-smoke
+
+# Run the complete test suite across all 5 test classes
+make test-all
+```
+
 ## Makefile targets
 
 | Target | Purpose |
@@ -1747,10 +2141,18 @@ rm -rf /path/to/metagenomics_pipeline/<RUN_ID>
 | `make setup` | Build/download all containers and clean temporary cache |
 | `make build-containers` | Build the five locally defined images |
 | `make pull-containers` | Download the seven remote images |
+| `make lint` | Run all static analysis and linting checks (bash, shellcheck, defs, python) |
+| `make test-unit` | Run unit test suite (isolated schemas, models, functions) |
+| `make test-integration` | Run CLI integration test suite (argument parsing, plan/version CLI) |
 | `make test-containers` | Verify all 12 images and their principal commands |
+| `make test-smoke` | Run smoke test suite (end-to-end plan and dry-run with fixtures) |
+| `make test` | Run unit and integration test suites |
+| `make test-all` | Run all 5 test classes (lint, unit, integration, container, smoke) |
 | `make test-dry-run ...` | Check Bash syntax and run pre-flight validation |
 | `make test-error-record` | Run Python unit and integration test suite for fatal error capture |
-| `make test` | Run all test suites (including error capture) |
+| `make test-disk-space` | Run Python unit test suite for structured disk space reporting |
+| `make test-inspect-versions` | Run Python unit and integration test suite for version inspector |
+| `make test-execution-plan` | Run Python unit and integration test suite for execution plan |
 | `make clean-tmp` | Remove local container build/cache files |
 | `make clean` | Remove generated `.sif` images and temporary files |
 

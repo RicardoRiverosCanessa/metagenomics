@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Stub binary - prints version and exits 0
+echo "stub $0 version 0.0.1"
+exit 0

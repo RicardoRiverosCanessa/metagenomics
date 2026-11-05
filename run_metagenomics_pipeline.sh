@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 ###############################################################################
-# run_metagenomics_pipeline.sh — Consolidated Shotgun Metagenomics Pipeline
+# run_metagenomics_pipeline.sh — MetaNexus Shotgun Metagenomics Pipeline
 #
 # Internal checkpoint IDs/directories are stable for existing results.
 # Visible execution order begins with fastp, Kraken2/Bracken, then MEGAHIT.
@@ -68,7 +68,9 @@ PIPELINE_SCRIPTS_DIR="${PIPELINE_DIR}/scripts"
 SUMMARY_GENERATOR="${PIPELINE_SCRIPTS_DIR}/generate_pipeline_summaries.py"
 WRITE_ERROR_RECORD="${PIPELINE_SCRIPTS_DIR}/write_error_record.py"
 
-PIPELINE_VERSION="${PIPELINE_VERSION:-2.0.0}"
+readonly PIPELINE_NAME="MetaNexus"
+readonly PIPELINE_VERSION="0.3.2"
+readonly PIPELINE_RELEASE_STATUS="development"
 PIPELINE_START_TIME_UTC="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "unknown-time")"
 export PIPELINE_START_TIME_UTC
 PIPELINE_PID="$$"
@@ -116,6 +118,7 @@ STAGE_STATUS_FILE=""
 RUN_STATUS_FILE=""
 RESUME_PLAN_FILE=""
 BENCHMARK_WRITER="${PIPELINE_SCRIPTS_DIR}/write_benchmark_manifest.py"
+WRITE_DISK_SPACE_REPORT="${PIPELINE_SCRIPTS_DIR}/write_disk_space_report.py"
 CURRENT_STAGE_METRICS_DIR=""
 GNU_TIME_BIN=""
 GNU_TIME_AVAILABLE=false
@@ -143,6 +146,29 @@ declare -A STAGE_STATE=()
 declare -A GRAPH_CHILDREN=()
 declare -A GRAPH_PARENTS=()
 declare -A STAGE_FINAL_STATUS=()
+declare -A STAGE_STAGE_NAME=()
+declare -A STAGE_CHECKPOINT_PATH=()
+declare -A STAGE_REQUESTED_ACTION=()
+declare -A STAGE_APPLICABILITY=()
+declare -A STAGE_REQUIRED=()
+declare -A STAGE_CONFIGURED_ENABLED=()
+declare -A STAGE_CHECKPOINT_STATUS=()
+declare -A STAGE_CHECKPOINT_REASON=()
+declare -A STAGE_INPUT_STATUS=()
+declare -A STAGE_RUNTIME_STATUS=()
+declare -A STAGE_DATABASE_STATUS=()
+declare -A STAGE_OUTPUT_STATUS=()
+declare -A STAGE_VALIDATION_STATUS=()
+declare -A STAGE_INVALIDATED_BY=()
+declare -A STAGE_BLOCKING_STAGE=()
+declare -A STAGE_REASON_CODE=()
+declare -A STAGE_REASON_DETAIL=()
+declare -A STAGE_DIAGNOSTIC_CODES=()
+declare -A STAGE_DEPENDENCIES=()
+declare -A STAGE_DOWNSTREAM=()
+declare -A STAGE_PRIMARY_OUTPUT=()
+declare -A STAGE_PRIMARY_LOG=()
+declare -A STAGE_PRECONDITIONS=()
 # shellcheck disable=SC2034
 declare -A STAGE_START_TIME=()
 # shellcheck disable=SC2034
@@ -342,6 +368,12 @@ NEEDS_MAGS=false
 # ── Execution Flags ───────────────────────────────────────────────────────────
 DRY_RUN="${DRY_RUN:-false}"                   # Print commands without running them
 FORCE_RERUN="${FORCE_RERUN:-false}"           # Ignore checkpoints and rerun every step
+PLAN_MODE="${PLAN_MODE:-false}"
+PLAN_FORMAT="text"
+PLAN_DETAILS="full"
+STRICT_PLAN=false
+PLAN_IS_FROZEN=false
+COLLECTING_PLAN=false
 
 # ── Temporary Workspace ────────────────────────────────────────────────────────
 # Captured before any export; used as the environment-tier candidate.
@@ -372,6 +404,26 @@ REASSEMBLY_TEMP_READS_VALIDATION_VERSION="1"
 REASSEMBLY_CONCAT_SPACE_FACTOR="1.10"
 # Minimum inodes required in the pipeline workspace (pipeline files only)
 REQUIRED_FREE_INODES=16
+# ── Disk Space Assessment Configuration ───────────────────────────────────────
+DISK_WARNING_HEADROOM_FACTOR="1.25"
+FASTP_OUTPUT_FACTOR="1.10"
+MEGAHIT_WORK_FACTOR="2.50"
+KRAKEN_OUTPUT_FACTOR="1.00"
+MAPPING_OUTPUT_FACTOR="1.50"
+DISK_PRECHECK_STAGES=(
+  01_fastp
+  02_megahit
+  03_kraken2
+  04_mapping
+  05a_vamb
+  05b_metabinner
+  05c_comebin
+  06_refinement
+  07_reassembly
+  08_checkm2
+  10_gtdbtk
+  11_coverm
+)
 
 ###############################################################################
 #  END OF CONFIGURATION                                                       #
@@ -379,11 +431,20 @@ REQUIRED_FREE_INODES=16
 
 # ── CLI Parsing ───────────────────────────────────────────────────────────────
 _show_help() {
-    cat <<'HELP'
-run_metagenomics_pipeline.sh — Consolidated Shotgun Metagenomics Pipeline
+    cat <<HELP
+${PIPELINE_NAME} ${PIPELINE_VERSION} (${PIPELINE_RELEASE_STATUS}) — Shotgun Metagenomics Pipeline
 
 Usage:
   bash run_metagenomics_pipeline.sh [OPTIONS]
+
+Identity & Inspection:
+  -V, --version                Show pipeline identity and exit
+      --versions               Inspect tools, runtimes, and databases (read-only)
+      --versions-all           Inspect all pipeline components across all stages
+      --versions-deep          Compute cryptographic fingerprints during inspection
+      --versions-format <text|json>
+                               Format inspection report as text or json (default: text)
+      --strict-versions        Exit with code 1 if any component is unavailable
 
 Options:
   -r, --reads-dir <directory>  Directory containing raw paired-end reads
@@ -457,6 +518,11 @@ Options:
   --stop-after <stage>         Stop after: mapping, binning, refinement,
                                reassembly, checkm2, mag-filtering, gtdbtk,
                                coverm, taxonomy-summary, mag-summary, or run-overview
+  --plan                       Display the execution plan and decisions without executing analysis
+  --plan-format <text|json>    Execution plan format (default: text; requires --plan)
+  --plan-details <summary|full>
+                               Execution plan detail level (default: full; requires --plan)
+  --strict-plan                Exit 1 if any required stage is blocked (requires --plan)
   --dry-run / --no-dry-run     Validate and print the frozen plan without writing results
   --force / --no-force         Force all active stages / cancel prior --force
   --resume                     Reuse compatible checkpoints (default)
@@ -495,6 +561,417 @@ HELP
     exit 0
 }
 
+_show_plan_help() {
+    cat <<PLAN_HELP
+${PIPELINE_NAME} ${PIPELINE_VERSION} (${PIPELINE_RELEASE_STATUS}) — Execution Plan Inspection
+
+Usage:
+  ./run_metagenomics_pipeline.sh --plan [OPTIONS]
+
+Options:
+  --plan                       Inspect and display the canonical execution plan in a
+                               strictly read-only manner without executing analysis.
+  --plan-format <text|json>    Output format: text (default) or json.
+  --plan-details <summary|full>
+                               Detail level: full (default) or summary.
+  --strict-plan                Exit with code 1 if any required stage is blocked.
+  --profile <profile>          Target pipeline profile (full, taxonomy, assembly, custom).
+  --force-stage <stage>        Force a stage and its effective descendants.
+  --restart-from <stage>       Restart from a boundary stage.
+  -h, --help                   Show this help message and exit.
+
+Examples:
+  ./run_metagenomics_pipeline.sh --plan
+  ./run_metagenomics_pipeline.sh --plan --plan-format json
+  ./run_metagenomics_pipeline.sh --plan --plan-details summary
+  ./run_metagenomics_pipeline.sh --plan --strict-plan
+PLAN_HELP
+    exit 0
+}
+
+_show_versions_help() {
+    cat <<VERSIONS_HELP
+${PIPELINE_NAME} ${PIPELINE_VERSION} (${PIPELINE_RELEASE_STATUS}) — Version & Runtime Inspection
+
+Usage:
+  ./run_metagenomics_pipeline.sh --versions [OPTIONS]
+
+Options:
+  --versions                   Inspect pipeline tools, runtimes, and databases in a
+                               strictly read-only manner without executing analysis.
+  --versions-all               Inspect all tools, runtimes, and reference databases
+                               across all stages, regardless of profile or disabled stages.
+  --versions-deep              Perform cryptographic fingerprinting of runtime images
+                               and reference databases (except deep GTDB-Tk).
+  --versions-format <text|json>
+                               Output format: text (default) or json.
+  --strict-versions            Exit with non-zero code (1) if any inspected tool, runtime,
+                               or database is unavailable or unknown.
+  -e, --engine <apptainer|mamba>
+                               Execution engine to inspect (default: apptainer).
+  --profile <full|taxonomy|assembly|custom>
+                               Target profile whose stages should be inspected (default: full).
+  --taxonomy-only              Alias for --profile taxonomy.
+  --assembly-only              Alias for --profile assembly.
+  --kraken2-db <dir>           Path to Kraken2/Bracken database directory.
+  --checkm2-db <file>          Path to CheckM2 diamond database file.
+  --gtdbtk-data-path <dir>     Path to GTDB-Tk reference data directory.
+  --sif-dir <dir>              Directory containing .sif images (default: ./containers).
+  --timeout <seconds>          Per-command execution timeout (default: 20s).
+  -h, --help                   Show this help message and exit.
+
+Examples:
+  ./run_metagenomics_pipeline.sh --versions
+  ./run_metagenomics_pipeline.sh --versions --versions-format json
+  ./run_metagenomics_pipeline.sh --versions --profile taxonomy
+  ./run_metagenomics_pipeline.sh --versions --versions-all --versions-deep
+  ./run_metagenomics_pipeline.sh --versions --strict-versions
+VERSIONS_HELP
+    exit 0
+}
+
+# shellcheck disable=SC2034
+_handle_versions_mode() {
+    local -a raw_args=("$@")
+    local req_profile="full"
+    local run_megahit=true
+    local run_fastp=true
+    local run_kraken2=true
+    local run_mapping=true
+    local run_binning=true
+    local run_reassembly=false
+    local run_checkm2=true
+    local run_mag_filtering=true
+    local run_gtdbtk=true
+    local run_coverm=true
+    local run_summary=true
+    local run_taxonomy_summary=true
+    local run_mag_summary=true
+    local run_run_overview=true
+    local selected_binners="${SELECTED_BINNERS:-vamb,metabinner,comebin}"
+    local refinement_mode="auto"
+    local exec_mode="${EXEC_MODE:-apptainer}"
+    local sif_dir="${SIF_DIR:-./containers}"
+    local kraken2_db="${KRAKEN2_DB:-}"
+    local checkm2_db="${CHECKM2_DB:-}"
+    local gtdbtk_data_path="${GTDBTK_DATA_PATH:-}"
+    local versions_all=false
+    local versions_deep=false
+    local versions_format="text"
+    local strict_versions=false
+    local timeout_val=""
+
+    # First pass: check for profile
+    local idx=0
+    while (( idx < ${#raw_args[@]} )); do
+        local arg="${raw_args[idx]}"
+        case "${arg}" in
+            --profile)
+                if (( idx + 1 < ${#raw_args[@]} )); then
+                    req_profile="${raw_args[idx+1]}"
+                    idx=$((idx + 2))
+                else
+                    echo "[ERROR] --profile requires a value (full, taxonomy, assembly, custom)." >&2
+                    exit 1
+                fi
+                ;;
+            --taxonomy-only) req_profile="taxonomy"; idx=$((idx + 1)) ;;
+            --assembly-only) req_profile="assembly"; idx=$((idx + 1)) ;;
+            *) idx=$((idx + 1)) ;;
+        esac
+    done
+
+    # Apply profile defaults
+    case "${req_profile}" in
+        full)
+            run_megahit=true; run_kraken2=true; run_mapping=true; run_binning=true
+            refinement_mode="auto"; run_checkm2=true; run_mag_filtering=true
+            run_coverm=true; run_summary=true; run_taxonomy_summary=true
+            run_mag_summary=true; run_run_overview=true ;;
+        taxonomy)
+            run_kraken2=true; run_megahit=false; run_mapping=false; run_binning=false
+            refinement_mode="never"; run_reassembly=false; run_checkm2=false
+            run_mag_filtering=false; run_gtdbtk=false; run_coverm=false
+            run_summary=true; run_taxonomy_summary=true; run_mag_summary=false
+            run_run_overview=true ;;
+        assembly)
+            run_kraken2=false; run_megahit=true; run_mapping=true; run_binning=true
+            refinement_mode="auto"; run_checkm2=true; run_mag_filtering=true
+            run_coverm=true; run_summary=true; run_taxonomy_summary=false
+            run_mag_summary=true; run_run_overview=true ;;
+        custom) ;;
+        *)
+            echo "[ERROR] Invalid profile '${req_profile}' (expected full, taxonomy, assembly, or custom)." >&2
+            exit 1 ;;
+    esac
+
+    # Second pass: parse overrides and versions flags
+    idx=0
+    while (( idx < ${#raw_args[@]} )); do
+        local arg="${raw_args[idx]}"
+        case "${arg}" in
+            --versions) idx=$((idx + 1)) ;;
+            --versions-all) versions_all=true; idx=$((idx + 1)) ;;
+            --versions-deep) versions_deep=true; idx=$((idx + 1)) ;;
+            --versions-format)
+                if (( idx + 1 < ${#raw_args[@]} )); then
+                    local fmt_val="${raw_args[idx+1]}"
+                    case "${fmt_val}" in
+                        text|json) versions_format="${fmt_val}"; idx=$((idx + 2)) ;;
+                        *) echo "[ERROR] Invalid format '${fmt_val}' for --versions-format (expected text or json)." >&2; exit 2 ;;
+                    esac
+                else
+                    echo "[ERROR] --versions-format requires a value (text or json)." >&2
+                    exit 2
+                fi
+                ;;
+            --strict-versions) strict_versions=true; idx=$((idx + 1)) ;;
+            --timeout)
+                if (( idx + 1 < ${#raw_args[@]} )); then
+                    timeout_val="${raw_args[idx+1]}"
+                    idx=$((idx + 2))
+                else
+                    echo "[ERROR] --timeout requires a value." >&2
+                    exit 1
+                fi
+                ;;
+            -e|--engine)
+                if (( idx + 1 < ${#raw_args[@]} )); then
+                    local eng_val="${raw_args[idx+1]}"
+                    case "${eng_val}" in
+                        apptainer|mamba) exec_mode="${eng_val}"; idx=$((idx + 2)) ;;
+                        *) echo "[ERROR] --engine must be 'apptainer' or 'mamba'." >&2; exit 1 ;;
+                    esac
+                else
+                    echo "[ERROR] --engine requires a value (apptainer or mamba)." >&2
+                    exit 1
+                fi
+                ;;
+            --sif-dir)
+                if (( idx + 1 < ${#raw_args[@]} )); then
+                    sif_dir="${raw_args[idx+1]}"; idx=$((idx + 2))
+                else
+                    echo "[ERROR] --sif-dir requires a directory path." >&2
+                    exit 1
+                fi
+                ;;
+            --kraken2-db)
+                if (( idx + 1 < ${#raw_args[@]} )); then
+                    kraken2_db="${raw_args[idx+1]}"; idx=$((idx + 2))
+                else
+                    echo "[ERROR] --kraken2-db requires a directory value." >&2
+                    exit 1
+                fi
+                ;;
+            --checkm2-db)
+                if (( idx + 1 < ${#raw_args[@]} )); then
+                    checkm2_db="${raw_args[idx+1]}"; idx=$((idx + 2))
+                else
+                    echo "[ERROR] --checkm2-db requires a file value." >&2
+                    exit 1
+                fi
+                ;;
+            --gtdbtk-data-path)
+                if (( idx + 1 < ${#raw_args[@]} )); then
+                    gtdbtk_data_path="${raw_args[idx+1]}"; idx=$((idx + 2))
+                else
+                    echo "[ERROR] --gtdbtk-data-path requires a directory value." >&2
+                    exit 1
+                fi
+                ;;
+            --fastp) run_fastp=true; idx=$((idx + 1)) ;;
+            --no-fastp) run_fastp=false; idx=$((idx + 1)) ;;
+            --megahit) run_megahit=true; idx=$((idx + 1)) ;;
+            --no-megahit) run_megahit=false; idx=$((idx + 1)) ;;
+            --kraken2) run_kraken2=true; idx=$((idx + 1)) ;;
+            --no-kraken2) run_kraken2=false; idx=$((idx + 1)) ;;
+            --mapping) run_mapping=true; idx=$((idx + 1)) ;;
+            --no-mapping) run_mapping=false; idx=$((idx + 1)) ;;
+            --binning) run_binning=true; idx=$((idx + 1)) ;;
+            --no-binning) run_binning=false; idx=$((idx + 1)) ;;
+            --binners)
+                if (( idx + 1 < ${#raw_args[@]} )); then
+                    selected_binners="${raw_args[idx+1]}"; idx=$((idx + 2))
+                else
+                    idx=$((idx + 1))
+                fi
+                ;;
+            --refinement-mode)
+                if (( idx + 1 < ${#raw_args[@]} )); then
+                    refinement_mode="${raw_args[idx+1]}"; idx=$((idx + 2))
+                else
+                    idx=$((idx + 1))
+                fi
+                ;;
+            --refinement) refinement_mode="always"; idx=$((idx + 1)) ;;
+            --no-refinement) refinement_mode="never"; idx=$((idx + 1)) ;;
+            --reassembly) run_reassembly=true; idx=$((idx + 1)) ;;
+            --no-reassembly) run_reassembly=false; idx=$((idx + 1)) ;;
+            --checkm2) run_checkm2=true; idx=$((idx + 1)) ;;
+            --no-checkm2) run_checkm2=false; idx=$((idx + 1)) ;;
+            --mag-filtering) run_mag_filtering=true; idx=$((idx + 1)) ;;
+            --no-mag-filtering) run_mag_filtering=false; idx=$((idx + 1)) ;;
+            --gtdbtk) run_gtdbtk=true; idx=$((idx + 1)) ;;
+            --no-gtdbtk) run_gtdbtk=false; idx=$((idx + 1)) ;;
+            --coverm) run_coverm=true; idx=$((idx + 1)) ;;
+            --no-coverm) run_coverm=false; idx=$((idx + 1)) ;;
+            --summary) run_summary=true; idx=$((idx + 1)) ;;
+            --no-summary) run_summary=false; idx=$((idx + 1)) ;;
+            --profile) idx=$((idx + 2)) ;;
+            --taxonomy-only|--assembly-only) idx=$((idx + 1)) ;;
+            -r|--reads-dir|--clean-reads-dir|-a|--assembly-in|--bam-dir|--bam-manifest|\
+            --jgi-depth-file|--force-stage|--restart-from|--bins-dir|--bins-source|\
+            --vamb-binsplit-separator|--comebin-device|--comebin-seed|--min-completeness|\
+            --max-contamination|--tmpdir|-o|--outdir|--metabinner-scripts-dir|-t|--threads|\
+            -m|--memory|--stop-after)
+                idx=$((idx + 2)) ;;
+            --dry-run|--no-dry-run|--force|--no-force|--resume|--keep-temporary|--no-keep-temporary|\
+            --bracken|--no-bracken|--taxonomy-summary|--no-taxonomy-summary|--mag-summary|\
+            --no-mag-summary|--run-overview|--no-run-overview)
+                idx=$((idx + 1)) ;;
+            *)
+                idx=$((idx + 1)) ;;
+        esac
+    done
+
+    # Compute active stages
+    local -a active_stages=()
+    if [[ "${versions_all}" == true ]]; then
+        active_stages=(01_fastp 03_kraken2 02_megahit 04_mapping 05a_vamb 05b_metabinner 05c_comebin 06_refinement 07_reassembly 08_checkm2 09_filter_mags 10_gtdbtk 11_coverm 12a_taxonomy_summary 12b_mag_summary 12c_run_overview)
+    else
+        [[ "${run_fastp}" == true ]] && active_stages+=(01_fastp)
+        [[ "${run_kraken2}" == true ]] && active_stages+=(03_kraken2)
+        [[ "${run_megahit}" == true ]] && active_stages+=(02_megahit)
+        [[ "${run_mapping}" == true ]] && active_stages+=(04_mapping)
+        if [[ "${run_binning}" == true ]]; then
+            IFS=',' read -r -a b_list <<< "${selected_binners}"
+            for b in "${b_list[@]}"; do
+                case "${b}" in
+                    vamb) active_stages+=(05a_vamb) ;;
+                    metabinner) active_stages+=(05b_metabinner) ;;
+                    comebin) active_stages+=(05c_comebin) ;;
+                esac
+            done
+        fi
+        if [[ "${refinement_mode}" == auto || "${refinement_mode}" == always ]]; then
+            active_stages+=(06_refinement)
+        fi
+        [[ "${run_reassembly}" == true ]] && active_stages+=(07_reassembly)
+        [[ "${run_checkm2}" == true ]] && active_stages+=(08_checkm2)
+        [[ "${run_mag_filtering}" == true ]] && active_stages+=(09_filter_mags)
+        [[ "${run_gtdbtk}" == true ]] && active_stages+=(10_gtdbtk)
+        [[ "${run_coverm}" == true ]] && active_stages+=(11_coverm)
+    fi
+
+    local stages_joined
+    stages_joined="$(IFS=,; echo "${active_stages[*]}")"
+    [[ -z "${stages_joined}" ]] && stages_joined="none"
+
+    local -a py_cmd=(
+        python3 "${PIPELINE_SCRIPTS_DIR}/inspect_versions.py"
+        --pipeline-name "${PIPELINE_NAME}"
+        --pipeline-version "${PIPELINE_VERSION}"
+        --pipeline-status "${PIPELINE_RELEASE_STATUS}"
+        --engine "${exec_mode}"
+        --sif-dir "${sif_dir}"
+        --stages "${stages_joined}"
+        --format "${versions_format}"
+    )
+    [[ "${versions_all}" == true ]] && py_cmd+=(--versions-all)
+    [[ "${versions_deep}" == true ]] && py_cmd+=(--versions-deep)
+    [[ "${strict_versions}" == true ]] && py_cmd+=(--strict-versions)
+    [[ -n "${kraken2_db}" ]] && py_cmd+=(--kraken2-db "${kraken2_db}")
+    [[ -n "${checkm2_db}" ]] && py_cmd+=(--checkm2-db "${checkm2_db}")
+    [[ -n "${gtdbtk_data_path}" ]] && py_cmd+=(--gtdbtk-data-path "${gtdbtk_data_path}")
+    [[ -n "${timeout_val}" ]] && py_cmd+=(--timeout "${timeout_val}")
+
+    trap - ERR
+    set +e
+    "${py_cmd[@]}"
+    local rc=$?
+    exit "${rc}"
+}
+
+# ── Terminal Pre-parsing (--version, -V, --versions, --plan, --help) ─────────
+_has_version=false
+_has_versions=false
+_has_plan=false
+_has_plan_format=false
+_has_plan_details=false
+_has_strict_plan=false
+_has_dry_run=false
+_has_help=false
+
+for _arg in "$@"; do
+    case "${_arg}" in
+        --version|-V)
+            _has_version=true
+            ;;
+        --versions)
+            _has_versions=true
+            ;;
+        --plan)
+            _has_plan=true
+            ;;
+        --plan-format|--plan-format=*)
+            _has_plan_format=true
+            ;;
+        --plan-details|--plan-details=*)
+            _has_plan_details=true
+            ;;
+        --strict-plan)
+            _has_strict_plan=true
+            ;;
+        --dry-run)
+            _has_dry_run=true
+            ;;
+        --help|-h)
+            _has_help=true
+            ;;
+    esac
+done
+
+if [[ "${_has_version}" == true && "${_has_versions}" == true ]]; then
+    echo "[ERROR] Cannot combine --version/-V with --versions." >&2
+    exit 2
+fi
+
+if [[ "${_has_plan}" == true && ( "${_has_version}" == true || "${_has_versions}" == true ) ]]; then
+    echo "[ERROR] Cannot combine --plan with --version or --versions." >&2
+    exit 2
+fi
+
+if [[ "${_has_plan}" == true && "${_has_dry_run}" == true ]]; then
+    echo "[ERROR] Cannot combine --plan with --dry-run." >&2
+    exit 2
+fi
+
+if [[ "${_has_plan}" == false && ( "${_has_plan_format}" == true || "${_has_plan_details}" == true || "${_has_strict_plan}" == true ) ]]; then
+    echo "[ERROR] --plan-format, --plan-details, and --strict-plan require --plan." >&2
+    exit 2
+fi
+
+if [[ "${_has_version}" == true ]]; then
+    printf '%s %s (%s)\n' "${PIPELINE_NAME}" "${PIPELINE_VERSION}" "${PIPELINE_RELEASE_STATUS}"
+    exit 0
+fi
+
+if [[ "${_has_plan}" == true && "${_has_help}" == true ]]; then
+    _show_plan_help
+fi
+
+if [[ "${_has_versions}" == true && "${_has_help}" == true ]]; then
+    _show_versions_help
+fi
+
+if [[ "${_has_help}" == true && "${_has_versions}" == false && "${_has_plan}" == false ]]; then
+    _show_help
+fi
+
+if [[ "${_has_versions}" == true ]]; then
+    _handle_versions_mode "$@"
+fi
+
 # The last profile is applied first; individual CLI options are then applied
 # in original order and always take precedence.
 _profile_seen=""
@@ -502,7 +979,7 @@ _profile_set() {
     local value="$1"
     case "${value}" in
         full|taxonomy|assembly|custom) ;;
-        *) echo "[ERROR] Invalid profile '${value}' (expected full, taxonomy, assembly, or custom)." >&2; exit 1 ;;
+        *) echo "[ERROR] Invalid profile '${value}' (expected full, taxonomy, assembly, or custom)." >&2; exit 2 ;;
     esac
     _profile_seen="${value}"
 }
@@ -511,7 +988,7 @@ while [[ ${#_profile_scan[@]} -gt 0 ]]; do
     case "${_profile_scan[0]}" in
         --profile)
             [[ ${#_profile_scan[@]} -ge 2 && -n "${_profile_scan[1]}" ]] || {
-                echo "[ERROR] --profile requires a value." >&2; exit 1; }
+                echo "[ERROR] --profile requires a value." >&2; exit 2; }
             _profile_set "${_profile_scan[1]}"
             _profile_scan=("${_profile_scan[@]:2}") ;;
         --taxonomy-only) _profile_set taxonomy; _profile_scan=("${_profile_scan[@]:1}") ;;
@@ -521,7 +998,7 @@ while [[ ${#_profile_scan[@]} -gt 0 ]]; do
         --bam-dir|--bam-manifest|--jgi-depth-file|--force-stage|--restart-from|\
         --binners|--refinement-mode|--bins-dir|--bins-source|--vamb-binsplit-separator|\
         --comebin-device|--comebin-seed|--min-completeness|--max-contamination|\
-        --tmpdir|\
+        --tmpdir|--plan-format|--plan-details|\
         -o|--outdir|--metabinner-scripts-dir|-t|--threads|-m|--memory|-e|--engine|--stop-after)
             _profile_scan=("${_profile_scan[@]:2}") ;;
         *) _profile_scan=("${_profile_scan[@]:1}") ;;
@@ -531,7 +1008,7 @@ done
 RESULTING_PROFILE="${REQUESTED_PROFILE}"
 case "${REQUESTED_PROFILE}" in
     full|taxonomy|assembly|custom) ;;
-    *) echo "[ERROR] Invalid profile '${REQUESTED_PROFILE}' (expected full, taxonomy, assembly, or custom)." >&2; exit 1 ;;
+    *) echo "[ERROR] Invalid profile '${REQUESTED_PROFILE}' (expected full, taxonomy, assembly, or custom)." >&2; exit 2 ;;
 esac
 
 case "${REQUESTED_PROFILE}" in
@@ -711,6 +1188,7 @@ while [[ $# -gt 0 ]]; do
                 --tmpdir|--keep-temporary|--no-keep-temporary|\
                 --reassembly|--no-reassembly|--dry-run|--no-dry-run|\
                 --force|--no-force|--resume|--force-stage|--restart-from|\
+                --plan|--plan-format|--plan-details|--strict-plan|\
                 --fastp|--no-fastp|--megahit|--no-megahit|--kraken2|--no-kraken2|\
                 --bracken|--no-bracken|--gtdbtk|--no-gtdbtk|--mapping|--no-mapping|\
                 --binning|--no-binning|--refinement|--no-refinement|--checkm2|--no-checkm2|\
@@ -755,24 +1233,44 @@ while [[ $# -gt 0 ]]; do
         --no-run-overview) RUN_RUN_OVERVIEW=false; shift ;;
         --stop-after)
             [[ -z "${2:-}" || "${2:-}" == -* ]] && {
-                echo "[ERROR] --stop-after requires a stage value." >&2; exit 1; }
+                echo "[ERROR] --stop-after requires a stage value." >&2; exit 2; }
             STOP_AFTER="$2"; shift 2 ;;
+        --plan)
+            PLAN_MODE=true; shift ;;
+        --plan-format)
+            [[ -z "${2:-}" || "${2}" == -* ]] && { echo "[ERROR] --plan-format requires a value (text or json)." >&2; exit 2; }
+            case "${2}" in
+                text|json) PLAN_FORMAT="${2}" ;;
+                *) echo "[ERROR] Invalid --plan-format '${2}' (expected text or json)." >&2; exit 2 ;;
+            esac
+            shift 2 ;;
+        --plan-details)
+            [[ -z "${2:-}" || "${2}" == -* ]] && { echo "[ERROR] --plan-details requires a value (summary or full)." >&2; exit 2; }
+            case "${2}" in
+                summary|full) PLAN_DETAILS="${2}" ;;
+                *) echo "[ERROR] Invalid --plan-details '${2}' (expected summary or full)." >&2; exit 2 ;;
+            esac
+            shift 2 ;;
+        --strict-plan)
+            STRICT_PLAN=true; shift ;;
         --dry-run)     DRY_RUN=true;      shift ;;
         --no-dry-run)  DRY_RUN=false;     shift ;;
         --force)     FORCE_RERUN=true; FORCE_REQUESTED=true; shift ;;
         --no-force)  FORCE_RERUN=false; FORCE_REQUESTED=false; shift ;;
         --resume) RESUME_REQUESTED=true; shift ;;
         --force-stage)
-            [[ -z "${2:-}" || "${2}" == -* ]] && { echo "[ERROR] --force-stage requires a stage name." >&2; exit 1; }
+            [[ -z "${2:-}" || "${2}" == -* ]] && { echo "[ERROR] --force-stage requires a stage name." >&2; exit 2; }
+            resolve_stage_id "${2}" >/dev/null 2>&1 || { echo "[ERROR] Unknown stage '${2}' for --force-stage." >&2; exit 2; }
             FORCE_STAGE_NAMES+=("$2"); shift 2 ;;
         --restart-from)
-            [[ -z "${2:-}" || "${2}" == -* ]] && { echo "[ERROR] --restart-from requires a stage name." >&2; exit 1; }
+            [[ -z "${2:-}" || "${2}" == -* ]] && { echo "[ERROR] --restart-from requires a stage name." >&2; exit 2; }
+            resolve_stage_id "${2}" >/dev/null 2>&1 || { echo "[ERROR] Unknown stage '${2}' for --restart-from." >&2; exit 2; }
             RESTART_REQUEST_COUNT=$((RESTART_REQUEST_COUNT + 1))
             (( RESTART_REQUEST_COUNT == 1 )) || {
-                echo "[ERROR] --restart-from may be specified only once." >&2; exit 1; }
+                echo "[ERROR] --restart-from may be specified only once." >&2; exit 2; }
             RESTART_FROM_NAME="$2"; RESTART_REQUESTED=true; shift 2 ;;
         -h|--help)  _show_help ;;
-        *)  echo "[ERROR] Unknown option: $1. Use -h for help." >&2; exit 1 ;;
+        *)  echo "[ERROR] Unknown option: $1. Use -h for help." >&2; exit 2 ;;
     esac
 done
 
@@ -788,19 +1286,31 @@ if len(separator) != 1 or separator.isspace() or separator in "/>":
 PY_VAMB_SEPARATOR_OPTION
 fi
 
+if [[ "${PLAN_MODE}" != true ]]; then
+    if [[ "${_has_plan_format}" == true || "${_has_plan_details}" == true || "${STRICT_PLAN}" == true ]]; then
+        echo "[ERROR] --plan-format, --plan-details, and --strict-plan require --plan." >&2
+        exit 2
+    fi
+fi
+
+if [[ "${PLAN_MODE}" == true && "${DRY_RUN}" == true ]]; then
+    echo "[ERROR] --plan cannot be combined with --dry-run." >&2
+    exit 2
+fi
+
 if [[ "${FORCE_RERUN}" == true ]]; then FORCE_REQUESTED=true; fi
 if [[ "${RESUME_REQUESTED}" == true && ( "${FORCE_REQUESTED}" == true || \
       ${#FORCE_STAGE_NAMES[@]} -gt 0 || "${RESTART_REQUESTED}" == true ) ]]; then
     echo "[ERROR] --resume cannot be combined with --force, --force-stage, or --restart-from." >&2
-    exit 1
+    exit 2
 fi
 if [[ "${FORCE_REQUESTED}" == true && ( ${#FORCE_STAGE_NAMES[@]} -gt 0 || "${RESTART_REQUESTED}" == true ) ]]; then
     echo "[ERROR] --force cannot be combined with --force-stage or --restart-from." >&2
-    exit 1
+    exit 2
 fi
 if (( ${#FORCE_STAGE_NAMES[@]} > 0 )) && [[ "${RESTART_REQUESTED}" == true ]]; then
     echo "[ERROR] --force-stage cannot be combined with --restart-from." >&2
-    exit 1
+    exit 2
 fi
 if [[ "${RESTART_REQUESTED}" == true ]]; then
     RESUME_CONTROL=restart
@@ -1160,83 +1670,970 @@ validate_pipeline_tmpdir_base() {
     return 0
 }
 
+# ── Structured Disk Space Assessment ──────────────────────────────────────────
+
+# find_existing_parent PATH
+#   Finds the nearest existing ancestor directory for PATH.
+#   If PATH exists and is a directory, returns PATH.
+#   If PATH is a regular file, returns its dirname.
+#   Walks up until an existing directory is found, defaulting to "/".
+find_existing_parent() {
+    local target="$1"
+    [[ -z "${target}" ]] && target="/"
+    local dir="${target}"
+    if [[ -f "${dir}" ]]; then
+        dir="${dir%/*}"
+        [[ -z "${dir}" ]] && dir="/"
+    fi
+    while [[ -n "${dir}" && "${dir}" != "/" && ! -d "${dir}" ]]; do
+        dir="${dir%/*}"
+    done
+    [[ -z "${dir}" ]] && dir="/"
+    realpath -m -- "${dir}" 2>/dev/null || printf '%s' "${dir}"
+}
+
+# canonicalize_storage_path PATH
+#   Resolves an absolute, canonical path for PATH without trailing slashes.
+canonicalize_storage_path() {
+    local raw="$1"
+    [[ -z "${raw}" ]] && { printf '/'; return 0; }
+    local abs=""
+    if [[ -e "${raw}" ]]; then
+        abs="$(realpath -- "${raw}" 2>/dev/null)" || abs="$(realpath -m -- "${raw}" 2>/dev/null)" || abs="${raw}"
+    else
+        abs="$(realpath -m -- "${raw}" 2>/dev/null)" || {
+            local parent rest
+            parent="$(find_existing_parent "${raw}")"
+            rest="${raw#"${parent}"}"
+            rest="${rest#/}"
+            abs="${parent%/}/${rest}"
+        }
+    fi
+    while [[ "${abs}" != "/" && "${abs}" == */ ]]; do
+        abs="${abs%/}"
+    done
+    printf '%s' "${abs}"
+}
+
+# get_filesystem_device_id PATH
+#   Queries the numeric device ID using stat -c '%d' on nearest existing ancestor.
+get_filesystem_device_id() {
+    local path="$1"
+    local check_path
+    check_path="$(find_existing_parent "${path}")"
+    local dev_id
+    dev_id="$(stat -c '%d' -- "${check_path}" 2>/dev/null || echo "")"
+    if [[ -n "${dev_id}" && "${dev_id}" =~ ^[0-9]+$ ]]; then
+        printf '%s' "${dev_id}"
+    else
+        printf 'unknown'
+    fi
+}
+
+# get_filesystem_mount_point PATH
+#   Queries the mount point using POSIX df -Pk on nearest existing ancestor.
+get_filesystem_mount_point() {
+    local path="$1"
+    local check_path
+    check_path="$(find_existing_parent "${path}")"
+    local mount_pt
+    mount_pt="$(LC_ALL=C df -Pk -- "${check_path}" 2>/dev/null | awk 'NR>1 { if (NF>=6) { print $6; exit } }')"
+    if [[ -n "${mount_pt}" ]]; then
+        printf '%s' "${mount_pt}"
+    else
+        printf 'unknown'
+    fi
+}
+
+# get_filesystem_id PATH
+#   Returns <device_id>|<mount_point> or unknown
+get_filesystem_id() {
+    local path="$1"
+    local dev mnt
+    dev="$(get_filesystem_device_id "${path}")"
+    mnt="$(get_filesystem_mount_point "${path}")"
+    if [[ "${dev}" == "unknown" && "${mnt}" == "unknown" ]]; then
+        printf 'unknown'
+    else
+        printf '%s|%s' "${dev}" "${mnt}"
+    fi
+}
+
+# compare_filesystem_identities FS_ID_1 FS_ID_2
+#   Implements Section 9 logic to detect shared capacity between filesystems.
+compare_filesystem_identities() {
+    local fs1="$1" fs2="$2"
+    if [[ "${fs1}" == "unknown" || "${fs2}" == "unknown" ]]; then
+        printf 'unknown'
+        return 0
+    fi
+    local dev1="${fs1%%|*}" mnt1="${fs1#*|}"
+    local dev2="${fs2%%|*}" mnt2="${fs2#*|}"
+
+    # 1. if device_id and mount_point match: shared=true
+    if [[ "${dev1}" != "unknown" && "${dev2}" != "unknown" && "${dev1}" == "${dev2}" && \
+          "${mnt1}" != "unknown" && "${mnt2}" != "unknown" && "${mnt1}" == "${mnt2}" ]]; then
+        printf 'true'
+        return 0
+    fi
+
+    # 2. if device_id missing, but mount_point matches: shared=true
+    if [[ ( "${dev1}" == "unknown" || "${dev2}" == "unknown" ) && \
+          "${mnt1}" != "unknown" && "${mnt2}" != "unknown" && "${mnt1}" == "${mnt2}" ]]; then
+        printf 'true'
+        return 0
+    fi
+
+    # 3. if device_id matches, but mount_point differs: shared=unknown
+    if [[ "${dev1}" != "unknown" && "${dev2}" != "unknown" && "${dev1}" == "${dev2}" && \
+          "${mnt1}" != "${mnt2}" ]]; then
+        printf 'unknown'
+        return 0
+    fi
+
+    # 4. if mount_point matches, but device_id differs: shared=unknown
+    if [[ "${mnt1}" != "unknown" && "${mnt2}" != "unknown" && "${mnt1}" == "${mnt2}" && \
+          "${dev1}" != "${dev2}" ]]; then
+        printf 'unknown'
+        return 0
+    fi
+
+    # 5. only declare false when consistent evidence of different filesystems
+    if [[ "${dev1}" != "unknown" && "${dev2}" != "unknown" && "${dev1}" != "${dev2}" && \
+          "${mnt1}" != "unknown" && "${mnt2}" != "unknown" && "${mnt1}" != "${mnt2}" ]]; then
+        printf 'false'
+        return 0
+    fi
+
+    # 6. on conflict / edge case: shared=unknown
+    printf 'unknown'
+}
+
+# get_filesystem_capacity PATH
+#   Queries capacity via LC_ALL=C df -Pk -- PATH.
+#   Returns tab-separated: total_bytes used_bytes available_bytes mount_point
+get_filesystem_capacity() {
+    local path="$1"
+    local check_path
+    check_path="$(find_existing_parent "${path}")"
+    local df_out
+    df_out="$(LC_ALL=C df -Pk -- "${check_path}" 2>/dev/null | awk 'NR>1 { if (NF>=6 && $2 ~ /^[0-9]+$/ && $3 ~ /^[0-9]+$/ && $4 ~ /^[0-9]+$/) { print $2, $3, $4, $6; exit } }')"
+    if [[ -z "${df_out}" ]]; then
+        printf 'NA\tNA\tNA\tunknown\n'
+        return 0
+    fi
+    local tot_k used_k avail_k mnt
+    tot_k="$(awk '{print $1}' <<< "${df_out}")"
+    used_k="$(awk '{print $2}' <<< "${df_out}")"
+    avail_k="$(awk '{print $3}' <<< "${df_out}")"
+    mnt="$(awk '{print $4}' <<< "${df_out}")"
+
+    local tot_bytes used_bytes avail_bytes
+    tot_bytes="$(awk -v k="${tot_k}" 'BEGIN { printf "%.0f", k * 1024 }')"
+    used_bytes="$(awk -v k="${used_k}" 'BEGIN { printf "%.0f", k * 1024 }')"
+    avail_bytes="$(awk -v k="${avail_k}" 'BEGIN { printf "%.0f", k * 1024 }')"
+
+    printf '%s\t%s\t%s\t%s\n' "${tot_bytes}" "${used_bytes}" "${avail_bytes}" "${mnt}"
+}
+
+# get_available_inodes PATH
+#   Queries free inodes via LC_ALL=C df -Pi -- PATH.
+#   Returns non-negative integer or NA.
+get_available_inodes() {
+    local path="$1"
+    local check_path
+    check_path="$(find_existing_parent "${path}")"
+    local ifree
+    ifree="$(LC_ALL=C df -Pi -- "${check_path}" 2>/dev/null | awk 'NR>1 { if (NF>=5) { print $4; exit } }')"
+    if [[ -n "${ifree}" && "${ifree}" =~ ^[0-9]+$ ]]; then
+        printf '%s' "${ifree}"
+    else
+        printf 'NA'
+    fi
+}
+
+# sum_file_sizes FILE...
+#   Sums file sizes in bytes.
+sum_file_sizes() {
+    local total=0 s f
+    for f in "$@"; do
+        if [[ -f "${f}" ]]; then
+            s="$(stat -c '%s' -- "${f}" 2>/dev/null || echo 0)"
+            if [[ "${s}" =~ ^[0-9]+$ ]]; then
+                total=$(( total + s ))
+            fi
+        fi
+    done
+    printf '%s' "${total}"
+}
+
+# get_canonical_reads_bytes
+#   Returns the total size in bytes of active reads from manifest or active arrays.
+get_canonical_reads_bytes() {
+    local manifest="${SAMPLE_MANIFEST_ACTIVE:-${FASTP_CLEAN_SAMPLE_MANIFEST:-${RAW_SAMPLE_MANIFEST}}}"
+    if [[ -s "${manifest}" && -f "${manifest}" ]]; then
+        local sum
+        sum="$(awk -F'\t' 'NR>1 { if ($8 ~ /^[0-9]+$/) s += $8; if ($9 ~ /^[0-9]+$/) s += $9 } END { printf "%.0f", s }' "${manifest}" 2>/dev/null)"
+        if [[ -n "${sum}" && "${sum}" =~ ^[0-9]+$ && "${sum}" -gt 0 ]]; then
+            printf '%s' "${sum}"
+            return 0
+        fi
+    fi
+    local -a files=()
+    if (( ${#ACTIVE_R1_FILES[@]} > 0 )); then
+        files=("${ACTIVE_R1_FILES[@]}" "${ACTIVE_R2_FILES[@]}")
+    elif (( ${#INPUT_R1_FILES[@]} > 0 )); then
+        files=("${INPUT_R1_FILES[@]}" "${INPUT_R2_FILES[@]}")
+    fi
+    if (( ${#files[@]} > 0 )); then
+        sum_file_sizes "${files[@]}"
+        return 0
+    fi
+    printf '0'
+}
+
+# estimate_stage_disk_requirement STAGE_ID STORAGE_ROLE
+#   Returns tab-separated:
+#   estimated_required_bytes safety_factor estimate_confidence required_inodes blocking
+estimate_stage_disk_requirement() {
+    local stage="$1" role="$2"
+    local reads_bytes
+    reads_bytes="$(get_canonical_reads_bytes)"
+
+    case "${stage}" in
+        01_fastp)
+            local factor="${FASTP_OUTPUT_FACTOR:-1.10}"
+            local est
+            est="$(awk -v b="${reads_bytes}" -v f="${factor}" 'BEGIN { val = b * f; ival = int(val); if (val > ival) ival++; printf "%.0f", ival }')"
+            printf '%s\t%s\t%s\t%s\t%s\n' "${est}" "${factor}" "informational" "NA" "false"
+            ;;
+        02_megahit)
+            local factor="${MEGAHIT_WORK_FACTOR:-2.50}"
+            local est
+            est="$(awk -v b="${reads_bytes}" -v f="${factor}" 'BEGIN { val = b * f; ival = int(val); if (val > ival) ival++; printf "%.0f", ival }')"
+            printf '%s\t%s\t%s\t%s\t%s\n' "${est}" "${factor}" "informational" "NA" "false"
+            ;;
+        03_kraken2)
+            local factor="${KRAKEN_OUTPUT_FACTOR:-1.00}"
+            local est
+            est="$(awk -v b="${reads_bytes}" -v f="${factor}" 'BEGIN { val = b * f; ival = int(val); if (val > ival) ival++; printf "%.0f", ival }')"
+            printf '%s\t%s\t%s\t%s\t%s\n' "${est}" "${factor}" "informational" "NA" "false"
+            ;;
+        04_mapping)
+            local factor="${MAPPING_OUTPUT_FACTOR:-1.50}"
+            local est
+            est="$(awk -v b="${reads_bytes}" -v f="${factor}" 'BEGIN { val = b * f; ival = int(val); if (val > ival) ival++; printf "%.0f", ival }')"
+            printf '%s\t%s\t%s\t%s\t%s\n' "${est}" "${factor}" "informational" "NA" "false"
+            ;;
+        05a_vamb|05b_metabinner|05c_comebin)
+            printf 'NA\tNA\tunknown\tNA\tfalse\n'
+            ;;
+        06_refinement)
+            printf 'NA\tNA\tunknown\tNA\tfalse\n'
+            ;;
+        07_reassembly)
+            if [[ "${role}" == "tmpdir" ]]; then
+                local factor="${REASSEMBLY_CONCAT_SPACE_FACTOR:-1.10}"
+                local est
+                est="$(awk -v b="${reads_bytes}" -v f="${factor}" 'BEGIN { val = b * f; ival = int(val); if (val > ival) ival++; printf "%.0f", ival }')"
+                printf '%s\t%s\t%s\t%s\t%s\n' "${est}" "${factor}" "hard-minimum" "${REQUIRED_FREE_INODES:-16}" "true"
+            else
+                printf 'NA\tNA\tunknown\tNA\tfalse\n'
+            fi
+            ;;
+        08_checkm2|10_gtdbtk|11_coverm)
+            printf 'NA\tNA\tunknown\tNA\tfalse\n'
+            ;;
+        pipeline)
+            printf 'NA\tNA\tunknown\tNA\tfalse\n'
+            ;;
+        *)
+            printf 'NA\tNA\tnot-applicable\tNA\tfalse\n'
+            ;;
+    esac
+}
+
+# classify_disk_requirement AVAIL_BYTES REQ_BYTES CONFIDENCE BLOCKING AVAIL_INODES REQ_INODES
+#   Determines sufficient | warning | insufficient | unknown | not-applicable.
+classify_disk_requirement() {
+    local avail_bytes="$1" req_bytes="$2" confidence="$3" blocking="$4" avail_inodes="$5" req_inodes="$6"
+    local headroom_factor="${DISK_WARNING_HEADROOM_FACTOR:-1.25}"
+
+    if [[ "${confidence}" == "not-applicable" ]]; then
+        printf 'not-applicable'
+        return 0
+    fi
+    if [[ "${req_bytes}" == "NA" ]]; then
+        printf 'unknown'
+        return 0
+    fi
+
+    local st="sufficient"
+
+    if [[ "${avail_bytes}" == "NA" ]]; then
+        st="warning"
+    else
+        local warn_threshold
+        warn_threshold="$(awk -v r="${req_bytes}" -v h="${headroom_factor}" 'BEGIN { printf "%.0f", r * h }')"
+
+        if [[ "${blocking}" == "true" ]]; then
+            if (( avail_bytes < req_bytes )); then
+                st="insufficient"
+            elif (( avail_bytes < warn_threshold )); then
+                st="warning"
+            else
+                st="sufficient"
+            fi
+        else
+            # Informational never produces insufficient
+            if (( avail_bytes < warn_threshold )); then
+                st="warning"
+            else
+                st="sufficient"
+            fi
+        fi
+    fi
+
+    # Inode checks
+    if [[ "${st}" != "insufficient" && "${req_inodes}" != "NA" && "${req_inodes}" =~ ^[0-9]+$ && "${req_inodes}" -gt 0 ]]; then
+        if [[ "${avail_inodes}" == "NA" ]]; then
+            st="warning"
+        elif [[ "${avail_inodes}" =~ ^[0-9]+$ ]]; then
+            if (( avail_inodes < req_inodes )); then
+                if [[ "${blocking}" == "true" ]]; then
+                    st="insufficient"
+                else
+                    st="warning"
+                fi
+            fi
+        fi
+    fi
+
+    printf '%s' "${st}"
+}
+
+# record_disk_measurement ARGS...
+#   Appends a measurement to disk_space.current.tsv (and disk_space.tsv if published).
+record_disk_measurement() {
+    if [[ "${DRY_RUN}" == true ]]; then
+        return 0
+    fi
+    python3 "${WRITE_DISK_SPACE_REPORT}" record "$@" >/dev/null 2>&1
+}
+
+# publish_disk_space_report
+#   Atomically publishes current.tsv to disk_space.tsv.
+publish_disk_space_report() {
+    if [[ "${DRY_RUN}" == true ]]; then
+        return 0
+    fi
+    if [[ ! -s "${DISK_SPACE_CURRENT_TSV}" ]]; then
+        return 0
+    fi
+    python3 "${WRITE_DISK_SPACE_REPORT}" publish \
+        --report-current "${DISK_SPACE_CURRENT_TSV}" \
+        --publish-path "${DISK_SPACE_TSV}" \
+        --run-id "${RUN_ID}" >/dev/null 2>&1
+}
+
+# get_latest_disk_status
+#   Returns summary of disk checks.
+get_latest_disk_status() {
+    if [[ ! -s "${DISK_SPACE_CURRENT_TSV}" ]]; then
+        printf 'OVERALL_STATUS=not-applicable\nWARNING_COUNT=0\n'
+        return 0
+    fi
+    python3 "${WRITE_DISK_SPACE_REPORT}" summary \
+        --report-current "${DISK_SPACE_CURRENT_TSV}" \
+        --run-id "${RUN_ID}" 2>/dev/null || printf 'OVERALL_STATUS=unknown\nWARNING_COUNT=0\n'
+}
+
+# check_disk_requirement STAGE_ID STORAGE_ROLE PURPOSE TARGET_PATH SHARED_GROUP MEASUREMENT_TYPE [OVERRIDE_REQ_BYTES] [OVERRIDE_IN_BYTES]
+#   Executes full check: capacity inquiry, classification, logging, and recording.
+check_disk_requirement() {
+    local stage="$1" role="$2" purpose="$3" target_path="$4" group="$5" mtype="$6"
+    local override_req="${7:-}" override_in="${8:-}"
+
+    local check_id="${stage}.${role}.${purpose}"
+    local existing_parent
+    existing_parent="$(find_existing_parent "${target_path}")"
+    local fs_id
+    fs_id="$(get_filesystem_id "${existing_parent}")"
+
+    local cap_info tot_bytes used_bytes avail_bytes
+    cap_info="$(get_filesystem_capacity "${existing_parent}")"
+    tot_bytes="$(awk '{print $1}' <<< "${cap_info}")"
+    used_bytes="$(awk '{print $2}' <<< "${cap_info}")"
+    avail_bytes="$(awk '{print $3}' <<< "${cap_info}")"
+
+    local avail_inodes
+    avail_inodes="$(get_available_inodes "${existing_parent}")"
+
+    # Estimation
+    local req_bytes safety_factor confidence req_inodes blocking
+    if [[ -n "${override_req}" ]]; then
+        req_bytes="${override_req}"
+        safety_factor="${REASSEMBLY_CONCAT_SPACE_FACTOR:-1.10}"
+        confidence="hard-minimum"
+        req_inodes="${REQUIRED_FREE_INODES:-16}"
+        blocking="true"
+    else
+        local est_line
+        est_line="$(estimate_stage_disk_requirement "${stage}" "${role}")"
+        req_bytes="$(awk '{print $1}' <<< "${est_line}")"
+        safety_factor="$(awk '{print $2}' <<< "${est_line}")"
+        confidence="$(awk '{print $3}' <<< "${est_line}")"
+        req_inodes="$(awk '{print $4}' <<< "${est_line}")"
+        blocking="$(awk '{print $5}' <<< "${est_line}")"
+    fi
+
+    local in_bytes="NA"
+    if [[ -n "${override_in}" ]]; then
+        in_bytes="${override_in}"
+    elif [[ "${stage}" != "pipeline" && "${confidence}" != "not-applicable" ]]; then
+        in_bytes="$(get_canonical_reads_bytes)"
+    fi
+
+    # Classify
+    local status
+    status="$(classify_disk_requirement "${avail_bytes}" "${req_bytes}" "${confidence}" "${blocking}" "${avail_inodes}" "${req_inodes}")"
+
+    CURRENT_STAGE_DISK_STATUS="${status}"
+    CURRENT_STAGE_DISK_REQ="${req_bytes}"
+    CURRENT_STAGE_DISK_AVAIL="${avail_bytes}"
+
+    # Build message
+    local msg=""
+    if [[ "${existing_parent}" != "${target_path}" ]]; then
+        msg="filesystem_source=existing-parent;target_path=${target_path}"
+    else
+        msg="filesystem_source=real"
+    fi
+    if [[ "${confidence}" == "informational" && "${status}" == "warning" ]]; then
+        msg="${msg};headroom_warning=available_below_headroom"
+    fi
+
+    local ts_utc
+    ts_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "1970-01-01T00:00:00Z")"
+
+    # Record measurement
+    if [[ "${DRY_RUN}" != true ]]; then
+        record_disk_measurement \
+            --report-current "${DISK_SPACE_CURRENT_TSV}" \
+            --publish-path "${DISK_SPACE_TSV}" \
+            --run-id "${RUN_ID}" \
+            --measurement-sequence "auto" \
+            --check-id "${check_id}" \
+            --timestamp-utc "${ts_utc}" \
+            --stage-id "${stage}" \
+            --storage-role "${role}" \
+            --purpose "${purpose}" \
+            --path "${target_path}" \
+            --filesystem-id "${fs_id}" \
+            --measurement-type "${mtype}" \
+            --estimate-confidence "${confidence}" \
+            --input-bytes-read "${in_bytes}" \
+            --estimated-required-bytes "${req_bytes}" \
+            --filesystem-available-bytes "${avail_bytes}" \
+            --filesystem-used-bytes "${used_bytes}" \
+            --filesystem-total-bytes "${tot_bytes}" \
+            --required-free-inodes "${req_inodes}" \
+            --available-free-inodes "${avail_inodes}" \
+            --safety-factor "${safety_factor}" \
+            --shared-capacity-group "${group}" \
+            --status "${status}" \
+            --message "${msg}"
+    fi
+
+    if [[ "${status}" == "insufficient" && "${blocking}" == "true" ]]; then
+        log_error "Insufficient disk space for ${check_id}. Stage: ${stage}; filesystem: ${fs_id}; required: ${req_bytes} bytes; available: ${avail_bytes} bytes; path: ${target_path}; confidence: ${confidence}."
+        return 1
+    elif [[ "${status}" == "warning" ]]; then
+        log_warn "Disk space warning for ${check_id}: available (${avail_bytes} B) is near or below estimated requirement (${req_bytes} B) on ${fs_id}."
+    fi
+
+    return 0
+}
+
 # check_tmpdir_space SOURCE_R1_ARRAY_NAME SOURCE_R2_ARRAY_NAME
-#   Estimates space needed and checks bytes + inodes in PIPELINE_TMPDIR_BASE.
-#   Uses POSIX df -Pk and df -Pi.
+#   Canonical implementation of reassembly temporary workspace disk check.
 check_tmpdir_space() {
     local -n _r1_arr="$1"
     local -n _r2_arr="$2"
-    local total_bytes=0 f fsize factor
-    factor="${REASSEMBLY_CONCAT_SPACE_FACTOR:-1.10}"
-
-    for f in "${_r1_arr[@]}" "${_r2_arr[@]}"; do
-        if [[ -f "${f}" ]]; then
-            fsize="$(stat -c '%s' -- "${f}" 2>/dev/null || echo 0)"
-            total_bytes=$(( total_bytes + fsize ))
-        fi
-    done
-
-    # Apply safety factor via awk: ceil(total_bytes * factor)
+    local total_bytes
+    total_bytes="$(sum_file_sizes "${_r1_arr[@]}" "${_r2_arr[@]}")"
+    local factor="${REASSEMBLY_CONCAT_SPACE_FACTOR:-1.10}"
     local required_bytes
-    required_bytes="$(awk -v b="${total_bytes}" -v f="${factor}" 'BEGIN {
-        val = b * f
-        ival = int(val)
-        if (val > ival) ival++
-        printf "%d", ival
-    }')"
+    required_bytes="$(awk -v b="${total_bytes}" -v f="${factor}" 'BEGIN { val = b * f; ival = int(val); if (val > ival) ival++; printf "%.0f", ival }')"
 
-    # Find nearest existing directory for df inquiry
     local check_path="${PIPELINE_TMPDIR_BASE}"
-    while [[ -n "${check_path}" && "${check_path}" != "/" && ! -e "${check_path}" ]]; do
-        check_path="${check_path%/*}"
+    if ! check_disk_requirement "07_reassembly" "tmpdir" "read-concatenation" "${check_path}" "07_reassembly" "stage-precheck" "${required_bytes}" "${total_bytes}"; then
+        return 1
+    fi
+    log_info "[Tmpdir] Space check for reassembly temporary concatenation passed (required: ${required_bytes} bytes, factor: ${factor}x)."
+    return 0
+}
+
+# run_stage_precheck STAGE_ID
+#   Remeasures filesystem capacity and executes precheck immediately before a stage.
+run_stage_precheck() {
+    local stage="$1"
+    local r_group="none"
+    [[ "${SHARED_CAPACITY_FS}" == "true" ]] && r_group="${stage}"
+
+    case "${stage}" in
+        01_fastp)
+            check_disk_requirement "01_fastp" "outdir" "cleaned-reads" "${QC_DIR}" "none" "stage-precheck" || return 1
+            ;;
+        02_megahit)
+            check_disk_requirement "02_megahit" "outdir" "assembly" "${ASSEMBLY_DIR}" "none" "stage-precheck" || return 1
+            ;;
+        03_kraken2)
+            check_disk_requirement "03_kraken2" "outdir" "taxonomy-output" "${KRAKEN2_DIR}" "none" "stage-precheck" || return 1
+            ;;
+        04_mapping)
+            check_disk_requirement "04_mapping" "outdir" "mapping-bam" "${MAPPING_DIR}" "none" "stage-precheck" || return 1
+            ;;
+        05a_vamb)
+            check_disk_requirement "05a_vamb" "outdir" "binning" "${VAMB_DIR}" "none" "stage-precheck" || return 1
+            ;;
+        05b_metabinner)
+            check_disk_requirement "05b_metabinner" "outdir" "binning" "${METABINNER_DIR}" "none" "stage-precheck" || return 1
+            ;;
+        05c_comebin)
+            check_disk_requirement "05c_comebin" "outdir" "binning" "${COMEBIN_DIR}" "none" "stage-precheck" || return 1
+            ;;
+        06_refinement)
+            check_disk_requirement "06_refinement" "outdir" "refinement" "${REFINEMENT_DIR}" "none" "stage-precheck" || return 1
+            ;;
+        07_reassembly)
+            check_disk_requirement "07_reassembly" "tmpdir" "read-concatenation" "${PIPELINE_TMPDIR_BASE}" "${r_group}" "stage-precheck" || return 1
+            check_disk_requirement "07_reassembly" "outdir" "reassembly-output" "${REASSEMBLY_DIR}" "${r_group}" "stage-precheck" || return 1
+            if [[ "${SHARED_CAPACITY_FS}" == "true" ]]; then
+                local req_concat
+                req_concat="$(estimate_stage_disk_requirement 07_reassembly tmpdir | awk '{print $1}')"
+                check_disk_requirement "07_reassembly" "other" "shared-capacity" "${OUTDIR}" "${r_group}" "stage-precheck" "${req_concat}" || return 1
+            fi
+            ;;
+        08_checkm2)
+            check_disk_requirement "08_checkm2" "outdir" "quality-assessment" "${CHECKM2_DIR}" "none" "stage-precheck" || return 1
+            ;;
+        10_gtdbtk)
+            check_disk_requirement "10_gtdbtk" "outdir" "classification-output" "${GTDBTK_DIR}" "none" "stage-precheck" || return 1
+            ;;
+        11_coverm)
+            check_disk_requirement "11_coverm" "outdir" "coverage-output" "${ABUNDANCE_DIR}" "none" "stage-precheck" || return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+    return 0
+}
+
+# record_post_stage_observation STAGE_ID
+#   Records filesystem capacity observation following successful stage completion.
+record_post_stage_observation() {
+    local stage="$1"
+    if [[ "${DRY_RUN}" == true ]]; then return 0; fi
+
+    local check_path="${OUTDIR}"
+    local existing_parent
+    existing_parent="$(find_existing_parent "${check_path}")"
+    local fs_id
+    fs_id="$(get_filesystem_id "${existing_parent}")"
+
+    local cap_info tot_bytes used_bytes avail_bytes
+    cap_info="$(get_filesystem_capacity "${existing_parent}")"
+    tot_bytes="$(awk '{print $1}' <<< "${cap_info}")"
+    used_bytes="$(awk '{print $2}' <<< "${cap_info}")"
+    avail_bytes="$(awk '{print $3}' <<< "${cap_info}")"
+
+    local avail_inodes
+    avail_inodes="$(get_available_inodes "${existing_parent}")"
+
+    local ts_utc
+    ts_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "1970-01-01T00:00:00Z")"
+
+    record_disk_measurement \
+        --report-current "${DISK_SPACE_CURRENT_TSV}" \
+        --publish-path "${DISK_SPACE_TSV}" \
+        --run-id "${RUN_ID}" \
+        --measurement-sequence "auto" \
+        --check-id "${stage}.outdir.observation" \
+        --timestamp-utc "${ts_utc}" \
+        --stage-id "${stage}" \
+        --storage-role "outdir" \
+        --purpose "filesystem-observation" \
+        --path "${check_path}" \
+        --filesystem-id "${fs_id}" \
+        --measurement-type "post-stage-observation" \
+        --estimate-confidence "not-applicable" \
+        --input-bytes-read "NA" \
+        --estimated-required-bytes "NA" \
+        --filesystem-available-bytes "${avail_bytes}" \
+        --filesystem-used-bytes "${used_bytes}" \
+        --filesystem-total-bytes "${tot_bytes}" \
+        --required-free-inodes "NA" \
+        --available-free-inodes "${avail_inodes}" \
+        --safety-factor "NA" \
+        --shared-capacity-group "none" \
+        --status "sufficient" \
+        --message "post_stage_observation=stage_finished;stage_id=${stage}"
+
+    if [[ "${stage}" == "07_reassembly" && -n "${PIPELINE_TMPDIR_BASE}" ]]; then
+        local tmp_parent tmp_fs_id tmp_cap_info t_tot t_used t_avail t_inodes
+        tmp_parent="$(find_existing_parent "${PIPELINE_TMPDIR_BASE}")"
+        tmp_fs_id="$(get_filesystem_id "${tmp_parent}")"
+        tmp_cap_info="$(get_filesystem_capacity "${tmp_parent}")"
+        t_tot="$(awk '{print $1}' <<< "${tmp_cap_info}")"
+        t_used="$(awk '{print $2}' <<< "${tmp_cap_info}")"
+        t_avail="$(awk '{print $3}' <<< "${tmp_cap_info}")"
+        t_inodes="$(get_available_inodes "${tmp_parent}")"
+
+        record_disk_measurement \
+            --report-current "${DISK_SPACE_CURRENT_TSV}" \
+            --publish-path "${DISK_SPACE_TSV}" \
+            --run-id "${RUN_ID}" \
+            --measurement-sequence "auto" \
+            --check-id "${stage}.tmpdir.observation" \
+            --timestamp-utc "${ts_utc}" \
+            --stage-id "${stage}" \
+            --storage-role "tmpdir" \
+            --purpose "filesystem-observation" \
+            --path "${PIPELINE_TMPDIR_BASE}" \
+            --filesystem-id "${tmp_fs_id}" \
+            --measurement-type "post-stage-observation" \
+            --estimate-confidence "not-applicable" \
+            --input-bytes-read "NA" \
+            --estimated-required-bytes "NA" \
+            --filesystem-available-bytes "${t_avail}" \
+            --filesystem-used-bytes "${t_used}" \
+            --filesystem-total-bytes "${t_tot}" \
+            --required-free-inodes "NA" \
+            --available-free-inodes "${t_inodes}" \
+            --safety-factor "NA" \
+            --shared-capacity-group "none" \
+            --status "sufficient" \
+            --message "post_stage_observation=tmpdir_observation;stage_id=${stage}"
+    fi
+}
+
+# record_final_disk_observations
+#   Records final filesystem observation for OUTDIR and TMPDIR at pipeline completion.
+record_final_disk_observations() {
+    if [[ "${DRY_RUN}" == true ]]; then return 0; fi
+
+    local check_path="${OUTDIR}"
+    local existing_parent
+    existing_parent="$(find_existing_parent "${check_path}")"
+    local fs_id
+    fs_id="$(get_filesystem_id "${existing_parent}")"
+
+    local cap_info tot_bytes used_bytes avail_bytes
+    cap_info="$(get_filesystem_capacity "${existing_parent}")"
+    tot_bytes="$(awk '{print $1}' <<< "${cap_info}")"
+    used_bytes="$(awk '{print $2}' <<< "${cap_info}")"
+    avail_bytes="$(awk '{print $3}' <<< "${cap_info}")"
+
+    local avail_inodes
+    avail_inodes="$(get_available_inodes "${existing_parent}")"
+
+    local ts_utc
+    ts_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "1970-01-01T00:00:00Z")"
+
+    record_disk_measurement \
+        --report-current "${DISK_SPACE_CURRENT_TSV}" \
+        --publish-path "${DISK_SPACE_TSV}" \
+        --run-id "${RUN_ID}" \
+        --measurement-sequence "auto" \
+        --check-id "pipeline.outdir.final" \
+        --timestamp-utc "${ts_utc}" \
+        --stage-id "pipeline" \
+        --storage-role "outdir" \
+        --purpose "filesystem-observation" \
+        --path "${check_path}" \
+        --filesystem-id "${fs_id}" \
+        --measurement-type "final-observation" \
+        --estimate-confidence "not-applicable" \
+        --input-bytes-read "NA" \
+        --estimated-required-bytes "NA" \
+        --filesystem-available-bytes "${avail_bytes}" \
+        --filesystem-used-bytes "${used_bytes}" \
+        --filesystem-total-bytes "${tot_bytes}" \
+        --required-free-inodes "NA" \
+        --available-free-inodes "${avail_inodes}" \
+        --safety-factor "NA" \
+        --shared-capacity-group "none" \
+        --status "sufficient" \
+        --message "final_observation=pipeline_completed"
+
+    if [[ -n "${PIPELINE_TMPDIR_BASE}" ]]; then
+        local tmp_parent tmp_fs_id tmp_cap_info t_tot t_used t_avail t_inodes
+        tmp_parent="$(find_existing_parent "${PIPELINE_TMPDIR_BASE}")"
+        tmp_fs_id="$(get_filesystem_id "${tmp_parent}")"
+        tmp_cap_info="$(get_filesystem_capacity "${tmp_parent}")"
+        t_tot="$(awk '{print $1}' <<< "${tmp_cap_info}")"
+        t_used="$(awk '{print $2}' <<< "${tmp_cap_info}")"
+        t_avail="$(awk '{print $3}' <<< "${tmp_cap_info}")"
+        t_inodes="$(get_available_inodes "${tmp_parent}")"
+
+        record_disk_measurement \
+            --report-current "${DISK_SPACE_CURRENT_TSV}" \
+            --publish-path "${DISK_SPACE_TSV}" \
+            --run-id "${RUN_ID}" \
+            --measurement-sequence "auto" \
+            --check-id "pipeline.tmpdir.final" \
+            --timestamp-utc "${ts_utc}" \
+            --stage-id "pipeline" \
+            --storage-role "tmpdir" \
+            --purpose "filesystem-observation" \
+            --path "${PIPELINE_TMPDIR_BASE}" \
+            --filesystem-id "${tmp_fs_id}" \
+            --measurement-type "final-observation" \
+            --estimate-confidence "not-applicable" \
+            --input-bytes-read "NA" \
+            --estimated-required-bytes "NA" \
+            --filesystem-available-bytes "${t_avail}" \
+            --filesystem-used-bytes "${t_used}" \
+            --filesystem-total-bytes "${t_tot}" \
+            --required-free-inodes "NA" \
+            --available-free-inodes "${t_inodes}" \
+            --safety-factor "NA" \
+            --shared-capacity-group "none" \
+            --status "sufficient" \
+            --message "final_observation=tmpdir_status"
+    fi
+
+    publish_disk_space_report
+}
+
+# run_disk_preflight
+#   Constructs complete preflight assessment for OUTDIR, TMPDIR, and applicable stages.
+run_disk_preflight() {
+    local preflight_errors=0
+
+    # 1. OUTDIR resolution & initial measurement
+    OUTDIR="$(canonicalize_storage_path "${OUTDIR}")"
+    local outdir_parent
+    outdir_parent="$(find_existing_parent "${OUTDIR}")"
+    local parent_fs_id
+    parent_fs_id="$(get_filesystem_id "${outdir_parent}")"
+
+    local parent_cap p_avail
+    parent_cap="$(get_filesystem_capacity "${outdir_parent}")"
+    p_avail="$(awk '{print $3}' <<< "${parent_cap}")"
+
+    # Step 3: verify basic minimum space exists to create basic structure
+    if [[ "${p_avail}" != "NA" && "${p_avail}" -le 0 ]]; then
+        log_error "No disk space available in ${outdir_parent} (${p_avail} bytes) to create OUTDIR structure."
+        preflight_errors=$(( preflight_errors + 1 ))
+    fi
+
+    # Step 4 & 5: If normal execution, create OUTDIR and measure real filesystem
+    if [[ "${DRY_RUN}" != true ]]; then
+        mkdir -p "${OUTDIR}" "${LOGS_DIR}" || {
+            log_error "Cannot create OUTDIR or LOGS_DIR: ${OUTDIR}"
+            return 1
+        }
+        OUTDIR_FS_ID="$(get_filesystem_id "${OUTDIR}")"
+        if [[ "${OUTDIR_FS_ID}" != "${parent_fs_id}" ]]; then
+            log_info "[Disk] OUTDIR filesystem resolved to ${OUTDIR_FS_ID} (inferred from parent was ${parent_fs_id})."
+        fi
+    else
+        OUTDIR_FS_ID="${parent_fs_id}"
+    fi
+
+    # TMPDIR resolution
+    local tmpdir_target="${PIPELINE_TMPDIR_BASE:-${OUTDIR}/.tmp}"
+    local tmpdir_parent
+    tmpdir_parent="$(find_existing_parent "${tmpdir_target}")"
+    TMPDIR_FS_ID="$(get_filesystem_id "${tmpdir_parent}")"
+
+    # Detect shared capacity
+    SHARED_CAPACITY_FS="$(compare_filesystem_identities "${OUTDIR_FS_ID}" "${TMPDIR_FS_ID}")"
+
+    # Pipeline general checks
+    check_disk_requirement "pipeline" "outdir" "pipeline-outputs" "${OUTDIR}" "none" "preflight-estimate" || (( preflight_errors += 1 ))
+    check_disk_requirement "pipeline" "tmpdir" "workspace" "${tmpdir_target}" "none" "preflight-estimate" || (( preflight_errors += 1 ))
+
+    local largest_blocking_bytes=0 largest_blocking_stg="none"
+    local largest_info_bytes=0 largest_info_stg="none"
+
+    # Stage prechecks
+    local stg action
+    for stg in "${DISK_PRECHECK_STAGES[@]}"; do
+        action="${STAGE_ACTION[$stg]:-disabled}"
+        if [[ "${action}" == "reuse" ]]; then
+            if [[ "${DRY_RUN}" != true ]]; then
+                record_disk_measurement \
+                    --report-current "${DISK_SPACE_CURRENT_TSV}" \
+                    --publish-path "${DISK_SPACE_TSV}" \
+                    --run-id "${RUN_ID}" \
+                    --measurement-sequence "auto" \
+                    --check-id "${stg}.outdir.execution" \
+                    --timestamp-utc "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "1970-01-01T00:00:00Z")" \
+                    --stage-id "${stg}" \
+                    --storage-role "outdir" \
+                    --purpose "reused-checkpoint" \
+                    --path "${OUTDIR}" \
+                    --filesystem-id "${OUTDIR_FS_ID}" \
+                    --measurement-type "preflight-estimate" \
+                    --estimate-confidence "not-applicable" \
+                    --input-bytes-read "NA" \
+                    --estimated-required-bytes "NA" \
+                    --filesystem-available-bytes "NA" \
+                    --filesystem-used-bytes "NA" \
+                    --filesystem-total-bytes "NA" \
+                    --required-free-inodes "NA" \
+                    --available-free-inodes "NA" \
+                    --safety-factor "NA" \
+                    --shared-capacity-group "none" \
+                    --status "not-applicable" \
+                    --message "action=reuse;no_new_space_required"
+            fi
+            continue
+        fi
+
+        if ! stage_action_requires_execution "${stg}"; then
+            continue
+        fi
+
+        # Track largest requirements
+        local est_line est_req est_block
+        est_line="$(estimate_stage_disk_requirement "${stg}" "outdir")"
+        est_req="$(awk '{print $1}' <<< "${est_line}")"
+        est_block="$(awk '{print $5}' <<< "${est_line}")"
+
+        if [[ "${est_req}" != "NA" && "${est_req}" =~ ^[0-9]+$ ]]; then
+            if [[ "${est_block}" == "true" ]]; then
+                if (( est_req > largest_blocking_bytes )); then
+                    largest_blocking_bytes="${est_req}"
+                    largest_blocking_stg="${stg}"
+                fi
+            else
+                if (( est_req > largest_info_bytes )); then
+                    largest_info_bytes="${est_req}"
+                    largest_info_stg="${stg}"
+                fi
+            fi
+        fi
+
+        local r_group="none"
+        [[ "${SHARED_CAPACITY_FS}" == "true" ]] && r_group="${stg}"
+
+        case "${stg}" in
+            01_fastp)
+                check_disk_requirement "01_fastp" "outdir" "cleaned-reads" "${QC_DIR}" "none" "preflight-estimate" || (( preflight_errors += 1 ))
+                ;;
+            02_megahit)
+                check_disk_requirement "02_megahit" "outdir" "assembly" "${ASSEMBLY_DIR}" "none" "preflight-estimate" || (( preflight_errors += 1 ))
+                ;;
+            03_kraken2)
+                check_disk_requirement "03_kraken2" "outdir" "taxonomy-output" "${KRAKEN2_DIR}" "none" "preflight-estimate" || (( preflight_errors += 1 ))
+                ;;
+            04_mapping)
+                check_disk_requirement "04_mapping" "outdir" "mapping-bam" "${MAPPING_DIR}" "none" "preflight-estimate" || (( preflight_errors += 1 ))
+                ;;
+            05a_vamb)
+                check_disk_requirement "05a_vamb" "outdir" "binning" "${VAMB_DIR}" "none" "preflight-estimate" || (( preflight_errors += 1 ))
+                ;;
+            05b_metabinner)
+                check_disk_requirement "05b_metabinner" "outdir" "binning" "${METABINNER_DIR}" "none" "preflight-estimate" || (( preflight_errors += 1 ))
+                ;;
+            05c_comebin)
+                check_disk_requirement "05c_comebin" "outdir" "binning" "${COMEBIN_DIR}" "none" "preflight-estimate" || (( preflight_errors += 1 ))
+                ;;
+            06_refinement)
+                check_disk_requirement "06_refinement" "outdir" "refinement" "${REFINEMENT_DIR}" "none" "preflight-estimate" || (( preflight_errors += 1 ))
+                ;;
+            07_reassembly)
+                local est_tmp_line est_tmp_req est_tmp_block
+                est_tmp_line="$(estimate_stage_disk_requirement "07_reassembly" "tmpdir")"
+                est_tmp_req="$(awk '{print $1}' <<< "${est_tmp_line}")"
+                est_tmp_block="$(awk '{print $5}' <<< "${est_tmp_line}")"
+                if [[ "${est_tmp_req}" != "NA" && "${est_tmp_req}" =~ ^[0-9]+$ && "${est_tmp_block}" == "true" ]]; then
+                    if (( est_tmp_req > largest_blocking_bytes )); then
+                        largest_blocking_bytes="${est_tmp_req}"
+                        largest_blocking_stg="07_reassembly"
+                    fi
+                fi
+                check_disk_requirement "07_reassembly" "tmpdir" "read-concatenation" "${PIPELINE_TMPDIR_BASE}" "${r_group}" "preflight-estimate" || (( preflight_errors += 1 ))
+                check_disk_requirement "07_reassembly" "outdir" "reassembly-output" "${REASSEMBLY_DIR}" "${r_group}" "preflight-estimate" || (( preflight_errors += 1 ))
+                if [[ "${SHARED_CAPACITY_FS}" == "true" ]]; then
+                    local req_concat
+                    req_concat="$(estimate_stage_disk_requirement 07_reassembly tmpdir | awk '{print $1}')"
+                    check_disk_requirement "07_reassembly" "other" "shared-capacity" "${OUTDIR}" "${r_group}" "preflight-estimate" "${req_concat}" || (( preflight_errors += 1 ))
+                fi
+                ;;
+            08_checkm2)
+                check_disk_requirement "08_checkm2" "outdir" "quality-assessment" "${CHECKM2_DIR}" "none" "preflight-estimate" || (( preflight_errors += 1 ))
+                ;;
+            10_gtdbtk)
+                check_disk_requirement "10_gtdbtk" "outdir" "classification-output" "${GTDBTK_DIR}" "none" "preflight-estimate" || (( preflight_errors += 1 ))
+                ;;
+            11_coverm)
+                check_disk_requirement "11_coverm" "outdir" "coverage-output" "${ABUNDANCE_DIR}" "none" "preflight-estimate" || (( preflight_errors += 1 ))
+                ;;
+        esac
     done
-    [[ -z "${check_path}" ]] && check_path="/"
 
-    local avail_k avail_bytes=-1
-    avail_k="$(LC_ALL=C df -Pk -- "${check_path}" 2>/dev/null | awk 'NR>1 { if (NF>=5 && $4 ~ /^[0-9]+$/) { print $4; exit } }')"
-    if [[ -n "${avail_k}" && "${avail_k}" =~ ^[0-9]+$ ]]; then
-        avail_bytes=$(( avail_k * 1024 ))
+    # Publish report if normal execution
+    if [[ "${DRY_RUN}" != true ]]; then
+        publish_disk_space_report
+    fi
+
+    # Determine summary status
+    local sum_out
+    sum_out="$(get_latest_disk_status)"
+    local overall_st warn_cnt
+    overall_st="$(grep -E '^OVERALL_STATUS=' <<< "${sum_out}" | cut -d'=' -f2)"
+    warn_cnt="$(grep -E '^WARNING_COUNT=' <<< "${sum_out}" | cut -d'=' -f2)"
+    DISK_PREFLIGHT_STATUS="${overall_st:-unknown}"
+    DISK_WARNING_COUNT="${warn_cnt:-0}"
+
+    local outdir_avail tmpdir_avail
+    outdir_avail="$(get_filesystem_capacity "${OUTDIR}" | awk '{print $3}')"
+    tmpdir_avail="$(get_filesystem_capacity "${tmpdir_target}" | awk '{print $3}')"
+
+    local largest_block_disp="none:NA"
+    if (( largest_blocking_bytes > 0 )); then
+        largest_block_disp="${largest_blocking_stg}:${largest_blocking_bytes}"
+    fi
+    local largest_info_disp="none:NA"
+    if (( largest_info_bytes > 0 )); then
+        largest_info_disp="${largest_info_stg}:${largest_info_bytes}"
+    fi
+
+    # Print visible block
+    if [[ "${DRY_RUN}" == true ]]; then
+        local in_bytes
+        in_bytes="$(get_canonical_reads_bytes)"
+        echo "Disk report                    : would write"
+        echo "OUTDIR filesystem              : ${OUTDIR_FS_ID}"
+        echo "OUTDIR available bytes         : ${outdir_avail}"
+        echo "TMPDIR filesystem              : ${TMPDIR_FS_ID}"
+        echo "TMPDIR available bytes         : ${tmpdir_avail}"
+        echo "Shared filesystem              : ${SHARED_CAPACITY_FS}"
+        echo "Estimated input bytes          : ${in_bytes}"
+        echo "Largest blocking requirement   : ${largest_block_disp}"
+        echo "Largest informational estimate : ${largest_info_disp}"
+        echo "Disk status                    : ${DISK_PREFLIGHT_STATUS}"
     else
-        log_warn "[Tmpdir] Cannot determine available disk space on ${check_path}; proceeding without space guard."
+        echo "Disk report                    : ${DISK_SPACE_TSV}"
+        echo "OUTDIR filesystem              : ${OUTDIR_FS_ID}"
+        echo "OUTDIR available bytes         : ${outdir_avail}"
+        echo "TMPDIR filesystem              : ${TMPDIR_FS_ID}"
+        echo "TMPDIR available bytes         : ${tmpdir_avail}"
+        echo "Shared filesystem              : ${SHARED_CAPACITY_FS}"
+        echo "Largest blocking requirement   : ${largest_block_disp}"
+        echo "Largest informational estimate : ${largest_info_disp}"
+        echo "Disk preflight status          : ${DISK_PREFLIGHT_STATUS}"
     fi
 
-    local avail_inodes=-1
-    avail_inodes="$(LC_ALL=C df -Pi -- "${check_path}" 2>/dev/null | awk 'NR>1 { if (NF>=5 && $4 ~ /^[0-9]+$/) { print $4; exit } }')"
-    if [[ -z "${avail_inodes}" || ! "${avail_inodes}" =~ ^[0-9]+$ ]]; then
-        log_warn "[Tmpdir] Cannot determine available free inodes on ${check_path}; proceeding without inode guard."
-        avail_inodes=-1
+    if (( preflight_errors > 0 )); then
+        return 1
     fi
-
-    log_info "[Tmpdir] Space check for reassembly temporary concatenation:"
-    log_info "         Input reads total : ${total_bytes} bytes"
-    log_info "         Required space    : ${required_bytes} bytes (${factor}x factor)"
-    if (( avail_bytes >= 0 )); then
-        log_info "         Available space   : ${avail_bytes} bytes"
-        if (( avail_bytes < required_bytes )); then
-            log_error "[Tmpdir] Insufficient disk space in ${check_path} for reassembly temporary concatenation:"
-            log_error "         Required  : ${required_bytes} bytes (with ${factor}x factor)"
-            log_error "         Available : ${avail_bytes} bytes"
-            log_error "         Please provide a different base directory using --tmpdir."
-            return 1
-        fi
-    else
-        log_info "         Available space   : unknown"
-    fi
-
-    local min_inodes="${REQUIRED_FREE_INODES:-16}"
-    if (( avail_inodes >= 0 )); then
-        log_info "         Available inodes  : ${avail_inodes} (required: ${min_inodes})"
-        if (( avail_inodes > 0 && avail_inodes < min_inodes )); then
-            log_error "[Tmpdir] Insufficient inodes in ${check_path}:"
-            log_error "         Required  : ${min_inodes}"
-            log_error "         Available : ${avail_inodes}"
-            log_error "         Please provide a different base directory using --tmpdir."
-            return 1
-        fi
-    else
-        log_info "         Available inodes  : unknown (required: ${min_inodes})"
-    fi
-    log_info "[Tmpdir] Space check passed. Note: covers pipeline concatenation only; does not guarantee internal MetaWRAP overhead."
     return 0
 }
 
@@ -1491,45 +2888,33 @@ cleanup_safe_temporaries() {
 # show_tmpdir_dry_run_info
 #   Prints temporary workspace plan during dry-run (no directories created).
 show_tmpdir_dry_run_info() {
-    local est_r1=0 est_r2=0 f s
-    for f in "${ACTIVE_R1_FILES[@]}"; do
-        if [[ -f "${f}" ]]; then
-            s="$(stat -c '%s' -- "${f}" 2>/dev/null || echo 0)"
-            est_r1=$(( est_r1 + s ))
-        fi
-    done
-    for f in "${ACTIVE_R2_FILES[@]}"; do
-        if [[ -f "${f}" ]]; then
-            s="$(stat -c '%s' -- "${f}" 2>/dev/null || echo 0)"
-            est_r2=$(( est_r2 + s ))
-        fi
-    done
-    local total_in=$(( est_r1 + est_r2 ))
+    local total_in
+    total_in="$(get_canonical_reads_bytes)"
     local factor="${REASSEMBLY_CONCAT_SPACE_FACTOR:-1.10}"
     local est_bytes
     est_bytes="$(awk -v b="${total_in}" -v f="${factor}" 'BEGIN {
         val = b * f
         ival = int(val)
         if (val > ival) ival++
-        printf "%d", ival
+        printf "%.0f", ival
     }')"
 
     local check_path="${PIPELINE_TMPDIR_BASE}"
-    while [[ -n "${check_path}" && "${check_path}" != "/" && ! -e "${check_path}" ]]; do
-        check_path="${check_path%/*}"
-    done
-    [[ -z "${check_path}" ]] && check_path="/"
-
-    local avail_k avail_bytes_str="unknown"
-    avail_k="$(LC_ALL=C df -Pk -- "${check_path}" 2>/dev/null | awk 'NR>1 { if (NF>=5 && $4 ~ /^[0-9]+$/) { print $4; exit } }')"
-    if [[ -n "${avail_k}" && "${avail_k}" =~ ^[0-9]+$ ]]; then
-        avail_bytes_str="$(( avail_k * 1024 ))"
+    local parent
+    parent="$(find_existing_parent "${check_path}")"
+    local cap_info avail_bytes_str="unknown"
+    cap_info="$(get_filesystem_capacity "${parent}")"
+    local a_bytes
+    a_bytes="$(awk '{print $3}' <<< "${cap_info}")"
+    if [[ "${a_bytes}" != "NA" ]]; then
+        avail_bytes_str="${a_bytes}"
     fi
 
-    local avail_inodes avail_inodes_str="unknown"
-    avail_inodes="$(LC_ALL=C df -Pi -- "${check_path}" 2>/dev/null | awk 'NR>1 { if (NF>=5 && $4 ~ /^[0-9]+$/) { print $4; exit } }')"
-    if [[ -n "${avail_inodes}" && "${avail_inodes}" =~ ^[0-9]+$ ]]; then
-        avail_inodes_str="${avail_inodes}"
+    local avail_inodes_str="unknown"
+    local a_inodes
+    a_inodes="$(get_available_inodes "${parent}")"
+    if [[ "${a_inodes}" != "NA" ]]; then
+        avail_inodes_str="${a_inodes}"
     fi
 
     log_info "[DRY-RUN] Temporary workspace plan:"
@@ -4945,6 +6330,9 @@ set_last_valid_product() {
 run_stage() {
     local id="$1" function_name="$2" action="${STAGE_ACTION[$1]:-disabled}"
     stage_is_active "${id}" || return 0
+    if [[ "${PLAN_IS_FROZEN}" == true ]]; then
+        verify_stage_preconditions "${id}" || return 1
+    fi
     if stage_action_requires_execution "${id}"; then
         assert_runtime_identity_frozen "${id}" || return 1
         assert_database_identity_frozen "${id}" || return 1
@@ -5011,8 +6399,23 @@ run_stage() {
                 --start-time-utc "${stage_start_utc}" >/dev/null 2>&1 || true
         fi
 
+        # Immediate stage precheck for stages in DISK_PRECHECK_STAGES
+        local is_precheck_stg=false stg_elem
+        for stg_elem in "${DISK_PRECHECK_STAGES[@]}"; do
+            if [[ "${stg_elem}" == "${id}" ]]; then is_precheck_stg=true; break; fi
+        done
+        if [[ "${is_precheck_stg}" == true ]]; then
+            if ! run_stage_precheck "${id}"; then
+                log_error "[Stage Precheck] Halting before execution of ${id} due to insufficient disk space."
+                return 1
+            fi
+        fi
+
         "$function_name"
         local func_rc=$?
+
+        # Record post-stage observation
+        record_post_stage_observation "${id}"
 
         stage_end_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
         stage_end_mono="$(python3 -c 'import time; print(f"{time.monotonic():.6f}")' 2>/dev/null || echo "0.0")"
@@ -5031,6 +6434,10 @@ run_stage() {
         [[ "${action}" == restart ]] && chk_act="restarted"
 
         if [[ "${DRY_RUN}" != true && "${RUN_STATUS_INITIALIZED:-false}" == true ]]; then
+            local stg_finish_msg="stage completed successfully"
+            if [[ -n "${CURRENT_STAGE_DISK_STATUS:-}" ]]; then
+                stg_finish_msg="${stg_finish_msg};disk_check=${CURRENT_STAGE_DISK_STATUS};disk_required_bytes=${CURRENT_STAGE_DISK_REQ:-NA};disk_available_bytes=${CURRENT_STAGE_DISK_AVAIL:-NA}"
+            fi
             python3 "${BENCHMARK_WRITER}" stage-finish \
                 --stage-status-path "${STAGE_STATUS_FILE}" \
                 --compat-run-status-path "${RUN_STATUS_FILE}" \
@@ -5055,7 +6462,7 @@ run_stage() {
                 --tool-version "$(stage_primary_tool_version "${id}")" \
                 --runtime-fingerprint "$(stage_primary_runtime_fingerprint "${id}")" \
                 --database-fingerprint "$(stage_primary_database_fingerprint "${id}")" \
-                --message "stage completed successfully" >/dev/null 2>&1 || true
+                --message "${stg_finish_msg}" >/dev/null 2>&1 || true
         fi
         rm -rf "${stage_metrics_dir}" 2>/dev/null || true
     fi
@@ -5228,6 +6635,9 @@ record_fallback_error() {
     if (( rc == 0 )); then
         return 0
     fi
+    if [[ "${DRY_RUN:-false}" == true || "${PLAN_MODE:-false}" == true ]]; then
+        return 0
+    fi
 
     local stg="${CURRENT_STAGE:-pipeline}"
     local stg_name="${CURRENT_STAGE_NAME:-$(stage_display_name "${stg}")}"
@@ -5359,9 +6769,14 @@ pipeline_error_handler() {
         status="preflight-failed"
     fi
 
-    if [[ "${DRY_RUN:-false}" == true ]]; then
-        printf '[FATAL] [DRY-RUN] stage=%s | action=%s | exit=%s | line=%s | command=%s | would write errors.tsv in %s/logs/\n' \
-            "${stg}" "${stg_action}" "${rc}" "${trap_src_line}" "${final_cmd}" "${OUTDIR}" >&2
+    if [[ "${DRY_RUN:-false}" == true || "${IS_PLAN_MODE:-false}" == true ]]; then
+        if [[ "${IS_PLAN_MODE:-false}" == true ]]; then
+            printf '[FATAL] [PLAN] stage=%s | action=%s | exit=%s | line=%s | command=%s\n' \
+                "${stg}" "${stg_action}" "${rc}" "${trap_src_line}" "${final_cmd}" >&2
+        else
+            printf '[FATAL] [DRY-RUN] stage=%s | action=%s | exit=%s | line=%s | command=%s | would write errors.tsv in %s/logs/\n' \
+                "${stg}" "${stg_action}" "${rc}" "${trap_src_line}" "${final_cmd}" "${OUTDIR}" >&2
+        fi
         PIPELINE_TERMINATION_RECORDED=true
         ERROR_ALREADY_RECORDED=1
         exit "${rc}"
@@ -5574,6 +6989,9 @@ pipeline_exit_handler() {
     if (( rc == 0 )); then
         return 0
     fi
+    if [[ "${PLAN_MODE:-false}" == true ]]; then
+        return 0
+    fi
     if (( ERROR_HANDLER_ACTIVE == 1 || ERROR_ALREADY_RECORDED == 1 )); then
         return 0
     fi
@@ -5675,6 +7093,13 @@ SUMMARY_DIR="${OUTDIR}/12_summary"
 LOGS_DIR="${OUTDIR}/logs"
 CHECKPOINT_DIR="${OUTDIR}/.checkpoints"
 TMPSCRIPTS_DIR="${OUTDIR}/logs/mamba_scripts"
+DISK_SPACE_CURRENT_TSV="${LOGS_DIR}/disk_space.current.tsv"
+DISK_SPACE_TSV="${LOGS_DIR}/disk_space.tsv"
+DISK_PREFLIGHT_STATUS="pending"
+DISK_WARNING_COUNT=0
+OUTDIR_FS_ID=""
+TMPDIR_FS_ID=""
+SHARED_CAPACITY_FS="unknown"
 
 # Install full traps now that directories and error system are initialized
 install_pipeline_traps
@@ -6622,142 +8047,632 @@ stage_depends_on() {
     [[ " ${GRAPH_PARENTS[$downstream]:-} " == *" ${upstream} "* ]]
 }
 
-propagate_rebuild_actions() {
-    local node child
-    local -a queue=()
-    local -A visited=()
-    for node in "${STAGE_IDS[@]}"; do
-        if stage_is_active "${node}" && [[ "${STAGE_ACTION[$node]}" == run || \
-              "${STAGE_ACTION[$node]}" == force || "${STAGE_ACTION[$node]}" == restart ]]; then
-            queue+=("${node}")
+assert_plan_mutable() {
+    local helper_name="$1"
+    if [[ "${COLLECTING_PLAN:-false}" != true || "${PLAN_IS_FROZEN:-false}" == true ]]; then
+        echo "[ERROR] ${helper_name} may only be called inside collect_execution_plan before freeze." >&2
+        exit 3
+    fi
+}
+
+emit_plan_tsv() {
+    local id
+    for id in "${STAGE_IDS[@]}"; do
+        local in_by diag deps down
+        in_by="$(echo "${STAGE_INVALIDATED_BY[$id]:-}" | tr ' ' ',' | sed -e 's/^,//' -e 's/,$//' -e 's/,,*/,/g')"
+        diag="$(echo "${STAGE_DIAGNOSTIC_CODES[$id]:-}" | tr ' ' ',' | sed -e 's/^,//' -e 's/,$//' -e 's/,,*/,/g')"
+        deps="$(echo "${STAGE_DEPENDENCIES[$id]:-}" | tr ' ' ',' | sed -e 's/^,//' -e 's/,$//' -e 's/,,*/,/g')"
+        down="$(echo "${STAGE_DOWNSTREAM[$id]:-}" | tr ' ' ',' | sed -e 's/^,//' -e 's/,$//' -e 's/,,*/,/g')"
+
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "${id}" \
+            "${STAGE_STAGE_NAME[$id]:-$(get_stage_public_name "$id")}" \
+            "${STAGE_CONFIGURED_ENABLED[$id]:-false}" \
+            "${STAGE_REQUIRED[$id]:-false}" \
+            "${STAGE_REQUESTED_ACTION[$id]:-normal}" \
+            "${STAGE_APPLICABILITY[$id]:-not-applicable}" \
+            "${STAGE_ACTION[$id]:-disabled}" \
+            "${STAGE_CHECKPOINT_PATH[$id]:-${CHECKPOINT_DIR}/${id}.done}" \
+            "${STAGE_CHECKPOINT_STATUS[$id]:-not-applicable}" \
+            "${STAGE_CHECKPOINT_REASON[$id]:-}" \
+            "${STAGE_INPUT_STATUS[$id]:-not-applicable}" \
+            "${STAGE_RUNTIME_STATUS[$id]:-not-applicable}" \
+            "${STAGE_DATABASE_STATUS[$id]:-not-applicable}" \
+            "${STAGE_OUTPUT_STATUS[$id]:-not-applicable}" \
+            "${STAGE_VALIDATION_STATUS[$id]:-not-applicable}" \
+            "${in_by}" \
+            "${STAGE_BLOCKING_STAGE[$id]:-}" \
+            "${STAGE_REASON_CODE[$id]:-stage-disabled}" \
+            "${STAGE_REASON_DETAIL[$id]:-}" \
+            "${diag}" \
+            "${deps}" \
+            "${down}" \
+            "${STAGE_PRIMARY_OUTPUT[$id]:-}" \
+            "${STAGE_PRIMARY_LOG[$id]:-}"
+    done
+}
+
+serialize_execution_plan_json() {
+    emit_plan_tsv | python3 "${PIPELINE_SCRIPTS_DIR}/execution_plan.py" assemble --profile "${REQUESTED_PROFILE:-full}"
+}
+
+resolve_base_stage_actions() {
+    assert_plan_mutable "resolve_base_stage_actions"
+    check_legacy_summary_checkpoint
+    classify_stages
+    build_effective_dependency_graph
+
+    local id pub req_act
+    for id in "${STAGE_IDS[@]}"; do
+        pub="$(get_stage_public_name "${id}")"
+        STAGE_STAGE_NAME["${id}"]="${pub}"
+        STAGE_CHECKPOINT_PATH["${id}"]="${CHECKPOINT_DIR}/${id}.done"
+        STAGE_PRIMARY_OUTPUT["${id}"]="$(stage_primary_output "${id}")"
+        STAGE_PRIMARY_LOG["${id}"]="$(stage_primary_log "${id}")"
+        STAGE_INVALIDATED_BY["${id}"]=""
+        STAGE_BLOCKING_STAGE["${id}"]=""
+        STAGE_DIAGNOSTIC_CODES["${id}"]=""
+        STAGE_REASON_DETAIL["${id}"]=""
+
+        STAGE_DEPENDENCIES["${id}"]="${GRAPH_PARENTS[$id]:-}"
+        STAGE_DOWNSTREAM["${id}"]="${GRAPH_CHILDREN[$id]:-}"
+
+        case "${id}" in
+            01_fastp) [[ "${RUN_FASTP}" == true ]] && STAGE_CONFIGURED_ENABLED["${id}"]=true || STAGE_CONFIGURED_ENABLED["${id}"]=false ;;
+            03_kraken2) [[ "${RUN_KRAKEN2}" == true ]] && STAGE_CONFIGURED_ENABLED["${id}"]=true || STAGE_CONFIGURED_ENABLED["${id}"]=false ;;
+            02_megahit) [[ "${RUN_MEGAHIT}" == true ]] && STAGE_CONFIGURED_ENABLED["${id}"]=true || STAGE_CONFIGURED_ENABLED["${id}"]=false ;;
+            04_mapping) [[ "${RUN_MAPPING}" == true ]] && STAGE_CONFIGURED_ENABLED["${id}"]=true || STAGE_CONFIGURED_ENABLED["${id}"]=false ;;
+            05a_vamb) [[ "${RUN_BINNING}" == true ]] && binner_selected vamb && STAGE_CONFIGURED_ENABLED["${id}"]=true || STAGE_CONFIGURED_ENABLED["${id}"]=false ;;
+            05b_metabinner) [[ "${RUN_BINNING}" == true ]] && binner_selected metabinner && STAGE_CONFIGURED_ENABLED["${id}"]=true || STAGE_CONFIGURED_ENABLED["${id}"]=false ;;
+            05c_comebin) [[ "${RUN_BINNING}" == true ]] && binner_selected comebin && STAGE_CONFIGURED_ENABLED["${id}"]=true || STAGE_CONFIGURED_ENABLED["${id}"]=false ;;
+            06_refinement) [[ "${RUN_BINNING}" == true ]] && STAGE_CONFIGURED_ENABLED["${id}"]=true || STAGE_CONFIGURED_ENABLED["${id}"]=false ;;
+            07_reassembly) [[ "${RUN_REASSEMBLY}" == true ]] && STAGE_CONFIGURED_ENABLED["${id}"]=true || STAGE_CONFIGURED_ENABLED["${id}"]=false ;;
+            08_checkm2) [[ "${RUN_CHECKM2}" == true ]] && STAGE_CONFIGURED_ENABLED["${id}"]=true || STAGE_CONFIGURED_ENABLED["${id}"]=false ;;
+            09_filter_mags) [[ "${RUN_MAG_FILTERING}" == true ]] && STAGE_CONFIGURED_ENABLED["${id}"]=true || STAGE_CONFIGURED_ENABLED["${id}"]=false ;;
+            10_gtdbtk) [[ "${RUN_GTDBTK}" == true ]] && STAGE_CONFIGURED_ENABLED["${id}"]=true || STAGE_CONFIGURED_ENABLED["${id}"]=false ;;
+            11_coverm) [[ "${RUN_COVERM}" == true ]] && STAGE_CONFIGURED_ENABLED["${id}"]=true || STAGE_CONFIGURED_ENABLED["${id}"]=false ;;
+            12a_taxonomy_summary) [[ "${RUN_SUMMARY}" == true && "${RUN_TAXONOMY_SUMMARY}" == true ]] && STAGE_CONFIGURED_ENABLED["${id}"]=true || STAGE_CONFIGURED_ENABLED["${id}"]=false ;;
+            12b_mag_summary) [[ "${RUN_SUMMARY}" == true && "${RUN_MAG_SUMMARY}" == true ]] && STAGE_CONFIGURED_ENABLED["${id}"]=true || STAGE_CONFIGURED_ENABLED["${id}"]=false ;;
+            12c_run_overview) [[ "${RUN_SUMMARY}" == true && "${RUN_RUN_OVERVIEW}" == true ]] && STAGE_CONFIGURED_ENABLED["${id}"]=true || STAGE_CONFIGURED_ENABLED["${id}"]=false ;;
+        esac
+
+        req_act="normal"
+        if [[ "${RESTART_REQUESTED}" == true && "${RESTART_FROM_NAME}" == "${pub}" ]]; then
+            req_act="restart"
+        elif (( ${#FORCE_STAGE_NAMES[@]} > 0 )); then
+            local f_name
+            for f_name in "${FORCE_STAGE_NAMES[@]}"; do
+                if [[ "${f_name}" == "${pub}" ]]; then
+                    req_act="force"
+                    break
+                fi
+            done
+        elif [[ "${RESUME_CONTROL}" == force ]]; then
+            req_act="force"
+        fi
+        STAGE_REQUESTED_ACTION["${id}"]="${req_act}"
+
+        if [[ "${STAGE_CONFIGURED_ENABLED[$id]}" == false ]]; then
+            STAGE_APPLICABILITY["${id}"]="not-applicable"
+            STAGE_REQUIRED["${id}"]=false
+            STAGE_ACTION["${id}"]="disabled"
+            STAGE_REASON_CODE["${id}"]="stage-disabled"
+            STAGE_REASON_DETAIL["${id}"]="Stage is disabled in configuration"
+            STAGE_CHECKPOINT_STATUS["${id}"]="not-applicable"
+            STAGE_CHECKPOINT_REASON["${id}"]=""
+            STAGE_INPUT_STATUS["${id}"]="not-applicable"
+            STAGE_RUNTIME_STATUS["${id}"]="not-applicable"
+            STAGE_DATABASE_STATUS["${id}"]="not-applicable"
+            STAGE_OUTPUT_STATUS["${id}"]="not-applicable"
+            STAGE_VALIDATION_STATUS["${id}"]="not-applicable"
+            STAGE_DEPENDENCIES["${id}"]=""
+            STAGE_DOWNSTREAM["${id}"]=""
+            if [[ "${req_act}" == force ]]; then
+                STAGE_DIAGNOSTIC_CODES["${id}"]="forced-by-user"
+            elif [[ "${req_act}" == restart ]]; then
+                STAGE_DIAGNOSTIC_CODES["${id}"]="restart-boundary"
+            fi
+            continue
+        fi
+
+        if ! stage_in_scope "${pub}"; then
+            STAGE_APPLICABILITY["${id}"]="not-applicable"
+            STAGE_REQUIRED["${id}"]=false
+            STAGE_ACTION["${id}"]="not-applicable"
+            STAGE_REASON_CODE["${id}"]="stage-not-applicable"
+            STAGE_REASON_DETAIL["${id}"]="Stage is outside the scope of --stop-after ${STOP_AFTER}"
+            STAGE_CHECKPOINT_STATUS["${id}"]="not-applicable"
+            STAGE_CHECKPOINT_REASON["${id}"]=""
+            STAGE_INPUT_STATUS["${id}"]="not-applicable"
+            STAGE_RUNTIME_STATUS["${id}"]="not-applicable"
+            STAGE_DATABASE_STATUS["${id}"]="not-applicable"
+            STAGE_OUTPUT_STATUS["${id}"]="not-applicable"
+            STAGE_VALIDATION_STATUS["${id}"]="not-applicable"
+            STAGE_DEPENDENCIES["${id}"]=""
+            STAGE_DOWNSTREAM["${id}"]=""
+            if [[ "${req_act}" == force ]]; then
+                STAGE_DIAGNOSTIC_CODES["${id}"]="forced-by-user"
+            elif [[ "${req_act}" == restart ]]; then
+                STAGE_DIAGNOSTIC_CODES["${id}"]="restart-boundary"
+            fi
+            continue
+        fi
+
+        if [[ "${id}" == 06_refinement && "${RUN_REFINEMENT_EFFECTIVE}" != true ]]; then
+            STAGE_APPLICABILITY["${id}"]="not-applicable"
+            STAGE_REQUIRED["${id}"]=false
+            STAGE_ACTION["${id}"]="not-applicable"
+            STAGE_REASON_CODE["${id}"]="stage-not-applicable"
+            STAGE_REASON_DETAIL["${id}"]="Refinement is not effective with selected binners"
+            STAGE_CHECKPOINT_STATUS["${id}"]="not-applicable"
+            STAGE_CHECKPOINT_REASON["${id}"]=""
+            STAGE_INPUT_STATUS["${id}"]="not-applicable"
+            STAGE_RUNTIME_STATUS["${id}"]="not-applicable"
+            STAGE_DATABASE_STATUS["${id}"]="not-applicable"
+            STAGE_OUTPUT_STATUS["${id}"]="not-applicable"
+            STAGE_VALIDATION_STATUS["${id}"]="not-applicable"
+            STAGE_DEPENDENCIES["${id}"]=""
+            STAGE_DOWNSTREAM["${id}"]=""
+            if [[ "${req_act}" == force ]]; then
+                STAGE_DIAGNOSTIC_CODES["${id}"]="forced-by-user"
+            elif [[ "${req_act}" == restart ]]; then
+                STAGE_DIAGNOSTIC_CODES["${id}"]="restart-boundary"
+            fi
+            continue
+        fi
+
+        if [[ "${id}" == 12a_taxonomy_summary && "${RUN_KRAKEN2}" != true ]]; then
+            STAGE_APPLICABILITY["${id}"]="not-applicable"
+            STAGE_REQUIRED["${id}"]=false
+            STAGE_ACTION["${id}"]="not-applicable"
+            STAGE_REASON_CODE["${id}"]="stage-not-applicable"
+            STAGE_REASON_DETAIL["${id}"]="Kraken2 is disabled; taxonomy summary not applicable"
+            STAGE_CHECKPOINT_STATUS["${id}"]="not-applicable"
+            STAGE_CHECKPOINT_REASON["${id}"]=""
+            STAGE_INPUT_STATUS["${id}"]="not-applicable"
+            STAGE_RUNTIME_STATUS["${id}"]="not-applicable"
+            STAGE_DATABASE_STATUS["${id}"]="not-applicable"
+            STAGE_OUTPUT_STATUS["${id}"]="not-applicable"
+            STAGE_VALIDATION_STATUS["${id}"]="not-applicable"
+            STAGE_DEPENDENCIES["${id}"]=""
+            STAGE_DOWNSTREAM["${id}"]=""
+            if [[ "${req_act}" == force ]]; then
+                STAGE_DIAGNOSTIC_CODES["${id}"]="forced-by-user"
+            elif [[ "${req_act}" == restart ]]; then
+                STAGE_DIAGNOSTIC_CODES["${id}"]="restart-boundary"
+            fi
+            continue
+        fi
+
+        if [[ "${id}" == 12b_mag_summary && "${RUN_CHECKM2}" != true && "${RUN_MAG_FILTERING}" != true && "${RUN_GTDBTK}" != true && "${RUN_COVERM}" != true ]]; then
+            STAGE_APPLICABILITY["${id}"]="not-applicable"
+            STAGE_REQUIRED["${id}"]=false
+            STAGE_ACTION["${id}"]="not-applicable"
+            STAGE_REASON_CODE["${id}"]="stage-not-applicable"
+            STAGE_REASON_DETAIL["${id}"]="No MAG analytical stages are enabled; MAG summary not applicable"
+            STAGE_CHECKPOINT_STATUS["${id}"]="not-applicable"
+            STAGE_CHECKPOINT_REASON["${id}"]=""
+            STAGE_INPUT_STATUS["${id}"]="not-applicable"
+            STAGE_RUNTIME_STATUS["${id}"]="not-applicable"
+            STAGE_DATABASE_STATUS["${id}"]="not-applicable"
+            STAGE_OUTPUT_STATUS["${id}"]="not-applicable"
+            STAGE_VALIDATION_STATUS["${id}"]="not-applicable"
+            STAGE_DEPENDENCIES["${id}"]=""
+            STAGE_DOWNSTREAM["${id}"]=""
+            if [[ "${req_act}" == force ]]; then
+                STAGE_DIAGNOSTIC_CODES["${id}"]="forced-by-user"
+            elif [[ "${req_act}" == restart ]]; then
+                STAGE_DIAGNOSTIC_CODES["${id}"]="restart-boundary"
+            fi
+            continue
+        fi
+
+        STAGE_APPLICABILITY["${id}"]="applicable"
+        STAGE_REQUIRED["${id}"]=true
+
+        local in_st="available" run_st="available" db_st="not-applicable" out_st="available"
+        local blk_cause="" blk_detail=""
+
+        case "${id}" in
+            01_fastp)
+                if [[ -z "${RAW_READS_DIR:-}" ]]; then
+                    in_st="not-configured"; blk_cause="external-input-missing"; blk_detail="Raw reads directory (--reads-dir) not configured"
+                elif [[ ! -d "${RAW_READS_DIR}" ]]; then
+                    in_st="unavailable"; blk_cause="external-input-missing"; blk_detail="Raw reads directory does not exist: ${RAW_READS_DIR}"
+                elif [[ $(find "${RAW_READS_DIR}" -maxdepth 1 \( -name '*.fastq*' -o -name '*.fq*' \) 2>/dev/null | head -n 1 | wc -l) -eq 0 ]]; then
+                    in_st="unavailable"; blk_cause="external-input-missing"; blk_detail="No fastq/fq reads found in ${RAW_READS_DIR}"
+                fi ;;
+            02_megahit)
+                if [[ "${RUN_FASTP}" != true ]]; then
+                    if [[ -n "${CLEAN_READS_DIR:-}" ]]; then
+                        if [[ ! -d "${CLEAN_READS_DIR}" ]]; then in_st="unavailable"; blk_cause="external-input-missing"; blk_detail="Clean reads directory does not exist: ${CLEAN_READS_DIR}"; fi
+                    elif [[ -n "${RAW_READS_DIR:-}" ]]; then
+                        if [[ ! -d "${RAW_READS_DIR}" ]]; then in_st="unavailable"; blk_cause="external-input-missing"; blk_detail="Raw reads directory does not exist: ${RAW_READS_DIR}"; fi
+                    else
+                        in_st="not-configured"; blk_cause="external-input-missing"; blk_detail="No reads directory provided"
+                    fi
+                fi ;;
+            04_mapping)
+                if [[ "${COVERAGE_SOURCE:-internal}" == external ]]; then
+                    if [[ -n "${JGI_DEPTH_FILE:-}" && ! -s "${JGI_DEPTH_FILE}" ]]; then
+                        in_st="unavailable"; blk_cause="external-input-missing"; blk_detail="JGI depth file not found or empty: ${JGI_DEPTH_FILE}"
+                    elif [[ -n "${BAM_DIR:-}" && ! -d "${BAM_DIR}" ]]; then
+                        in_st="unavailable"; blk_cause="external-input-missing"; blk_detail="BAM directory not found: ${BAM_DIR}"
+                    fi
+                fi ;;
+        esac
+
+        if [[ "${EXEC_MODE}" == apptainer ]]; then
+            if ! command -v apptainer >/dev/null 2>&1 && ! command -v singularity >/dev/null 2>&1; then
+                run_st="unavailable"
+                [[ -z "${blk_cause}" ]] && { blk_cause="runtime-unavailable"; blk_detail="Apptainer or Singularity executable not found on host"; }
+            else
+                local sif_img=""
+                case "${id}" in
+                    01_fastp) sif_img="fastp.sif" ;;
+                    02_megahit) sif_img="megahit.sif" ;;
+                    03_kraken2) sif_img="kraken2_bracken.sif" ;;
+                    04_mapping) sif_img="mapping_depth.sif" ;;
+                    05a_vamb) sif_img="vamb.sif" ;;
+                    05b_metabinner) sif_img="metabinner.sif" ;;
+                    05c_comebin) sif_img="comebin.sif" ;;
+                    06_refinement|07_reassembly) sif_img="metawrap.sif" ;;
+                    08_checkm2) sif_img="checkm2.sif" ;;
+                    10_gtdbtk) sif_img="gtdbtk.sif" ;;
+                    11_coverm) sif_img="coverm.sif" ;;
+                esac
+                if [[ -n "${sif_img}" ]]; then
+                    local s_path="${SIF_DIR:-./containers}/${sif_img}"
+                    if [[ ! -f "${s_path}" || ! -r "${s_path}" ]]; then
+                        run_st="unavailable"
+                        [[ -z "${blk_cause}" ]] && { blk_cause="runtime-unavailable"; blk_detail="Container image '${sif_img}' not found at ${s_path}"; }
+                    fi
+                fi
+            fi
+        fi
+
+        case "${id}" in
+            03_kraken2)
+                if [[ -z "${KRAKEN2_DB:-}" ]]; then
+                    db_st="not-configured"
+                    [[ -z "${blk_cause}" ]] && { blk_cause="database-not-configured"; blk_detail="Kraken2 database path is not configured"; }
+                elif [[ ! -d "${KRAKEN2_DB}" ]]; then
+                    db_st="unavailable"
+                    [[ -z "${blk_cause}" ]] && { blk_cause="database-not-configured"; blk_detail="Kraken2 database directory does not exist: ${KRAKEN2_DB}"; }
+                elif [[ ! -f "${KRAKEN2_DB}/hash.k2d" || ! -f "${KRAKEN2_DB}/opts.k2d" || ! -f "${KRAKEN2_DB}/taxo.k2d" ]]; then
+                    db_st="invalid"
+                    [[ -z "${blk_cause}" ]] && { blk_cause="database-not-configured"; blk_detail="Kraken2 database missing required keyfiles"; }
+                else
+                    db_st="available"
+                fi ;;
+            08_checkm2)
+                if [[ -z "${CHECKM2_DB:-}" ]]; then
+                    db_st="not-configured"
+                    [[ -z "${blk_cause}" ]] && { blk_cause="database-not-configured"; blk_detail="CheckM2 diamond database path is not configured"; }
+                elif [[ ! -f "${CHECKM2_DB}" || ! -s "${CHECKM2_DB}" ]]; then
+                    db_st="unavailable"
+                    [[ -z "${blk_cause}" ]] && { blk_cause="database-not-configured"; blk_detail="CheckM2 diamond database file not found: ${CHECKM2_DB}"; }
+                else
+                    db_st="available"
+                fi ;;
+            10_gtdbtk)
+                if [[ -z "${GTDBTK_DATA_PATH:-}" ]]; then
+                    db_st="not-configured"
+                    [[ -z "${blk_cause}" ]] && { blk_cause="database-not-configured"; blk_detail="GTDB-Tk reference data path is not configured"; }
+                elif [[ ! -d "${GTDBTK_DATA_PATH}" ]]; then
+                    db_st="unavailable"
+                    [[ -z "${blk_cause}" ]] && { blk_cause="database-not-configured"; blk_detail="GTDB-Tk reference data directory does not exist: ${GTDBTK_DATA_PATH}"; }
+                else
+                    db_st="available"
+                fi ;;
+        esac
+
+        local cur_p="${OUTDIR}"
+        while [[ ! -d "${cur_p}" && "${cur_p}" != "/" && "${cur_p}" != "." ]]; do
+            cur_p="$(dirname "${cur_p}")"
+        done
+        if [[ ! -w "${cur_p}" ]]; then
+            out_st="invalid"
+            [[ -z "${blk_cause}" ]] && { blk_cause="output-parent-not-writable"; blk_detail="Nearest parent directory '${cur_p}' is not writable"; }
+        else
+            if [[ -d "${OUTDIR}" && -e "${STAGE_PRIMARY_OUTPUT[$id]}" ]]; then
+                out_st="available"
+            else
+                out_st="missing"
+            fi
+        fi
+
+        STAGE_INPUT_STATUS["${id}"]="${in_st}"
+        STAGE_RUNTIME_STATUS["${id}"]="${run_st}"
+        STAGE_DATABASE_STATUS["${id}"]="${db_st}"
+        STAGE_OUTPUT_STATUS["${id}"]="${out_st}"
+
+        if [[ -n "${blk_cause}" ]]; then
+            STAGE_ACTION["${id}"]="blocked"
+            STAGE_REASON_CODE["${id}"]="${blk_cause}"
+            STAGE_REASON_DETAIL["${id}"]="${blk_detail}"
+            STAGE_CHECKPOINT_STATUS["${id}"]="not-inspected"
+            STAGE_VALIDATION_STATUS["${id}"]="not-performed"
+            if [[ "${req_act}" == force ]]; then
+                STAGE_DIAGNOSTIC_CODES["${id}"]="forced-by-user"
+            elif [[ "${req_act}" == restart ]]; then
+                STAGE_DIAGNOSTIC_CODES["${id}"]="restart-boundary"
+            fi
+            continue
+        fi
+
+        local chk="${CHECKPOINT_DIR}/${id}.done"
+        local cfg="${CHECKPOINT_DIR}/${id}.config"
+        if [[ ! -d "${OUTDIR}" || ! -f "${chk}" ]]; then
+            STAGE_CHECKPOINT_STATUS["${id}"]="missing"
+            STAGE_CHECKPOINT_REASON["${id}"]=""
+            STAGE_VALIDATION_STATUS["${id}"]="not-performed"
+            STAGE_ACTION["${id}"]="run"
+            STAGE_REASON_CODE["${id}"]="checkpoint-missing"
+            STAGE_REASON_DETAIL["${id}"]="Checkpoint does not exist"
+        elif [[ ! -f "${cfg}" ]]; then
+            STAGE_CHECKPOINT_STATUS["${id}"]="legacy"
+            STAGE_CHECKPOINT_REASON["${id}"]="manifest missing"
+            STAGE_VALIDATION_STATUS["${id}"]="not-performed"
+            STAGE_ACTION["${id}"]="run"
+            STAGE_REASON_CODE["${id}"]="checkpoint-legacy"
+            STAGE_REASON_DETAIL["${id}"]="Checkpoint manifest missing"
+        else
+            local cur_manifest rec_manifest
+            cur_manifest="$(checkpoint_config_manifest "${id}" 2>/dev/null || true)"
+            rec_manifest="$(cat "${cfg}" 2>/dev/null || true)"
+            if [[ "$(comparable_checkpoint_manifest "${id}" "${cur_manifest}")" != "$(comparable_checkpoint_manifest "${id}" "${rec_manifest}")" ]] || \
+               ! checkpoint_identity_compatible "${id}" "${cur_manifest}" "${rec_manifest}" 2>/dev/null; then
+                STAGE_CHECKPOINT_STATUS["${id}"]="stale"
+                STAGE_CHECKPOINT_REASON["${id}"]="manifest changed"
+                STAGE_VALIDATION_STATUS["${id}"]="not-performed"
+                STAGE_ACTION["${id}"]="run"
+                STAGE_REASON_CODE["${id}"]="configuration-changed"
+                STAGE_REASON_DETAIL["${id}"]="Checkpoint configuration differs from current configuration"
+            elif ! validate_step_products "${id}" >/dev/null 2>&1; then
+                STAGE_CHECKPOINT_STATUS["${id}"]="invalid"
+                STAGE_CHECKPOINT_REASON["${id}"]="products invalid or missing"
+                STAGE_VALIDATION_STATUS["${id}"]="failed"
+                STAGE_ACTION["${id}"]="run"
+                STAGE_REASON_CODE["${id}"]="product-validation-failed"
+                STAGE_REASON_DETAIL["${id}"]="Checkpoint products failed validation or are missing"
+            else
+                STAGE_CHECKPOINT_STATUS["${id}"]="valid"
+                STAGE_CHECKPOINT_REASON["${id}"]="valid"
+                STAGE_VALIDATION_STATUS["${id}"]="valid"
+                STAGE_ACTION["${id}"]="reuse"
+                STAGE_REASON_CODE["${id}"]="checkpoint-valid"
+                STAGE_REASON_DETAIL["${id}"]="Checkpoint manifest and products are valid"
+            fi
         fi
     done
+}
+
+apply_force_stage_to_plan() {
+    assert_plan_mutable "apply_force_stage_to_plan"
+    local id pub node child
+    local -a queue=()
+    local -A visited=()
+
+    if [[ "${RESUME_CONTROL}" == force ]]; then
+        for id in "${STAGE_IDS[@]}"; do
+            [[ "${STAGE_APPLICABILITY[$id]}" == applicable ]] || continue
+            if [[ "${STAGE_ACTION[$id]}" != blocked ]]; then
+                STAGE_ACTION["${id}"]="force"
+                STAGE_REASON_CODE["${id}"]="forced-by-user"
+                STAGE_REASON_DETAIL["${id}"]="Global force rerun requested"
+            else
+                STAGE_DIAGNOSTIC_CODES["${id}"]="forced-by-user"
+            fi
+        done
+        return 0
+    fi
+
+    if (( ${#FORCE_STAGE_NAMES[@]} > 0 )); then
+        for pub in "${FORCE_STAGE_NAMES[@]}"; do
+            id="$(resolve_stage_id "${pub}")" || exit 2
+            if [[ "${STAGE_APPLICABILITY[$id]}" == applicable ]]; then
+                if [[ "${STAGE_ACTION[$id]}" != blocked ]]; then
+                    STAGE_ACTION["${id}"]="force"
+                    STAGE_REASON_CODE["${id}"]="forced-by-user"
+                    STAGE_REASON_DETAIL["${id}"]="Stage forced by user"
+                    queue+=("${id}")
+                else
+                    STAGE_DIAGNOSTIC_CODES["${id}"]="forced-by-user"
+                fi
+            fi
+        done
+
+        while (( ${#queue[@]} > 0 )); do
+            node="${queue[0]}"
+            queue=("${queue[@]:1}")
+            [[ -n "${visited[$node]:-}" ]] && continue
+            visited["${node}"]=1
+            for child in ${GRAPH_CHILDREN[$node]:-}; do
+                [[ "${STAGE_APPLICABILITY[$child]:-}" == applicable ]] || continue
+                if [[ "${STAGE_ACTION[$child]}" != blocked && "${STAGE_ACTION[$child]}" != force ]]; then
+                    STAGE_ACTION["${child}"]="run"
+                    STAGE_REASON_CODE["${child}"]="upstream-forced"
+                    STAGE_REASON_DETAIL["${child}"]="Upstream stage ${node} was forced by user"
+                    if [[ -z "${STAGE_INVALIDATED_BY[$child]}" ]]; then
+                        STAGE_INVALIDATED_BY["${child}"]="${node}"
+                    elif [[ " ${STAGE_INVALIDATED_BY[$child]} " != *" ${node} "* ]]; then
+                        STAGE_INVALIDATED_BY["${child}"]+=" ${node}"
+                    fi
+                    queue+=("${child}")
+                fi
+            done
+        done
+    fi
+}
+
+apply_restart_from_to_plan() {
+    assert_plan_mutable "apply_restart_from_to_plan"
+    [[ "${RESTART_REQUESTED}" == true ]] || return 0
+
+    local root node child
+    local -a queue=()
+    local -A visited=()
+
+    root="$(resolve_stage_id "${RESTART_FROM_NAME}")" || exit 2
+    if [[ "${STAGE_APPLICABILITY[$root]}" == applicable ]]; then
+        if [[ "${STAGE_ACTION[$root]}" != blocked ]]; then
+            STAGE_ACTION["${root}"]="restart"
+            STAGE_REASON_CODE["${root}"]="restart-boundary"
+            STAGE_REASON_DETAIL["${root}"]="Restart boundary requested by user"
+            queue+=("${root}")
+        else
+            STAGE_DIAGNOSTIC_CODES["${root}"]="restart-boundary"
+        fi
+    fi
+
     while (( ${#queue[@]} > 0 )); do
         node="${queue[0]}"
         queue=("${queue[@]:1}")
         [[ -n "${visited[$node]:-}" ]] && continue
         visited["${node}"]=1
         for child in ${GRAPH_CHILDREN[$node]:-}; do
-            if [[ "${STAGE_ACTION[$child]}" == reuse ]]; then
-                STAGE_ACTION["${child}"]=run
-                STAGE_REASON["${child}"]="upstream stage ${node} will be rebuilt"
+            [[ "${STAGE_APPLICABILITY[$child]:-}" == applicable ]] || continue
+            if [[ "${STAGE_ACTION[$child]}" != blocked ]]; then
+                STAGE_ACTION["${child}"]="run"
+                STAGE_REASON_CODE["${child}"]="downstream-of-restart"
+                STAGE_REASON_DETAIL["${child}"]="Descendant of restart boundary ${RESTART_FROM_NAME}"
+                if [[ -z "${STAGE_INVALIDATED_BY[$child]}" ]]; then
+                    STAGE_INVALIDATED_BY["${child}"]="${root}"
+                elif [[ " ${STAGE_INVALIDATED_BY[$child]} " != *" ${root} "* ]]; then
+                    STAGE_INVALIDATED_BY["${child}"]+=" ${root}"
+                fi
+                queue+=("${child}")
             fi
-            queue+=("${child}")
         done
     done
 }
 
-configure_stage_actions() {
-    local public root node child
-    local -a roots=() queue=()
-    local -A visited=() unique_roots=()
+propagate_plan_invalidation() {
+    assert_plan_mutable "propagate_plan_invalidation"
+    local node child
+    local -a queue=()
+    local -A visited=()
 
-    check_legacy_summary_checkpoint
-    classify_stages
-    build_effective_dependency_graph
-    resolve_all_current_identities
-    if [[ "${RESTART_REQUESTED}" == true ]]; then
-        root="$(resolve_stage_id "${RESTART_FROM_NAME}")" || return 1
-        stage_is_active "${root}" || {
-            log_error "--restart-from ${RESTART_FROM_NAME} refers to a ${STAGE_STATE[$root]} stage."
-            return 1
-        }
-        roots+=("${root}")
-        STAGE_ACTION["${root}"]=restart
-        STAGE_REASON["${root}"]="requested restart root"
-        queue+=("${root}")
-    elif (( ${#FORCE_STAGE_NAMES[@]} > 0 )); then
-        for public in "${FORCE_STAGE_NAMES[@]}"; do
-            root="$(resolve_stage_id "${public}")" || return 1
-            stage_is_active "${root}" || {
-                log_error "--force-stage ${public} refers to a ${STAGE_STATE[$root]} stage."
-                return 1
-            }
-            if [[ -z "${unique_roots[$root]:-}" ]]; then
-                unique_roots["$root"]=1
-                roots+=("$root")
-                STAGE_ACTION["$root"]=force
-                STAGE_REASON["$root"]="requested force root"
-                queue+=("$root")
+    # 1. Propagate blockages along effective graph
+    for node in "${STAGE_IDS[@]}"; do
+        if [[ "${STAGE_ACTION[$node]}" == blocked ]]; then
+            queue+=("${node}")
+        fi
+    done
+
+    while (( ${#queue[@]} > 0 )); do
+        node="${queue[0]}"
+        queue=("${queue[@]:1}")
+        [[ -n "${visited[$node]:-}" ]] && continue
+        visited["${node}"]=1
+        for child in ${GRAPH_CHILDREN[$node]:-}; do
+            [[ "${STAGE_APPLICABILITY[$child]:-}" == applicable ]] || continue
+            if [[ "${STAGE_ACTION[$child]}" != blocked ]]; then
+                STAGE_ACTION["${child}"]="blocked"
+                STAGE_REASON_CODE["${child}"]="dependency-blocked"
+                STAGE_BLOCKING_STAGE["${child}"]="${node}"
+                STAGE_REASON_DETAIL["${child}"]="Upstream dependency ${node} is blocked"
+                queue+=("${child}")
             fi
         done
-    elif [[ "${RESUME_CONTROL}" == force ]]; then
-        for root in "${STAGE_IDS[@]}"; do
-            if stage_is_active "${root}"; then
-                STAGE_ACTION["${root}"]=force
-                STAGE_REASON["${root}"]="global force requested"
-            fi
-        done
-    fi
+    done
 
-    if [[ "${RESTART_REQUESTED}" == true || ${#FORCE_STAGE_NAMES[@]} -gt 0 ]]; then
-        while (( ${#queue[@]} > 0 )); do
-            node="${queue[0]}"; queue=("${queue[@]:1}")
-            [[ -n "${visited[$node]:-}" ]] && continue
-            visited["$node"]=1
-            for child in ${GRAPH_CHILDREN[$node]:-}; do
-                if [[ "${RESTART_REQUESTED}" == true ]]; then
-                    STAGE_ACTION["${child}"]=restart
-                    STAGE_REASON["${child}"]="descendant of ${RESTART_FROM_NAME}"
-                elif [[ -z "${unique_roots[$child]:-}" && "${STAGE_ACTION[$child]}" != force ]]; then
-                    STAGE_ACTION["${child}"]=run
-                    STAGE_REASON["${child}"]="descendant of forced stage(s)"
+    # 2. Propagate rebuilds (run/force/restart invalidates downstream reuse)
+    queue=()
+    visited=()
+    for node in "${STAGE_IDS[@]}"; do
+        if [[ "${STAGE_ACTION[$node]}" == run || "${STAGE_ACTION[$node]}" == force || "${STAGE_ACTION[$node]}" == restart ]]; then
+            queue+=("${node}")
+        fi
+    done
+
+    while (( ${#queue[@]} > 0 )); do
+        node="${queue[0]}"
+        queue=("${queue[@]:1}")
+        [[ -n "${visited[$node]:-}" ]] && continue
+        visited["${node}"]=1
+        for child in ${GRAPH_CHILDREN[$node]:-}; do
+            [[ "${STAGE_APPLICABILITY[$child]:-}" == applicable ]] || continue
+            if [[ "${STAGE_ACTION[$child]}" == reuse ]]; then
+                STAGE_ACTION["${child}"]="run"
+                STAGE_REASON_CODE["${child}"]="upstream-invalidated"
+                STAGE_REASON_DETAIL["${child}"]="Upstream stage ${node} will be rebuilt"
+                if [[ -z "${STAGE_INVALIDATED_BY[$child]}" ]]; then
+                    STAGE_INVALIDATED_BY["${child}"]="${node}"
+                elif [[ " ${STAGE_INVALIDATED_BY[$child]} " != *" ${node} "* ]]; then
+                    STAGE_INVALIDATED_BY["${child}"]+=" ${node}"
                 fi
                 queue+=("${child}")
-            done
-        done
-    fi
-
-    local id checkpoint manifest current recorded previous_min previous_max change_reason
-    for id in "${STAGE_IDS[@]}"; do
-        stage_is_active "${id}" || continue
-        STAGE_FROZEN_EXTERNAL["${id}"]="$(stage_external_fingerprint "${id}")"
-        case "${STAGE_ACTION[$id]}" in
-            force|run|restart) continue ;;
-        esac
-        checkpoint="${CHECKPOINT_DIR}/${id}.done"
-        manifest="${CHECKPOINT_DIR}/${id}.config"
-        if [[ ! -f "${checkpoint}" || ! -f "${manifest}" ]]; then
-            STAGE_ACTION["${id}"]=run
-            STAGE_REASON["${id}"]="checkpoint or manifest is missing"
-            continue
-        fi
-        current="$(checkpoint_config_manifest "${id}")"
-        recorded="$(cat "${manifest}")"
-        if [[ "$(comparable_checkpoint_manifest "${id}" "${current}")" != \
-              "$(comparable_checkpoint_manifest "${id}" "${recorded}")" ]] || \
-           ! checkpoint_identity_compatible "${id}" "${current}" "${recorded}"; then
-            STAGE_ACTION["${id}"]=run
-            if [[ "${id}" == 09_filter_mags ]]; then
-                previous_min="$(awk -F= '$1 == "min_completeness" {print substr($0, index($0, "=") + 1); exit}' <<< "${recorded}")"
-                previous_max="$(awk -F= '$1 == "max_contamination" {print substr($0, index($0, "=") + 1); exit}' <<< "${recorded}")"
-                change_reason="quality thresholds changed:"
-                if [[ "${previous_min}" != "${MIN_COMPLETENESS}" ]]; then
-                    change_reason+=" min_completeness ${previous_min} -> ${MIN_COMPLETENESS};"
-                fi
-                if [[ "${previous_max}" != "${MAX_CONTAMINATION}" ]]; then
-                    change_reason+=" max_contamination ${previous_max} -> ${MAX_CONTAMINATION};"
-                fi
-                if [[ "${previous_min}" != "${MIN_COMPLETENESS}" || \
-                      "${previous_max}" != "${MAX_CONTAMINATION}" ]]; then
-                    STAGE_REASON["${id}"]="${change_reason%;}"
-                else
-                    STAGE_REASON["${id}"]="checkpoint manifest changed"
-                fi
-            else
-                STAGE_REASON["${id}"]="checkpoint manifest changed"
             fi
-        elif ! validate_step_products "${id}" >/dev/null 2>&1; then
-            STAGE_ACTION["${id}"]=run
-            STAGE_REASON["${id}"]="checkpoint products are invalid"
-        else
-            STAGE_ACTION["${id}"]=reuse
-            STAGE_REASON["${id}"]="checkpoint manifest and products are valid"
-        fi
-        STAGE_FROZEN_EXTERNAL["${id}"]="$(stage_external_fingerprint "${id}")"
+        done
     done
-    propagate_rebuild_actions
-    validate_current_identity_plan || return 1
+}
+
+validate_execution_plan() {
+    assert_plan_mutable "validate_execution_plan"
+    local tmp_val
+    tmp_val="$(mktemp "${TMPDIR:-/tmp}/metanexus_val.XXXXXX.json")"
+    if ! serialize_execution_plan_json > "${tmp_val}"; then
+        rm -f "${tmp_val}"
+        echo "[ERROR] Failed to serialize plan for validation" >&2
+        exit 3
+    fi
+    local val_rc=0
+    python3 "${PIPELINE_SCRIPTS_DIR}/execution_plan.py" validate --input "${tmp_val}" || val_rc=$?
+    rm -f "${tmp_val}"
+    if (( val_rc != 0 )); then
+        exit 3
+    fi
+    return 0
+}
+
+freeze_execution_plan() {
+    assert_plan_mutable "freeze_execution_plan"
+    PLAN_IS_FROZEN=true
+    local id
+    for id in "${STAGE_IDS[@]}"; do
+        STAGE_REASON["${id}"]="${STAGE_REASON_CODE[$id]}"
+        STAGE_PRECONDITIONS["${id}"]="$(printf '%s|%s|%s|%s|%s' \
+            "${STAGE_REQUESTED_ACTION[$id]}" \
+            "${STAGE_ACTION[$id]}" \
+            "${STAGE_CHECKPOINT_STATUS[$id]}" \
+            "${STAGE_INPUT_STATUS[$id]}" \
+            "${STAGE_RUNTIME_STATUS[$id]}")"
+    done
+}
+
+collect_execution_plan() {
+    COLLECTING_PLAN=true
+    PLAN_IS_FROZEN=false
+
+    resolve_base_stage_actions || { COLLECTING_PLAN=false; return 1; }
+    apply_force_stage_to_plan || { COLLECTING_PLAN=false; return 1; }
+    apply_restart_from_to_plan || { COLLECTING_PLAN=false; return 1; }
+    propagate_plan_invalidation || { COLLECTING_PLAN=false; return 1; }
+    validate_execution_plan || { COLLECTING_PLAN=false; return 1; }
+    freeze_execution_plan || { COLLECTING_PLAN=false; return 1; }
+
+    COLLECTING_PLAN=false
+    return 0
+}
+
+verify_stage_preconditions() {
+    local id="$1"
+    local recorded="${STAGE_PRECONDITIONS[$id]:-}"
+    [[ -n "${recorded}" ]] || return 0
+    local cur
+    cur="$(printf '%s|%s|%s|%s|%s' \
+        "${STAGE_REQUESTED_ACTION[$id]}" \
+        "${STAGE_ACTION[$id]}" \
+        "${STAGE_CHECKPOINT_STATUS[$id]}" \
+        "${STAGE_INPUT_STATUS[$id]}" \
+        "${STAGE_RUNTIME_STATUS[$id]}")"
+    if [[ "${recorded}" != "${cur}" ]]; then
+        log_error "Critical preconditions changed after planning for stage ${id} (recorded: ${recorded}, current: ${cur})."
+        return 1
+    fi
+    return 0
 }
 
 write_resume_plan() {
@@ -6818,7 +8733,7 @@ initialize_run_status() {
         --resume-plan-path "${RESUME_PLAN_FILE}" \
         --checkpoint-dir "${CHECKPOINT_DIR}" \
         --run-id "${RUN_ID}" \
-        --pipeline-version "${PIPELINE_VERSION:-2.0.0}" \
+        --pipeline-version "${PIPELINE_VERSION}" \
         --profile "${REQUESTED_PROFILE:-custom}" \
         --execution-mode "${EXEC_MODE}" \
         --start-time-utc "${PIPELINE_START_TIME_UTC}" \
@@ -6907,6 +8822,8 @@ clean_stage_outputs() {
         case "${protected_path}" in
             "$(realpath -m "${LOGS_DIR}/inventory")"|\
             "$(realpath -m "${LOGS_DIR}/inventory")"/*|\
+            "$(realpath -m "${LOGS_DIR}/disk_space.current.tsv")"|\
+            "$(realpath -m "${LOGS_DIR}/disk_space.tsv")"|\
             "$(realpath -m "${LOGS_DIR}/run_manifest.tsv")"|\
             "$(realpath -m "${LOGS_DIR}/stage_status.tsv")"|\
             "$(realpath -m "${OUTDIR}/run_status.tsv")"|\
@@ -7421,12 +9338,12 @@ preflight_check() {
         fi
     fi
     [[ "${RUN_MAG_FILTERING}" == true ]] && HQ_BINS_DIR="${MAGS_DIR}"
-    if ! configure_stage_actions; then
+    if ! collect_execution_plan; then
         errors=$((errors + 1))
     fi
 
     # ── Temporary workspace: resolve base and freeze per-run paths ────────────
-    # Must run after configure_stage_actions so we know the reassembly action.
+    # Must run after collect_execution_plan so we know the reassembly action.
     if ! resolve_pipeline_tmpdir_base; then
         (( errors += 1 ))
     else
@@ -7678,6 +9595,9 @@ preflight_check() {
         fi
     done
     log_info "Final stage status: ${stage_status[*]}."
+    if ! run_disk_preflight; then
+        (( errors += 1 ))
+    fi
     if [[ "${errors}" -gt 0 ]]; then
         log_error "Pre-flight failed with ${errors} error(s). Fix above and retry."
         exit 1
@@ -9000,7 +10920,7 @@ step_12a_taxonomy_summary() {
     local -a cmd=(
         python3 "${SUMMARY_GENERATOR}" taxonomy
         --outdir "${SUMMARY_DIR}"
-        --pipeline-version "${PIPELINE_VERSION:-2.0.0}"
+        --pipeline-version "${PIPELINE_VERSION}"
         --sample-manifest "${SAMPLE_MANIFEST_ACTIVE:-${FASTP_CLEAN_SAMPLE_MANIFEST:-${RAW_SAMPLE_MANIFEST}}}"
         --kraken2-dir "${KRAKEN2_DIR}"
         --kraken2-enabled
@@ -9055,7 +10975,7 @@ step_12b_mag_summary() {
     local -a cmd=(
         python3 "${SUMMARY_GENERATOR}" mag
         --outdir "${SUMMARY_DIR}"
-        --pipeline-version "${PIPELINE_VERSION:-2.0.0}"
+        --pipeline-version "${PIPELINE_VERSION}"
         --bins-dir "${HQ_BINS_DIR:-${MAGS_DIR}}"
         --min-completeness "${MIN_COMPLETENESS}"
         --max-contamination "${MAX_CONTAMINATION}"
@@ -9124,7 +11044,7 @@ step_12c_run_overview() {
         python3 "${SUMMARY_GENERATOR}" overview
         --outdir "${SUMMARY_DIR}"
         --pipeline-outdir "${OUTDIR}"
-        --pipeline-version "${PIPELINE_VERSION:-2.0.0}"
+        --pipeline-version "${PIPELINE_VERSION}"
         --run-id "${RUN_ID}"
         --profile "${REQUESTED_PROFILE:-custom}"
         --execution-mode "${EXEC_MODE}"
@@ -9181,6 +11101,63 @@ step_12c_run_overview() {
 ###############################################################################
 
 main() {
+    if [[ "${PLAN_MODE}" == true ]]; then
+        resolve_binning_configuration || exit 2
+        calculate_stage_needs
+        validate_percentage_threshold MIN_COMPLETENESS "${MIN_COMPLETENESS}" || exit 2
+        validate_percentage_threshold MAX_CONTAMINATION "${MAX_CONTAMINATION}" || exit 2
+        if [[ -n "${STOP_AFTER}" ]] && ! stage_in_scope "${STOP_AFTER}"; then
+            echo "[ERROR] Invalid --stop-after stage: ${STOP_AFTER}" >&2
+            exit 2
+        fi
+        if [[ "${RUN_MEGAHIT}" == true && -n "${ASSEMBLY_IN}" ]]; then
+            echo "[ERROR] --assembly-in cannot be combined with MEGAHIT; pass --no-megahit explicitly." >&2
+            exit 2
+        fi
+        if [[ -n "${RAW_READS_DIR}" && -n "${CLEAN_READS_DIR}" ]]; then
+            echo "[ERROR] --reads-dir and --clean-reads-dir are mutually exclusive." >&2
+            exit 2
+        fi
+        if [[ -n "${CLEAN_READS_DIR}" && "${RUN_FASTP}" == true ]]; then
+            echo "[ERROR] --clean-reads-dir cannot be combined with fastp; use --no-fastp." >&2
+            exit 2
+        fi
+
+        collect_execution_plan || exit $?
+
+        local tmp_plan
+        tmp_plan="$(mktemp "${TMPDIR:-/tmp}/metanexus_plan.XXXXXX.json")"
+        if ! serialize_execution_plan_json > "${tmp_plan}"; then
+            rm -f "${tmp_plan}"
+            echo "[ERROR] Failed to serialize execution plan to JSON." >&2
+            exit 3
+        fi
+
+        local render_rc=0
+        python3 "${PIPELINE_SCRIPTS_DIR}/execution_plan.py" render \
+            --format "${PLAN_FORMAT}" \
+            --details "${PLAN_DETAILS}" \
+            --input "${tmp_plan}" || render_rc=$?
+
+        if (( render_rc != 0 )); then
+            rm -f "${tmp_plan}"
+            exit "${render_rc}"
+        fi
+
+        local is_exec_rc=0
+        python3 "${PIPELINE_SCRIPTS_DIR}/execution_plan.py" is-executable \
+            --input "${tmp_plan}" || is_exec_rc=$?
+
+        rm -f "${tmp_plan}"
+
+        if [[ "${STRICT_PLAN}" == true ]]; then
+            if (( is_exec_rc != 0 )); then
+                exit 1
+            fi
+        fi
+        exit 0
+    fi
+
     resolve_binning_configuration || true
     MAG_FILTERING_APPLICABLE=false
     if [[ "${RUN_MAG_FILTERING}" == true ]] && stage_in_scope mag-filtering; then
@@ -9191,8 +11168,9 @@ main() {
 
     # Print run configuration banner
     echo -e "\n${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}${BOLD}║         SHOTGUN METAGENOMICS PIPELINE — CONFIGURATION         ║${NC}"
+    echo -e "${CYAN}${BOLD}║              METANEXUS — PIPELINE CONFIGURATION              ║${NC}"
     echo -e "${CYAN}${BOLD}╠══════════════════════════════════════════════════════════════╣${NC}"
+    echo -e "${CYAN}${BOLD}║${NC}  Pipeline               : ${PIPELINE_NAME} v${PIPELINE_VERSION} (${PIPELINE_RELEASE_STATUS})"
     echo -e "${CYAN}${BOLD}║${NC}  PROFILE requested/result: ${REQUESTED_PROFILE} / ${RESULTING_PROFILE}"
     echo -e "${CYAN}${BOLD}║${NC}  READS_DIR (raw)        : ${READS_DIR:-<unset>}"
     echo -e "${CYAN}${BOLD}║${NC}  CLEAN_READS_DIR        : ${CLEAN_READS_DIR:-<unset>}"
@@ -9244,10 +11222,12 @@ main() {
         echo -e "${CYAN}${BOLD}║${NC}  Error history          : would write on failure"
         echo -e "${CYAN}${BOLD}║${NC}  Last error report      : would write on failure"
         echo -e "${CYAN}${BOLD}║${NC}  Checkpoint state       : would track in normal execution"
+        echo -e "${CYAN}${BOLD}║${NC}  Disk report            : would write"
     else
         echo -e "${CYAN}${BOLD}║${NC}  Error history          : ${LOGS_DIR}/errors.tsv"
         echo -e "${CYAN}${BOLD}║${NC}  Last error report      : ${LOGS_DIR}/last_error.json"
         echo -e "${CYAN}${BOLD}║${NC}  Checkpoint state       : ${LOGS_DIR}/checkpoint_state/${RUN_ID}.tsv"
+        echo -e "${CYAN}${BOLD}║${NC}  Disk report            : pending"
         echo -e "${CYAN}${BOLD}║${NC}  Error log tail         : 20 lines"
         echo -e "${CYAN}${BOLD}║${NC}  Error schema           : 1"
     fi
@@ -9419,6 +11399,14 @@ main() {
     echo "Taxonomy summary path  : ${tax_path}"
     echo "MAG summary path       : ${mag_path}"
     echo "Run overview path      : ${ov_path}"
+    # Final disk space observations
+    record_final_disk_observations
+
+    local disk_sum_out
+    disk_sum_out="$(get_latest_disk_status)"
+    DISK_WARNING_COUNT="$(grep -E '^WARNING_COUNT=' <<< "${disk_sum_out}" | cut -d'=' -f2)"
+    [[ -z "${DISK_WARNING_COUNT}" || ! "${DISK_WARNING_COUNT}" =~ ^[0-9]+$ ]] && DISK_WARNING_COUNT=0
+
     if [[ "${DRY_RUN}" != true && "${RUN_STATUS_INITIALIZED:-false}" == true ]]; then
         local total_end_mono
         total_end_mono="$(python3 -c 'import time; print(f"{time.monotonic():.6f}")' 2>/dev/null || echo "0.0")"
@@ -9436,7 +11424,7 @@ main() {
             --final-status "success" \
             --exit-code 0 \
             --wall-time-seconds "${total_wall}" \
-            --warning-count "0" \
+            --warning-count "${DISK_WARNING_COUNT}" \
             --error-count "${err_count}" \
             --taxonomy-summary-path "${SUMMARY_DIR}/taxonomy_summary.tsv" \
             --mag-summary-path "${SUMMARY_DIR}/mag_summary.tsv" \
@@ -9446,10 +11434,13 @@ main() {
     echo "Run manifest   : ${LOGS_DIR}/run_manifest.tsv"
     echo "Stage status   : ${LOGS_DIR}/stage_status.tsv"
     echo "Run status     : ${OUTDIR}/run_status.tsv"
+    echo "Disk report    : ${DISK_SPACE_TSV}"
     echo "Logs           : ${LOGS_DIR}/"
     echo "Mamba scripts  : ${TMPSCRIPTS_DIR}/"
     echo "Error history  : ${LOGS_DIR}/errors.tsv"
     echo "Last error     : ${LOGS_DIR}/last_error.json"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

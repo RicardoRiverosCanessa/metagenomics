@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Stub fastp - simply exits 0
+exit 0
